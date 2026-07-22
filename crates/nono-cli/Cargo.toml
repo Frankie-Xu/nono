@@ -55,6 +55,8 @@ dirs = "6"
 walkdir.workspace = true
 ignore.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
+uuid.workspace = true
+base64.workspace = true
 
 # Allocation-free integer formatting for the post-fork cgroup self-attach path
 # (resource_cgroup::child_self_attach), where malloc could deadlock.
