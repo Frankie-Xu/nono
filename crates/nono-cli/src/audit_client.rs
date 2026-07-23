@@ -7,7 +7,10 @@ use crate::platform_client::{
 };
 use aws_lc_rs::rand::SystemRandom;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use nono::audit::{AUDIT_EVENTS_FILENAME, verify_audit_log};
+use nono::audit::{
+    AUDIT_EVENTS_FILENAME, canonical_session_digest_payload, compute_session_digest,
+    verify_audit_log,
+};
 use nono::undo::SessionMetadata;
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
@@ -33,6 +36,9 @@ pub(crate) struct AuditIngestEnvelope {
     pub hash_chain_head: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,
+    /// Exact canonical JSON bytes committed by `session_digest`.
+    pub session_metadata_json: String,
+    pub session_digest: String,
     pub events_ndjson: String,
 }
 
@@ -155,6 +161,13 @@ fn build_queued_audit(
             path: events_path,
             source,
         })?;
+    let session_metadata_json = String::from_utf8(canonical_session_digest_payload(metadata)?)
+        .map_err(|error| {
+            NonoError::ConfigParse(format!(
+                "canonical audit session metadata was not UTF-8: {error}"
+            ))
+        })?;
+    let session_digest = compute_session_digest(metadata)?.to_string();
     Ok(QueuedAudit {
         envelope: AuditIngestEnvelope {
             ingest_id: Uuid::now_v7(),
@@ -167,6 +180,8 @@ fn build_queued_audit(
             hash_chain_head: Some(integrity.chain_head.to_string()),
             started_at: metadata.started.clone(),
             ended_at: metadata.ended.clone(),
+            session_metadata_json,
+            session_digest,
             events_ndjson,
         },
         session_dir: session_dir.to_path_buf(),
@@ -315,7 +330,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::audit_integrity::AuditRecorder;
-    use nono::undo::AuditIntegritySummary;
+    use nono::undo::{AuditIntegritySummary, ContentHash, ExecutableIdentity};
 
     #[test]
     fn queued_audit_verifies_local_evidence_and_preserves_identity() {
@@ -347,6 +362,58 @@ mod tests {
         assert_eq!(queued.envelope.session_id, "session-1");
         assert!(queued.envelope.events_ndjson.contains("session_started"));
         assert!(queued.envelope.events_ndjson.contains("session_ended"));
+        assert_eq!(
+            queued.envelope.session_digest,
+            compute_session_digest(&metadata).unwrap().to_string()
+        );
+        let shipped_metadata: serde_json::Value =
+            serde_json::from_str(&queued.envelope.session_metadata_json).unwrap();
+        assert_eq!(shipped_metadata["session_id"], "session-1");
+        assert_eq!(shipped_metadata["command"], serde_json::json!(["true"]));
+        assert_eq!(shipped_metadata["exit_code"], 0);
+    }
+
+    #[test]
+    fn canonical_session_metadata_matches_cross_repository_fixture() {
+        let metadata = SessionMetadata {
+            session_id: "11822689bd7b29bd".to_string(),
+            started: "2026-07-21T07:18:23.355693+01:00".to_string(),
+            ended: Some("2026-07-21T07:18:23.431345+01:00".to_string()),
+            command: vec!["/usr/bin/true".to_string()],
+            executable_identity: Some(ExecutableIdentity {
+                resolved_path: PathBuf::from("/usr/bin/true"),
+                sha256: "ccb5264afd44f9c8539ef99ac96aec86d07bff579cabf1be3c0b57b1ed99afc5"
+                    .parse::<ContentHash>()
+                    .unwrap(),
+            }),
+            tracked_paths: vec![PathBuf::from("/Users/lukehinds/dev/nono-workspace/nono")],
+            snapshot_count: 0,
+            exit_code: Some(0),
+            merkle_roots: Vec::new(),
+            network_events: Vec::new(),
+            audit_event_count: 2,
+            audit_integrity: Some(AuditIntegritySummary {
+                hash_algorithm: "sha256".to_string(),
+                event_count: 2,
+                chain_head: "95698453e92153a6b0b98cdb5d77f0ab3faa1b78e6bc52ca041b34212495a6e4"
+                    .parse::<ContentHash>()
+                    .unwrap(),
+                merkle_root: "c106781324877481f027c7a7ccf85970e1dc186a8544f709e14a04dac024bb09"
+                    .parse::<ContentHash>()
+                    .unwrap(),
+            }),
+            audit_attestation: None,
+        };
+        let fixture =
+            include_str!("../../../tests/fixtures/audit-session-metadata-v1.json").trim_end();
+        assert_eq!(
+            String::from_utf8(canonical_session_digest_payload(&metadata).unwrap()).unwrap(),
+            fixture
+        );
+        assert_eq!(
+            compute_session_digest(&metadata).unwrap().to_string(),
+            "02022c14ce57dca6b392adfaaa922e4335d57ae6ce3d8ad962ec203cfd31dd0b"
+        );
     }
 
     fn metadata(session_id: &str, integrity: AuditIntegritySummary) -> SessionMetadata {
