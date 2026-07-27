@@ -41,6 +41,16 @@ impl Default for WalkBudget {
     }
 }
 
+/// What a walk over the tracked roots found.
+///
+/// Files and symlinks are kept apart because they are handled differently:
+/// files are hashed (and stored, for `walk_and_store`), while symlinks are
+/// only recorded by path.
+struct WalkResult {
+    files: HashMap<PathBuf, FileState>,
+    symlinks: HashSet<PathBuf>,
+}
+
 /// Manages snapshots for an undo session.
 ///
 /// Coordinates the object store, exclusion filter, and Merkle tree to
@@ -141,14 +151,15 @@ impl SnapshotManager {
     /// stores each file, builds the manifest with Merkle root, and writes
     /// it atomically to `snapshots/000.json`.
     pub fn create_baseline(&mut self) -> Result<SnapshotManifest> {
-        let files = self.walk_and_store()?;
-        let merkle = MerkleTree::from_manifest(&files)?;
+        let walked = self.walk_and_store()?;
+        let merkle = MerkleTree::from_manifest(&walked.files)?;
 
         let manifest = SnapshotManifest {
             number: 0,
             timestamp: now_epoch_secs(),
             parent: None,
-            files,
+            files: walked.files,
+            symlinks: walked.symlinks,
             merkle_root: *merkle.root(),
         };
 
@@ -166,16 +177,17 @@ impl SnapshotManager {
         &mut self,
         previous: &SnapshotManifest,
     ) -> Result<(SnapshotManifest, Vec<Change>)> {
-        let current_files = self.walk_and_store()?;
-        let changes = compute_changes(&previous.files, &current_files);
-        let merkle = MerkleTree::from_manifest(&current_files)?;
+        let walked = self.walk_and_store()?;
+        let changes = compute_changes(&previous.files, &walked.files);
+        let merkle = MerkleTree::from_manifest(&walked.files)?;
 
         let number = previous.number.saturating_add(1);
         let manifest = SnapshotManifest {
             number,
             timestamp: now_epoch_secs(),
             parent: Some(previous.number),
-            files: current_files,
+            files: walked.files,
+            symlinks: walked.symlinks,
             merkle_root: *merkle.root(),
         };
 
@@ -203,7 +215,8 @@ impl SnapshotManager {
     /// the list of changes that would be applied. Useful for dry-run previews.
     pub fn compute_restore_diff(&self, manifest: &SnapshotManifest) -> Result<Vec<Change>> {
         self.validate_manifest_paths(manifest)?;
-        let current_files = self.walk_current()?;
+        let current = self.walk_current()?;
+        let current_files = current.files;
         let mut changes = Vec::new();
 
         for (path, state) in &manifest.files {
@@ -241,21 +254,41 @@ impl SnapshotManager {
             }
         }
 
+        for path in &current.symlinks {
+            if Self::symlink_needs_cleanup(manifest, path) {
+                changes.push(Change {
+                    path: path.clone(),
+                    change_type: ChangeType::Deleted,
+                    size_delta: None,
+                    old_hash: None,
+                    new_hash: None,
+                });
+            }
+        }
+
         changes.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(changes)
+    }
+
+    /// Whether restore should unlink `path`, a symlink found on disk now.
+    fn symlink_needs_cleanup(manifest: &SnapshotManifest, path: &Path) -> bool {
+        !manifest.symlinks.contains(path) && !manifest.files.contains_key(path)
     }
 
     /// Restore filesystem to the state captured by the given manifest.
     ///
     /// For each file in the manifest: restores content from object store
     /// via atomic temp+rename. Deletes files that exist on disk but aren't
-    /// in the manifest. Returns the list of changes applied.
+    /// in the manifest, and unlinks symlinks the session created. Symlinks
+    /// recorded in the manifest are left in place; a link the session deleted
+    /// is not recreated, since manifests do not store link targets.
     ///
     /// All manifest paths are validated to be within tracked directories
     /// before any writes occur.
     pub fn restore_to(&self, manifest: &SnapshotManifest) -> Result<Vec<Change>> {
         self.validate_manifest_paths(manifest)?;
-        let current_files = self.walk_current()?;
+        let current = self.walk_current()?;
+        let current_files = current.files;
         let mut applied_changes = Vec::new();
 
         for (path, state) in &manifest.files {
@@ -329,6 +362,30 @@ impl SnapshotManager {
                         new_hash: None,
                     });
                 }
+            }
+        }
+
+        // Unlink symlinks the session created. `remove_file` unlinks the link
+        // itself and never follows it, so the target is untouched, but the
+        // path leading to it still has to be free of symlinked components.
+        for path in &current.symlinks {
+            if !Self::symlink_needs_cleanup(manifest, path) {
+                continue;
+            }
+            if let Err(e) = self.validate_restore_target(path) {
+                tracing::warn!("Skipping symlink cleanup for {}: {}", path.display(), e);
+                continue;
+            }
+            if let Err(e) = fs::remove_file(path) {
+                tracing::warn!("Failed to remove symlink {}: {}", path.display(), e);
+            } else {
+                applied_changes.push(Change {
+                    path: path.clone(),
+                    change_type: ChangeType::Deleted,
+                    size_delta: None,
+                    old_hash: None,
+                    new_hash: None,
+                });
             }
         }
 
@@ -438,9 +495,12 @@ impl SnapshotManager {
     /// file, and returns the Merkle root. This is useful for audit-only
     /// sessions that need a cryptographic commitment to filesystem state
     /// without the overhead of full snapshot storage.
+    ///
+    /// The commitment covers regular files only. Symlinks are not followed
+    /// and do not contribute to the root.
     pub fn compute_merkle_root(&self) -> Result<ContentHash> {
-        let files = self.walk_current()?;
-        let merkle = MerkleTree::from_manifest(&files)?;
+        let walked = self.walk_current()?;
+        let merkle = MerkleTree::from_manifest(&walked.files)?;
         Ok(*merkle.root())
     }
 
@@ -550,13 +610,14 @@ impl SnapshotManager {
         Ok(())
     }
 
-    /// Validate the live filesystem path that restore will write through.
+    /// Validate the live filesystem path that restore will write through or
+    /// unlink.
     ///
     /// Manifest validation is lexical: it proves stored paths are under tracked
     /// roots, but it cannot see symlinks created after the snapshot. Restore
     /// runs outside the sandbox, so every existing parent component at or below
     /// the tracked root must be a real directory before `create_dir_all`,
-    /// temp-file creation, rename, or chmod touches the path.
+    /// temp-file creation, rename, chmod, or unlink touches the path.
     fn validate_restore_target(&self, path: &Path) -> Result<()> {
         let tracked = self
             .tracked_paths
@@ -668,8 +729,9 @@ impl SnapshotManager {
         )
     }
 
-    fn walk_and_store(&self) -> Result<HashMap<PathBuf, FileState>> {
+    fn walk_and_store(&self) -> Result<WalkResult> {
         let mut files = HashMap::new();
+        let mut symlinks = HashSet::new();
         let mut entries_visited: usize = 0;
         let mut total_bytes: u64 = 0;
 
@@ -732,6 +794,7 @@ impl SnapshotManager {
                 // Never follow symlinks at snapshot time. `WalkDir` already
                 // lstat'd this entry, so `is_symlink()` costs no extra syscall.
                 if entry.file_type().is_symlink() {
+                    symlinks.insert(path.to_path_buf());
                     continue;
                 }
                 if !path.is_file() {
@@ -767,14 +830,15 @@ impl SnapshotManager {
             }
         }
 
-        Ok(files)
+        Ok(WalkResult { files, symlinks })
     }
 
     /// Walk tracked paths to get current file states without storing.
     ///
     /// Uses `filter_entry()` to prune excluded subtrees and enforces the walk budget.
-    fn walk_current(&self) -> Result<HashMap<PathBuf, FileState>> {
+    fn walk_current(&self) -> Result<WalkResult> {
         let mut files = HashMap::new();
+        let mut symlinks = HashSet::new();
         let mut entries_visited: usize = 0;
         let mut total_bytes: u64 = 0;
 
@@ -815,6 +879,7 @@ impl SnapshotManager {
                 let path = entry.path();
 
                 if entry.file_type().is_symlink() {
+                    symlinks.insert(path.to_path_buf());
                     continue;
                 }
                 if !path.is_file() {
@@ -829,7 +894,7 @@ impl SnapshotManager {
             }
         }
 
-        Ok(files)
+        Ok(WalkResult { files, symlinks })
     }
 
     /// Hash a file, store it in the object store, and return its FileState.
@@ -1322,6 +1387,36 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn restore_keeps_symlinks_present_at_baseline() {
+        let (dir, tracked) = setup_test_dir();
+        let session_dir = dir.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, b"OUTSIDE").expect("write outside file");
+
+        let preexisting = tracked.join("preexisting-link");
+        std::os::unix::fs::symlink(&outside, &preexisting).expect("create symlink");
+
+        let mut manager = make_manager(&session_dir, &tracked);
+        let baseline = manager.create_baseline().expect("baseline");
+        assert!(
+            baseline.symlinks.contains(&preexisting),
+            "baseline should record the symlink path"
+        );
+        assert!(
+            !baseline.files.contains_key(&preexisting),
+            "symlink must not be tracked as a file"
+        );
+
+        fs::write(tracked.join("file1.txt"), b"modified").expect("modify");
+        manager.restore_to(&baseline).expect("restore");
+
+        let meta = fs::symlink_metadata(&preexisting).expect("baseline symlink should survive");
+        assert!(meta.file_type().is_symlink());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn restore_diff_reports_session_symlink_as_deleted() {
         let (dir, tracked) = setup_test_dir();
         let session_dir = dir.path().join("session");
@@ -1346,6 +1441,38 @@ mod tests {
 
         // Dry run must not touch the filesystem.
         assert!(fs::symlink_metadata(&planted).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_never_removes_a_symlinked_tracked_root() {
+        let dir = TempDir::new().expect("tempdir");
+        let real = dir.path().join("real");
+        fs::create_dir_all(&real).expect("create real dir");
+        fs::write(real.join("file1.txt"), b"hello world").expect("write file1");
+        let root_link = dir.path().join("linked-root");
+        std::os::unix::fs::symlink(&real, &root_link).expect("create root symlink");
+
+        let session_dir = dir.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let mut manager = make_manager(&session_dir, &root_link);
+        let baseline = manager.create_baseline().expect("baseline");
+        assert!(baseline.files.is_empty(), "symlinked root is not walked");
+        assert!(
+            baseline.symlinks.is_empty(),
+            "symlinked root is not tracked"
+        );
+
+        manager.restore_to(&baseline).expect("restore");
+
+        assert!(
+            fs::symlink_metadata(&root_link)
+                .expect("tracked root should survive")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(real.join("file1.txt").exists());
     }
 
     #[test]
@@ -1607,6 +1734,7 @@ mod tests {
             number: 0,
             parent: None,
             files,
+            symlinks: HashSet::new(),
             merkle_root: ContentHash::from_bytes([0; 32]),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
         };
@@ -1643,6 +1771,7 @@ mod tests {
             number: 0,
             parent: None,
             files,
+            symlinks: HashSet::new(),
             merkle_root: ContentHash::from_bytes([0; 32]),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
         };
