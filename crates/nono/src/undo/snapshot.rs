@@ -1282,6 +1282,73 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn restore_removes_symlinks_created_during_session() {
+        let (dir, tracked) = setup_test_dir();
+        let session_dir = dir.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, b"OUTSIDE").expect("write outside file");
+
+        let mut manager = make_manager(&session_dir, &tracked);
+        let baseline = manager.create_baseline().expect("baseline");
+
+        let planted = tracked.join("planted-link");
+        let dangling = tracked.join("dangling-link");
+        std::os::unix::fs::symlink(&outside, &planted).expect("create symlink");
+        std::os::unix::fs::symlink(dir.path().join("missing.txt"), &dangling)
+            .expect("create dangling symlink");
+
+        let applied = manager.restore_to(&baseline).expect("restore");
+
+        for link in [&planted, &dangling] {
+            assert!(
+                fs::symlink_metadata(link).is_err(),
+                "session symlink {} should be unlinked",
+                link.display()
+            );
+            let change = applied
+                .iter()
+                .find(|c| &c.path == link)
+                .expect("symlink removal should be reported");
+            assert_eq!(change.change_type, ChangeType::Deleted);
+        }
+
+        assert_eq!(
+            fs::read_to_string(&outside).expect("read outside file"),
+            "OUTSIDE"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_diff_reports_session_symlink_as_deleted() {
+        let (dir, tracked) = setup_test_dir();
+        let session_dir = dir.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, b"OUTSIDE").expect("write outside file");
+
+        let mut manager = make_manager(&session_dir, &tracked);
+        let baseline = manager.create_baseline().expect("baseline");
+
+        let planted = tracked.join("planted-link");
+        std::os::unix::fs::symlink(&outside, &planted).expect("create symlink");
+
+        let diff = manager
+            .compute_restore_diff(&baseline)
+            .expect("compute diff");
+        let change = diff
+            .iter()
+            .find(|c| c.path == planted)
+            .expect("diff should preview the symlink removal");
+        assert_eq!(change.change_type, ChangeType::Deleted);
+
+        // Dry run must not touch the filesystem.
+        assert!(fs::symlink_metadata(&planted).is_ok());
+    }
+
+    #[test]
     fn merkle_root_differs_between_snapshots() {
         let (dir, tracked) = setup_test_dir();
         let session_dir = dir.path().join("session");
