@@ -416,7 +416,7 @@ fn apply_file_grant_staleness(
 fn query_command_policy(
     command: &str,
     caller: &str,
-    command_args: &[String],
+    command_args: &[std::ffi::OsString],
     policies: Option<&CommandPoliciesConfig>,
 ) -> query_ext::QueryResult {
     let Some(policies) = policies else {
@@ -490,6 +490,7 @@ fn query_command_policy(
         };
     };
 
+    use std::os::unix::ffi::OsStrExt;
     let mut argv = Vec::with_capacity(command_args.len() + 1);
     argv.push(command.as_bytes().to_vec());
     argv.extend(command_args.iter().map(|arg| arg.as_bytes().to_vec()));
@@ -511,7 +512,7 @@ fn query_command_policy(
             reason,
             details: Some(format!(
                 "Command '{command}' from '{caller}' with argv [{}] is denied by invocation_policy. This is an Tool Sandbox  command/argument policy denial, not a filesystem path denial.{endpoint_note}",
-                command_args.join(" ")
+                crate::command_display::format_command_line(command_args)
             )),
             policy_source: Some(format!(
                 "command_policies.commands.{command}.from.{caller}.invocation_policy"
@@ -529,7 +530,7 @@ fn query_command_policy(
             reason: reason.unwrap_or_else(|| "invocation_policy approval required".to_string()),
             details: Some(format!(
                 "Command '{command}' from '{caller}' with argv [{}] matches {rule_label}. Backend: {}. Timeout: {}.{endpoint_note}",
-                command_args.join(" "),
+                crate::command_display::format_command_line(command_args),
                 backend.unwrap_or_else(|| "<default>".to_string()),
                 timeout_secs
                     .map(|secs| format!("{secs}s"))
@@ -692,9 +693,9 @@ mod tests {
     fn command_policy_query_reports_argv_deny_reason() {
         let policies = gh_policy();
         let args = vec![
-            "issue".to_string(),
-            "comment".to_string(),
-            "1052".to_string(),
+            std::ffi::OsString::from("issue"),
+            std::ffi::OsString::from("comment"),
+            std::ffi::OsString::from("1052"),
         ];
 
         let result = query_command_policy("gh", "session", &args, Some(&policies));
@@ -907,7 +908,11 @@ mod tests {
     #[test]
     fn command_policy_query_reports_argv_allow() {
         let policies = gh_policy();
-        let args = vec!["issue".to_string(), "view".to_string(), "1052".to_string()];
+        let args = vec![
+            std::ffi::OsString::from("issue"),
+            std::ffi::OsString::from("view"),
+            std::ffi::OsString::from("1052"),
+        ];
 
         let result = query_command_policy("gh", "session", &args, Some(&policies));
 

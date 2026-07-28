@@ -5,6 +5,7 @@
 
 use clap::builder::styling::{Style, Styles};
 use clap::{Parser, Subcommand, ValueEnum};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 const STYLES: Styles = Styles::plain().header(Style::new().bold());
@@ -2102,7 +2103,7 @@ pub struct RunArgs {
 
     /// Command to run inside the sandbox (optional if profile specifies `binary`)
     #[arg(hide = true)]
-    pub command: Vec<String>,
+    pub command: Vec<OsString>,
 
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
@@ -2150,7 +2151,7 @@ pub struct WrapArgs {
 
     /// Command to run inside the sandbox
     #[arg(required = true, hide = true)]
-    pub command: Vec<String>,
+    pub command: Vec<OsString>,
 
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
@@ -2194,7 +2195,7 @@ pub struct WhyArgs {
 
     /// Arguments for --command after `--`
     #[arg(last = true, value_name = "ARGS", help_heading = "QUERY")]
-    pub command_args: Vec<String>,
+    pub command_args: Vec<OsString>,
 
     /// Path to check
     #[arg(long, help_heading = "QUERY")]
@@ -2318,7 +2319,7 @@ pub struct LearnArgs {
 
     /// Command to trace
     #[arg(required = true, hide = true)]
-    pub command: Vec<String>,
+    pub command: Vec<OsString>,
 
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]

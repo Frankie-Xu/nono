@@ -128,7 +128,7 @@ pub(crate) fn strip_untrusted_unsafe_seatbelt_rules(
 /// (and is a user profile), use it. If the CLI also provides a trailing
 /// command, warn that the profile binary takes precedence.
 fn resolve_program_from_profile_or_cli(
-    cli_command: &[String],
+    cli_command: &[OsString],
     loaded_profile: Option<(&str, &profile::Profile)>,
     silent: bool,
 ) -> Result<(OsString, Vec<OsString>)> {
@@ -140,16 +140,13 @@ fn resolve_program_from_profile_or_cli(
             crate::output::print_warning(&format!(
                 "Profile specifies binary '{}'; ignoring trailing command '{}'",
                 binary,
-                cli_command.join(" ")
+                crate::command_display::format_command_line(cli_command)
             ));
         }
         let program = OsString::from(&binary);
         Ok((program, Vec::new()))
-    } else if !cli_command.is_empty() {
-        let mut iter = cli_command.iter();
-        let program = OsString::from(iter.next().ok_or(NonoError::NoCommand)?);
-        let cmd_args: Vec<OsString> = iter.map(OsString::from).collect();
-        Ok((program, cmd_args))
+    } else if let Some((program, cmd_args)) = cli_command.split_first() {
+        Ok((program.clone(), cmd_args.to_vec()))
     } else {
         Err(NonoError::NoCommand)
     }
@@ -337,13 +334,11 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     let command = wrap_args.command;
     let no_diagnostics = wrap_args.no_diagnostics;
 
-    if command.is_empty() {
+    let Some((program, cmd_args)) = command.split_first() else {
         return Err(NonoError::NoCommand);
-    }
-
-    let mut command_iter = command.into_iter();
-    let program = OsString::from(command_iter.next().ok_or(NonoError::NoCommand)?);
-    let cmd_args: Vec<OsString> = command_iter.map(OsString::from).collect();
+    };
+    let program = program.clone();
+    let cmd_args = cmd_args.to_vec();
 
     if args.dry_run {
         let prepared = prepare_sandbox(&args, silent)?;

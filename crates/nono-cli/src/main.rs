@@ -117,12 +117,13 @@ fn main() {
     }
     tool_sandbox::record_main_start();
 
-    let legacy_network_warnings = collect_legacy_network_warnings();
+    let os_args: Vec<_> = std::env::args_os().collect();
+
+    let legacy_network_warnings = collect_legacy_network_warnings(&os_args);
     normalize_legacy_flag_env_vars();
     // Emit one deprecation warning per distinct legacy long flag before clap
     // parses. clap's `alias` rebinds `--override-deny` to `--bypass-protection`
     // silently; without this scan the user would never see a removal notice.
-    let os_args: Vec<_> = std::env::args_os().collect();
     deprecated_schema::warn_for_deprecated_flags(&os_args);
     let cli = Cli::parse();
     init_tracing(&cli);

@@ -254,7 +254,9 @@ pub(crate) fn offer_save_run_profile(offer: &ProfileSaveOffer<'_>) -> Result<()>
         merge_profile_patch(&mut patch, &url_patch);
     }
 
-    let cmd_name = command_name(offer.command)?;
+    let Some(cmd_name) = offer_command_name(offer.command) else {
+        return Ok(());
+    };
 
     // Try the interactive selector first; fall back to the text prompt when
     // raw mode is unavailable (e.g. a dumb terminal or a redirected TTY).
@@ -277,7 +279,7 @@ pub(crate) fn offer_save_run_profile(offer: &ProfileSaveOffer<'_>) -> Result<()>
 /// Offer profile save when only URL denials exist (no filesystem patch).
 fn offer_url_only_save(
     url_denials: &[UrlDenialRecord],
-    command: &[String],
+    command: &[std::ffi::OsString],
     compared_profile: Option<&str>,
 ) -> Result<()> {
     if url_denials.is_empty() {
@@ -288,7 +290,9 @@ fn offer_url_only_save(
         return Ok(());
     };
 
-    let cmd_name = command_name(command)?;
+    let Some(cmd_name) = offer_command_name(command) else {
+        return Ok(());
+    };
 
     match interactive_denial_selector(&url_patch)? {
         Some(items) => {
@@ -304,7 +308,7 @@ fn offer_url_only_save(
 fn offer_save_with_patch(
     patch: &profile::Profile,
     cmd_name: &str,
-    command: &[String],
+    command: &[std::ffi::OsString],
     compared_profile: Option<&str>,
 ) -> Result<()> {
     let has_overrides = patch_has_policy_overrides(patch);
@@ -351,7 +355,7 @@ fn offer_save_with_patch(
 fn offer_save_text_prompt(
     patch: &profile::Profile,
     cmd_name: &str,
-    command: &[String],
+    command: &[std::ffi::OsString],
     compared_profile: Option<&str>,
 ) -> Result<()> {
     let has_overrides = patch_has_policy_overrides(patch);
@@ -566,13 +570,32 @@ fn parse_profile_save_choice(input: &str, can_suppress: bool) -> Option<ProfileS
     }
 }
 
-pub(crate) fn command_name(command: &[String]) -> Result<String> {
+fn command_name<S: AsRef<std::ffi::OsStr>>(command: &[S]) -> Result<String> {
     command
         .first()
-        .and_then(|command| std::path::Path::new(command).file_name())
+        .and_then(|command| std::path::Path::new(command.as_ref()).file_name())
         .and_then(|name| name.to_str())
         .map(ToOwned::to_owned)
         .ok_or_else(|| NonoError::LearnError("Cannot derive profile name from command".to_string()))
+}
+
+/// Derive the profile name for a save *offer*, warning and returning `None`
+/// when it cannot be derived.
+///
+/// Every caller runs after the traced or sandboxed child has already finished,
+/// so an undeliverable offer must not become the run's result: propagating here
+/// would replace the child's exit status with an error about profile naming.
+pub(crate) fn offer_command_name<S: AsRef<std::ffi::OsStr>>(command: &[S]) -> Option<String> {
+    match command_name(command) {
+        Ok(name) => Some(name),
+        Err(_) => {
+            crate::output::print_warning(
+                "Skipping profile save: cannot derive a profile name from the command \
+                 (a profile name must be valid UTF-8).",
+            );
+            None
+        }
+    }
 }
 
 pub(crate) fn confirm(prompt: &str, default_yes: bool) -> Result<bool> {
@@ -750,7 +773,7 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn print_profile_save(prepared: &PreparedProfileSave, command: &[String]) {
+pub(crate) fn print_profile_save(prepared: &PreparedProfileSave, command: &[std::ffi::OsString]) {
     let status = match prepared.action {
         SaveAction::Created => "Profile saved:",
         SaveAction::Updated => "Profile updated:",
@@ -2231,6 +2254,26 @@ mod tests {
         assert_eq!(
             suggested_run_profile_name(Some("claude-code"), "copilot"),
             Some("claude-code-local".to_string())
+        );
+    }
+
+    /// Issue #1504: a profile name becomes a filename and a JSON key, so a
+    /// non-UTF-8 program name cannot yield one. The offer is skipped rather than
+    /// failed, because the child whose exit status we still owe has already run.
+    #[test]
+    fn offer_command_name_skips_non_utf8_program_without_erroring() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(
+            offer_command_name(&[OsString::from("/usr/bin/claude")]),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            offer_command_name(
+                &[std::ffi::OsStr::from_bytes(b"/usr/bin/cl\xffude").to_os_string()]
+            ),
+            None
         );
     }
 
