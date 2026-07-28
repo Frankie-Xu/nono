@@ -53,13 +53,34 @@ pub(crate) use env_sanitization::validate_set_vars;
 ///
 /// # Errors
 /// Returns an error if the program cannot be found in PATH or as a valid path.
-pub fn resolve_program(program: &str) -> Result<PathBuf> {
+pub fn resolve_program(program: &OsStr) -> Result<PathBuf> {
     which::which(program).map_err(|e| {
+        // Escaped only when the name is not valid UTF-8: this message names the
+        // program that could not be found, so those bytes must stay legible,
+        // but escaping the ordinary case would just add quotes to every miss.
+        let shown = program
+            .to_str()
+            .map_or_else(|| format!("{program:?}"), str::to_owned);
         NonoError::CommandExecution(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("{}: {}", program, e),
+            format!("{shown}: {e}"),
         ))
     })
+}
+
+/// Build the `argv` vector handed to `execve`: the resolved program followed by
+/// each argument.
+///
+/// Rejects an embedded NUL, which cannot be represented in argv at all.
+fn build_execve_argv(program_c: &CString, cmd_args: &[std::ffi::OsString]) -> Result<Vec<CString>> {
+    let mut argv_c: Vec<CString> = Vec::with_capacity(1 + cmd_args.len());
+    argv_c.push(program_c.clone());
+    for arg in cmd_args {
+        argv_c.push(CString::new(arg.as_bytes()).map_err(|_| {
+            NonoError::SandboxInit(format!("Argument contains null byte: {arg:?}"))
+        })?);
+    }
+    Ok(argv_c)
 }
 
 /// Maximum threads allowed when keyring backend is active.
@@ -83,7 +104,7 @@ pub(crate) struct ProfileSaveOffer<'a> {
     pub(crate) policy_explanations: &'a [crate::diagnostic::PolicyExplanation],
     pub(crate) error_observation: &'a crate::diagnostic::ErrorObservation,
     pub(crate) caps: &'a CapabilitySet,
-    pub(crate) command: &'a [String],
+    pub(crate) command: &'a [std::ffi::OsString],
     pub(crate) compared_profile: Option<&'a str>,
     pub(crate) sandbox_violations: &'a [nono::SandboxViolation],
     pub(crate) ignored_denial_paths: &'a [std::path::PathBuf],
@@ -226,7 +247,7 @@ impl SeccompPolicy {
 /// Configuration for command execution.
 pub struct ExecConfig<'a> {
     /// The command to execute (program + args).
-    pub command: &'a [String],
+    pub command: &'a [std::ffi::OsString],
     /// Pre-resolved absolute path to the program.
     /// This is resolved BEFORE the sandbox is applied to ensure the program
     /// can be found even if its directory is not in the sandbox's allowed paths.
@@ -508,25 +529,17 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     let program = &config.command[0];
     let cmd_args = &config.command[1..];
 
-    info!("Executing (supervised): {} {:?}", program, cmd_args);
+    info!("Executing (supervised): {:?} {:?}", program, cmd_args);
 
     // Use pre-resolved program path (resolved before fork)
     let program_path = config.resolved_program;
 
-    // Convert program path to CString for execve
-    let program_c = CString::new(program_path.to_string_lossy().as_bytes())
+    let program_c = CString::new(program_path.as_os_str().as_bytes())
         .map_err(|_| NonoError::SandboxInit("Program path contains null byte".to_string()))?;
     let current_dir_c = CString::new(config.current_dir.as_os_str().as_bytes())
         .map_err(|_| NonoError::SandboxInit("Working directory contains null byte".to_string()))?;
 
-    // Build argv: [program, args..., NULL]
-    let mut argv_c: Vec<CString> = Vec::with_capacity(1 + cmd_args.len());
-    argv_c.push(program_c.clone());
-    for arg in cmd_args {
-        argv_c.push(CString::new(arg.as_bytes()).map_err(|_| {
-            NonoError::SandboxInit(format!("Argument contains null byte: {}", arg))
-        })?);
-    }
+    let argv_c = build_execve_argv(&program_c, cmd_args)?;
 
     // Create supervisor socket pair only when the exec'd child actually needs
     // to talk back to the unsandboxed parent. The supervised parent/session
@@ -1718,11 +1731,16 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     )
                     .with_canonical_denial_paths(canonical_denial_paths);
                 if let Some(program) = config.command.first() {
+                    let argv_display: Vec<String> = config
+                        .command
+                        .iter()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect();
                     base_formatter =
                         base_formatter.with_command(crate::diagnostic::CommandContext {
-                            program: program.clone(),
+                            program: program.to_string_lossy().into_owned(),
                             resolved_path: config.resolved_program.to_path_buf(),
-                            args: nono::scrub_argv_with_policy(config.command, redaction_policy),
+                            args: nono::scrub_argv_with_policy(&argv_display, redaction_policy),
                         });
                 }
 
@@ -4380,6 +4398,49 @@ mod tests {
             .iter()
             .map(|c| c.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// Issue #1504: argv elements are byte strings on Unix, so an argument that
+    /// is not valid UTF-8 must reach `execve` unchanged rather than being
+    /// lossily rewritten to U+FFFD.
+    #[test]
+    fn build_execve_argv_preserves_non_utf8_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let program_c = CString::new("/bin/echo").expect("program cstring");
+        let raw = OsStr::from_bytes(b"pre\xffpost").to_os_string();
+        let args = vec![OsString::from("plain"), raw];
+
+        let argv = build_execve_argv(&program_c, &args).expect("build argv");
+
+        assert_eq!(argv.len(), 3, "program plus both arguments");
+        assert_eq!(argv[0].as_bytes(), b"/bin/echo");
+        assert_eq!(argv[1].as_bytes(), b"plain");
+        assert_eq!(
+            argv[2].as_bytes(),
+            b"pre\xffpost",
+            "non-UTF-8 argument must survive byte-for-byte"
+        );
+        assert!(
+            !argv[2]
+                .as_bytes()
+                .windows(3)
+                .any(|w| w == [0xef, 0xbf, 0xbd]),
+            "argument must not contain the U+FFFD replacement character"
+        );
+    }
+
+    /// An embedded NUL cannot be represented in argv, so it is the one input
+    /// that must be rejected rather than forwarded.
+    #[test]
+    fn build_execve_argv_rejects_embedded_nul() {
+        use std::ffi::OsString;
+
+        let program_c = CString::new("/bin/echo").expect("program cstring");
+        let args = vec![OsString::from("bad\0arg")];
+
+        assert!(build_execve_argv(&program_c, &args).is_err());
     }
 
     #[test]
