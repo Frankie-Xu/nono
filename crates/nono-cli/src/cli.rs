@@ -299,6 +299,19 @@ pub enum Commands {
 
     /// Enroll with and inspect an audit control plane
     #[command(subcommand_help_heading = "COMMANDS", disable_help_subcommand = true)]
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono platform <command>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono platform enroll --url https://nono.example.com --token \"$TOKEN\"
+  nono platform status
+  nono platform status --json
+")]
     Platform(PlatformArgs),
 
     /// Manage file trust and attestation
@@ -4493,6 +4506,7 @@ mod tests {
         "session",
         "rollback",
         "audit",
+        "platform",
         "trust",
         "policy",
         "profile",
