@@ -227,6 +227,7 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         | Commands::Rollback(_)
         | Commands::Trust(_)
         | Commands::Audit(_)
+        | Commands::Platform(_)
         | Commands::Pull(_)
         | Commands::Remove(_)
         | Commands::Update(_)

@@ -47,6 +47,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   session    Manage runtime session storage
   rollback   Manage rollback sessions (browse, restore, cleanup)
   audit      View audit trail of sandboxed commands
+  platform   Enroll with and inspect an audit control plane
   trust      Manage file trust and attestation
 
 \x1b[1mPACKS\x1b[0m
@@ -295,6 +296,23 @@ pub enum Commands {
   nono audit show <id> --json                  # Export as JSON
 ")]
     Audit(AuditArgs),
+
+    /// Enroll with and inspect an audit control plane
+    #[command(subcommand_help_heading = "COMMANDS", disable_help_subcommand = true)]
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono platform <command>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono platform enroll --url https://nono.example.com --token \"$TOKEN\"
+  nono platform status
+  nono platform status --json
+")]
+    Platform(PlatformArgs),
 
     /// Manage file trust and attestation
     #[command(subcommand_help_heading = "COMMANDS", disable_help_subcommand = true)]
@@ -2503,6 +2521,111 @@ pub enum AuditCommands {
     Verify(AuditVerifyArgs),
     /// Remove old audit sessions
     Cleanup(AuditCleanupArgs),
+    /// Deliver queued final audit sessions to the enrolled platform
+    Sync(AuditSyncArgs),
+    /// Show audit delivery queue status
+    Status(AuditStatusArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct AuditSyncArgs {
+    /// Print delivery results as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct AuditStatusArgs {
+    /// Print status as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// Platform enrollment command args
+// ---------------------------------------------------------------------------
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PlatformArgs {
+    #[command(subcommand)]
+    pub command: PlatformCommands,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PlatformCommands {
+    /// Exchange a one-time token for an audit-only enrolled identity
+    Enroll(PlatformEnrollArgs),
+    /// Show the locally enrolled platform identity
+    Status(PlatformStatusArgs),
+    /// Remove the local platform enrollment
+    Unenroll(PlatformUnenrollArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PlatformEnrollArgs {
+    /// Platform origin, for example https://nono.example.com
+    #[arg(long)]
+    pub url: String,
+
+    /// Short-lived, single-use enrollment token
+    #[arg(long)]
+    pub token: String,
+
+    /// Enroll as a durable workload instead of a developer device
+    #[arg(long)]
+    pub workload: bool,
+
+    /// Operator-facing label for this device or workload
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Private key location (keystore:// name or absolute file:// URI)
+    #[arg(long, default_value = "keystore://platform-device")]
+    pub keyref: String,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PlatformStatusArgs {
+    /// Print status as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PlatformUnenrollArgs {
+    /// Also delete the local signing key (the next enrollment mints a new one)
+    #[arg(long)]
+    pub delete_key: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
 }
 
 #[derive(Parser, Debug)]
@@ -4397,6 +4520,7 @@ mod tests {
         "session",
         "rollback",
         "audit",
+        "platform",
         "trust",
         "policy",
         "profile",

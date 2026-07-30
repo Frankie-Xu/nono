@@ -5,6 +5,7 @@
 mod app_runtime;
 mod approval_runtime;
 mod audit_attestation;
+mod audit_client;
 mod audit_commands;
 mod audit_event_reader;
 mod audit_integrity;
@@ -47,6 +48,7 @@ mod package;
 mod package_cmd;
 mod package_status;
 mod platform;
+mod platform_client;
 mod policy;
 mod profile;
 mod profile_cmd;

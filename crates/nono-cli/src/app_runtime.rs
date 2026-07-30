@@ -7,6 +7,7 @@ use crate::learn_runtime::run_learn;
 use crate::open_url_runtime::run_open_url_helper;
 use crate::output;
 use crate::package_cmd;
+use crate::platform_client;
 use crate::profile_cmd;
 use crate::proxy_command;
 use crate::registry_client::PullReason;
@@ -66,6 +67,9 @@ fn dispatch_command(
         Commands::Audit(args) => {
             run_command_with_update(update_handle, silent, || audit_commands::run_audit(args))
         }
+        Commands::Platform(args) => run_command_with_update(update_handle, silent, || {
+            platform_client::run_platform(args)
+        }),
         Commands::Ps(args) => {
             run_command_with_update(update_handle, silent, || session_commands::run_ps(&args))
         }

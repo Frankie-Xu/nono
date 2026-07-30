@@ -34,6 +34,8 @@ pub fn run_audit(args: AuditArgs) -> Result<()> {
         AuditCommands::Show(args) => cmd_show(args),
         AuditCommands::Verify(args) => cmd_verify(args),
         AuditCommands::Cleanup(args) => cmd_cleanup(args),
+        AuditCommands::Sync(args) => crate::audit_client::run_sync(args),
+        AuditCommands::Status(args) => crate::audit_client::run_status(args),
     }
 }
 
