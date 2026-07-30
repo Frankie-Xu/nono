@@ -1,6 +1,8 @@
 //! Audit-only platform enrollment and protected local identity state.
 
-use crate::cli::{PlatformArgs, PlatformCommands, PlatformEnrollArgs, PlatformStatusArgs};
+use crate::cli::{
+    PlatformArgs, PlatformCommands, PlatformEnrollArgs, PlatformStatusArgs, PlatformUnenrollArgs,
+};
 use crate::trust_keystore::{self, TrustKeyRef};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
@@ -62,6 +64,7 @@ pub(crate) fn run_platform(args: PlatformArgs) -> Result<()> {
     match args.command {
         PlatformCommands::Enroll(args) => enroll(args),
         PlatformCommands::Status(args) => status(args),
+        PlatformCommands::Unenroll(args) => unenroll(args),
     }
 }
 
@@ -169,6 +172,43 @@ fn status(args: PlatformStatusArgs) -> Result<()> {
         println!("  Tenant:   {}", state.tenant_id);
         println!("  Subject:  {} ({})", state.subject_id, state.subject_kind);
         println!("  Mode:     {}", state.management_mode);
+    }
+    Ok(())
+}
+
+/// Remove the local enrollment. Local-only by design: the platform-side
+/// subject stays active until a human revokes it in the console, because the
+/// device key must not be able to erase its own registration.
+fn unenroll(args: PlatformUnenrollArgs) -> Result<()> {
+    let state_path = state_path()?;
+    let Some(state) = load_state()? else {
+        println!("Not enrolled with a platform.");
+        return Ok(());
+    };
+    let queued = crate::audit_client::queued_count()?;
+
+    fs::remove_file(&state_path).map_err(|source| NonoError::ConfigWrite {
+        path: state_path.clone(),
+        source,
+    })?;
+    println!("Unenrolled from {}.", state.platform_url);
+    println!(
+        "  Subject {} stays registered with tenant {} until an operator revokes it.",
+        state.subject_id, state.tenant_id
+    );
+    if args.delete_key {
+        let key_ref = TrustKeyRef::parse(&state.key_ref)?;
+        let key_label = key_ref.key_id()?;
+        trust_keystore::remove_secret_for_ref(&key_ref, PLATFORM_KEY_SERVICE, &key_label)?;
+        println!("  Local signing key deleted; the next enrollment mints a new one.");
+    } else {
+        println!("  Local signing key kept; pass --delete-key to remove it.");
+    }
+    if queued > 0 {
+        println!(
+            "  {queued} audit session(s) remain queued and will be delivered after the next \
+             enrollment."
+        );
     }
     Ok(())
 }

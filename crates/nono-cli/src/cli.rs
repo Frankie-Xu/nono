@@ -2572,6 +2572,8 @@ pub enum PlatformCommands {
     Enroll(PlatformEnrollArgs),
     /// Show the locally enrolled platform identity
     Status(PlatformStatusArgs),
+    /// Remove the local platform enrollment
+    Unenroll(PlatformUnenrollArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -2608,6 +2610,18 @@ pub struct PlatformStatusArgs {
     /// Print status as JSON
     #[arg(long)]
     pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PlatformUnenrollArgs {
+    /// Also delete the local signing key (the next enrollment mints a new one)
+    #[arg(long)]
+    pub delete_key: bool,
 
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]

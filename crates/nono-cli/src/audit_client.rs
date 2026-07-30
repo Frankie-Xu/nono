@@ -11,7 +11,7 @@ use nono::audit::{
     AUDIT_EVENTS_FILENAME, canonical_session_digest_payload, compute_session_digest,
     verify_audit_log,
 };
-use nono::undo::SessionMetadata;
+use nono::undo::{SessionMetadata, SnapshotManager};
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -98,6 +98,13 @@ impl QueuedAudit {
         }
     }
 
+    fn shipper_id(&self) -> &str {
+        match self {
+            Self::V2(queued) => &queued.envelope.shipper_id,
+            Self::V1(queued) => &queued.envelope.shipper_id,
+        }
+    }
+
     fn session_dir(&self) -> &Path {
         match self {
             Self::V2(queued) => &queued.session_dir,
@@ -168,7 +175,19 @@ pub(crate) fn run_sync(args: AuditSyncArgs) -> Result<()> {
     let mut failures = recover_missing_queue_items(&state)?;
     for path in queued_paths()? {
         attempted += 1;
-        match load_queued(&path).and_then(|queued| deliver_queued(&state, &path, &queued)) {
+        let result = load_queued(&path).and_then(|queued| {
+            if queued.shipper_id() == state.subject_id {
+                deliver_queued(&state, &path, &queued)
+            } else {
+                // Queued under a previous enrollment: the platform refuses an
+                // envelope whose shipper is not the authenticated subject, so
+                // re-mint it from the local session evidence before delivery.
+                let (rebuilt_path, rebuilt) =
+                    requeue_under_current_enrollment(&state, &path, &queued)?;
+                deliver_queued(&state, &rebuilt_path, &rebuilt)
+            }
+        });
+        match result {
             Ok(()) => delivered += 1,
             Err(error) => failures.push(format!("{}: {error}", path.display())),
         }
@@ -267,6 +286,39 @@ fn build_queued_audit(
         },
         session_dir: session_dir.to_path_buf(),
     }))
+}
+
+/// Re-mint a queue item that names a previous enrollment's identity.
+///
+/// The envelope is rebuilt from the session evidence still on disk — which
+/// re-verifies the hash chain — under the current subject, tenant, and a fresh
+/// ingest ID. The replacement is durably queued before the stale item is
+/// removed; a crash between the two steps double-queues the session, which is
+/// safe: the platform refuses the twin with its duplicate-session conflict, so
+/// nothing is silently dropped.
+fn requeue_under_current_enrollment(
+    state: &PlatformState,
+    stale_path: &Path,
+    stale: &QueuedAudit,
+) -> Result<(PathBuf, QueuedAudit)> {
+    let session_dir = stale.session_dir();
+    if !session_dir.is_dir() {
+        return Err(NonoError::Snapshot(format!(
+            "queued under a previous enrollment as {} and the session evidence at {} is no \
+             longer on disk; remove the outbox item to drop the session",
+            stale.shipper_id(),
+            session_dir.display()
+        )));
+    }
+    let metadata = SnapshotManager::load_session_metadata(session_dir)?;
+    let rebuilt = build_queued_audit(session_dir, &metadata, state)?;
+    let rebuilt_path = outbox_path(rebuilt.ingest_id())?;
+    write_json_secure(&rebuilt_path, &rebuilt)?;
+    fs::remove_file(stale_path).map_err(|source| NonoError::ConfigWrite {
+        path: stale_path.to_path_buf(),
+        source,
+    })?;
+    Ok((rebuilt_path, rebuilt))
 }
 
 fn deliver_queued(state: &PlatformState, path: &Path, queued: &QueuedAudit) -> Result<()> {
@@ -430,6 +482,10 @@ fn queued_session_id(path: &Path) -> Option<String> {
         .pointer("/envelope/session_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+pub(crate) fn queued_count() -> Result<usize> {
+    Ok(queued_paths()?.len())
 }
 
 fn queued_paths() -> Result<Vec<PathBuf>> {
@@ -634,6 +690,78 @@ mod tests {
 
         assert!(recover_missing_queue_items(&state()).unwrap().is_empty());
         assert_eq!(queued_paths().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sync_requeues_stale_enrollment_items_under_the_current_identity() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let state_home = root.path().join("state");
+        fs::create_dir_all(&home).unwrap();
+        let home = home.to_string_lossy().to_string();
+        let state_home = state_home.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", home.as_str()),
+            ("XDG_STATE_HOME", state_home.as_str()),
+        ]);
+
+        let session_dir = crate::audit_session::audit_root()
+            .unwrap()
+            .join("session-stale");
+        fs::create_dir_all(&session_dir).unwrap();
+        let mut recorder = AuditRecorder::new(session_dir.clone()).unwrap();
+        recorder
+            .record_session_started("2026-07-01T10:00:00Z".to_string(), vec!["true".to_string()])
+            .unwrap();
+        recorder
+            .record_session_ended("2026-07-01T10:00:01Z".to_string(), 0)
+            .unwrap();
+        let session_metadata = metadata("session-stale", recorder.finalize().unwrap());
+        nono::undo::SnapshotManager::write_session_metadata(&session_dir, &session_metadata)
+            .unwrap();
+
+        let mut old_state = state();
+        old_state.subject_id = "subject-retired".to_string();
+        old_state.tenant_id = "oldco".to_string();
+        let stale = build_queued_audit(&session_dir, &session_metadata, &old_state).unwrap();
+        let stale_path = outbox_path(stale.ingest_id()).unwrap();
+        write_json_secure(&stale_path, &stale).unwrap();
+
+        let current_state = state();
+        let loaded = load_queued(&stale_path).unwrap();
+        assert_ne!(loaded.shipper_id(), current_state.subject_id);
+
+        let (rebuilt_path, rebuilt) =
+            requeue_under_current_enrollment(&current_state, &stale_path, &loaded).unwrap();
+        assert!(!stale_path.exists());
+        assert!(rebuilt_path.exists());
+        let envelope = rebuilt.current_envelope().unwrap();
+        assert_eq!(envelope.shipper_id, "subject-1");
+        assert_eq!(envelope.tenant_id, "acme");
+        assert_eq!(envelope.session_id, "session-stale");
+        assert_ne!(envelope.ingest_id, stale.ingest_id());
+        assert_eq!(
+            envelope.session_digest,
+            compute_session_digest(&session_metadata)
+                .unwrap()
+                .to_string()
+        );
+
+        // Without the local session evidence a stale item cannot be re-minted:
+        // it must fail loudly and stay queued rather than vanish.
+        let second_stale = build_queued_audit(&session_dir, &session_metadata, &old_state).unwrap();
+        let second_path = outbox_path(second_stale.ingest_id()).unwrap();
+        write_json_secure(&second_path, &second_stale).unwrap();
+        fs::remove_dir_all(&session_dir).unwrap();
+        let error = requeue_under_current_enrollment(
+            &current_state,
+            &second_path,
+            &load_queued(&second_path).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("previous enrollment"));
+        assert!(second_path.exists());
     }
 
     #[test]
