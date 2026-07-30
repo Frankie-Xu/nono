@@ -476,12 +476,21 @@ fn recover_missing_queue_items(state: &PlatformState) -> Result<Vec<String>> {
 }
 
 fn queued_session_id(path: &Path) -> Option<String> {
+    // Outbox items embed the full event log, so deserialize only the one field
+    // needed instead of materializing the whole document. Unknown fields —
+    // including future schema versions — are skipped without allocating.
+    #[derive(Deserialize)]
+    struct SessionIdEnvelope {
+        session_id: String,
+    }
+    #[derive(Deserialize)]
+    struct SessionIdItem {
+        envelope: SessionIdEnvelope,
+    }
     let contents = fs::read_to_string(path).ok()?;
-    let queued = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
-    queued
-        .pointer("/envelope/session_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
+    serde_json::from_str::<SessionIdItem>(&contents)
+        .ok()
+        .map(|item| item.envelope.session_id)
 }
 
 pub(crate) fn queued_count() -> Result<usize> {

@@ -122,6 +122,8 @@ fn enroll(args: PlatformEnrollArgs) -> Result<()> {
             "platform returned an unsupported enrollment contract".to_string(),
         ));
     }
+    validate_wire_identifier("tenant id", &response.tenant_id)?;
+    validate_wire_identifier("subject id", &response.subject_id)?;
 
     let state = PlatformState {
         protocol_version: response.protocol_version,
@@ -187,6 +189,14 @@ fn unenroll(args: PlatformUnenrollArgs) -> Result<()> {
     };
     let queued = crate::audit_client::queued_count()?;
 
+    // Delete the key before the state file: the state holds the only key_ref,
+    // so removing it first would orphan the key in the keystore if deletion
+    // failed. Key removal is idempotent, so a failure here is retryable.
+    if args.delete_key {
+        let key_ref = TrustKeyRef::parse(&state.key_ref)?;
+        let key_label = key_ref.key_id()?;
+        trust_keystore::remove_secret_for_ref(&key_ref, PLATFORM_KEY_SERVICE, &key_label)?;
+    }
     fs::remove_file(&state_path).map_err(|source| NonoError::ConfigWrite {
         path: state_path.clone(),
         source,
@@ -197,9 +207,6 @@ fn unenroll(args: PlatformUnenrollArgs) -> Result<()> {
         state.subject_id, state.tenant_id
     );
     if args.delete_key {
-        let key_ref = TrustKeyRef::parse(&state.key_ref)?;
-        let key_label = key_ref.key_id()?;
-        trust_keystore::remove_secret_for_ref(&key_ref, PLATFORM_KEY_SERVICE, &key_label)?;
         println!("  Local signing key deleted; the next enrollment mints a new one.");
     } else {
         println!("  Local signing key kept; pass --delete-key to remove it.");
@@ -270,6 +277,10 @@ pub(crate) fn load_state() -> Result<Option<PlatformState>> {
             "unsupported local platform enrollment state".to_string(),
         ));
     }
+    // Re-validated on every load, not just at enrollment, so a tampered state
+    // file cannot inject bytes into signed request headers either.
+    validate_wire_identifier("tenant id", &state.tenant_id)?;
+    validate_wire_identifier("subject id", &state.subject_id)?;
     Ok(Some(state))
 }
 
@@ -306,11 +317,22 @@ pub(crate) fn canonical_request_v1(
 }
 
 pub(crate) fn endpoint_url(platform_url: &str, path: &str) -> Result<String> {
-    let base = url::Url::parse(platform_url)
+    let mut url = url::Url::parse(platform_url)
         .map_err(|error| NonoError::ConfigParse(format!("invalid platform URL: {error}")))?;
-    base.join(path)
-        .map(|url| url.to_string())
-        .map_err(|error| NonoError::ConfigParse(format!("invalid platform endpoint: {error}")))
+    if url.cannot_be_a_base() {
+        return Err(NonoError::ConfigParse(format!(
+            "invalid platform URL: {platform_url}"
+        )));
+    }
+    // Url::join drops the base path when the endpoint starts with '/', which
+    // would break a platform served under a subpath. Append instead.
+    let joined = format!(
+        "{}/{}",
+        url.path().trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    url.set_path(&joined);
+    Ok(url.to_string())
 }
 
 pub(crate) fn http_agent(global_timeout: Duration) -> ureq::Agent {
@@ -325,6 +347,25 @@ pub(crate) fn http_agent(global_timeout: Duration) -> ureq::Agent {
         .tls_config(tls_config)
         .build()
         .new_agent()
+}
+
+/// Reject platform-supplied identifiers that could not be safely embedded in
+/// HTTP headers or the newline-delimited canonical signing string. A malicious
+/// platform must not be able to smuggle CRLF or separator bytes through
+/// `subject_id`/`tenant_id` into later signed requests.
+fn validate_wire_identifier(name: &str, value: &str) -> Result<()> {
+    let valid = !value.is_empty()
+        && value.len() <= 200
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(NonoError::ConfigParse(format!(
+            "platform-supplied {name} contains unsupported characters"
+        )))
+    }
 }
 
 fn validate_platform_url(value: &str) -> Result<String> {
@@ -368,6 +409,9 @@ pub(crate) fn write_json_secure<T: Serialize>(path: &Path, value: &T) -> Result<
         }
     })?;
 
+    let encoded = serde_json::to_vec_pretty(value)
+        .map_err(|error| NonoError::ConfigParse(format!("failed to encode JSON: {error}")))?;
+
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     #[cfg(unix)]
     let mut file = OpenOptions::new()
@@ -388,18 +432,22 @@ pub(crate) fn write_json_secure<T: Serialize>(path: &Path, value: &T) -> Result<
             path: tmp.clone(),
             source,
         })?;
-    let encoded = serde_json::to_vec_pretty(value)
-        .map_err(|error| NonoError::ConfigParse(format!("failed to encode JSON: {error}")))?;
-    file.write_all(&encoded)
-        .and_then(|_| file.sync_all())
-        .map_err(|source| NonoError::ConfigWrite {
-            path: tmp.clone(),
+    // Remove the temp file on any failure past this point: `create_new` means
+    // a leftover would make every later write to this path fail permanently.
+    let written = file.write_all(&encoded).and_then(|_| file.sync_all());
+    if let Err(source) = written {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(NonoError::ConfigWrite { path: tmp, source });
+    }
+    drop(file);
+    if let Err(source) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(NonoError::ConfigWrite {
+            path: path.to_path_buf(),
             source,
-        })?;
-    fs::rename(&tmp, path).map_err(|source| NonoError::ConfigWrite {
-        path: path.to_path_buf(),
-        source,
-    })?;
+        });
+    }
     if let Ok(parent_file) = File::open(parent) {
         let _ = parent_file.sync_all();
     }
@@ -407,6 +455,7 @@ pub(crate) fn write_json_secure<T: Serialize>(path: &Path, value: &T) -> Result<
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use serde::Deserialize;
@@ -447,5 +496,52 @@ mod tests {
         assert!(validate_platform_url("http://localhost:8090").is_ok());
         assert!(validate_platform_url("http://example.com").is_err());
         assert!(validate_platform_url("https://example.com").is_ok());
+    }
+
+    #[test]
+    fn endpoint_url_preserves_a_platform_subpath() {
+        assert_eq!(
+            endpoint_url("https://example.com/platform", "/api/v1/audit/ingest").unwrap(),
+            "https://example.com/platform/api/v1/audit/ingest"
+        );
+        assert_eq!(
+            endpoint_url("https://example.com/platform/", "/api/v1/audit/ingest").unwrap(),
+            "https://example.com/platform/api/v1/audit/ingest"
+        );
+        assert_eq!(
+            endpoint_url("https://example.com", "/api/v1/audit/ingest").unwrap(),
+            "https://example.com/api/v1/audit/ingest"
+        );
+        assert!(endpoint_url("data:text/plain,nope", "/api").is_err());
+    }
+
+    #[test]
+    fn wire_identifiers_reject_header_and_canonical_separators() {
+        assert!(validate_wire_identifier("subject id", "019fb1c9-fcae-7341").is_ok());
+        assert!(validate_wire_identifier("tenant id", "testagent").is_ok());
+        assert!(validate_wire_identifier("tenant id", "acme.prod_2").is_ok());
+        assert!(validate_wire_identifier("subject id", "evil\r\nX-Injected: 1").is_err());
+        assert!(validate_wire_identifier("subject id", "line\nbreak").is_err());
+        assert!(validate_wire_identifier("tenant id", "").is_err());
+        assert!(validate_wire_identifier("tenant id", &"a".repeat(201)).is_err());
+        assert!(validate_wire_identifier("tenant id", "spaced value").is_err());
+    }
+
+    #[test]
+    fn failed_write_json_secure_cleans_up_its_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A non-empty directory at the target makes the final rename fail.
+        let target = dir.path().join("state.json");
+        std::fs::create_dir_all(target.join("occupied")).unwrap();
+
+        assert!(write_json_secure(&target, &serde_json::json!({"a": 1})).is_err());
+        let tmp = target.with_extension(format!("tmp-{}", std::process::id()));
+        assert!(!tmp.exists(), "temp file must not survive a failed write");
+
+        // The same process can still write elsewhere — a leftover temp would
+        // make create_new fail permanently.
+        let ok_target = dir.path().join("ok.json");
+        write_json_secure(&ok_target, &serde_json::json!({"a": 1})).unwrap();
+        write_json_secure(&ok_target, &serde_json::json!({"a": 2})).unwrap();
     }
 }
