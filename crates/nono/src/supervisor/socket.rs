@@ -182,8 +182,9 @@ impl SupervisorSocket {
     ///
     /// Used on the parent side to receive the proxy seccomp notify fd number
     /// written by the child without `SCM_RIGHTS` (which would be intercepted
-    /// by the AF_UNIX BPF filter). The caller must use `pidfd_getfd` to
-    /// acquire the actual fd from the child process.
+    /// by the AF_UNIX BPF filter). In a `CLONE_FILES` bootstrap the number is
+    /// a borrowed shared table slot until the child reports `DETACHED`; the
+    /// legacy handoff can instead duplicate it with `pidfd_getfd`.
     #[cfg(target_os = "linux")]
     pub fn recv_raw_fd_number(&self) -> Result<std::os::unix::io::RawFd> {
         let mut bytes = [0u8; 4];

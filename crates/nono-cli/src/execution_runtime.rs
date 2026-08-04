@@ -33,7 +33,11 @@ fn apply_pre_fork_sandbox(
             info!("Direct mode: detected {}", detected);
             match sandbox_policy {
                 LinuxSandboxPolicy::Auto => {
-                    Sandbox::apply_auto_with_abi(caps, &detected)?;
+                    Sandbox::apply_seccomp_with_abi(
+                        caps,
+                        &detected,
+                        nono::sandbox::SeccompOpts::network_baseline(),
+                    )?;
                 }
                 LinuxSandboxPolicy::Landlock => {
                     Sandbox::apply_landlock_with_abi(caps, &detected)?;
