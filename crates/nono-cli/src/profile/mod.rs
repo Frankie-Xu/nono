@@ -2556,6 +2556,14 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
             .and_then(|p| p.extends);
     }
 
+    // Registry refs are not valid bare profile names, so resolve them from the
+    // pack store before the name check below rejects them.
+    if is_registry_ref(name_or_path) {
+        return find_pack_store_profile(name_or_path)
+            .and_then(|(profile_path, _)| parse_profile_file(&profile_path).ok())
+            .and_then(|p| p.extends);
+    }
+
     if !is_valid_profile_name(name_or_path) {
         return None;
     }
@@ -2748,7 +2756,7 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         // bypassing the post-pull cleanup hook in `migration::check_and_run`.
         // Idempotent: silent no-op when no legacy artifacts exist, so safe
         // to fire on every claude resolution.
-        if is_always_further_claude_pack(&profile_path) {
+        if is_official_claude_pack(&profile_path) {
             crate::legacy_cleanup::check_and_offer_cleanup()?;
         }
         return Ok(Some(profile));
@@ -2770,15 +2778,19 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
     Ok(None)
 }
 
-/// True when `profile_path` lives inside `<package_store>/nolabs-ai/claude/`.
-/// Used to gate legacy-cleanup invocation on the canonical claude pack
-/// rather than any pack that happens to publish a profile named `claude`
-/// or `claude-code`.
-fn is_always_further_claude_pack(profile_path: &Path) -> bool {
+/// Returns `true` when `profile_path` lives inside `<package_store>/<ns>/claude/` for one of the
+/// namespaces the official claude pack has been published under. Used to gate legacy-cleanup
+/// invocation on the canonical claude pack rather than any pack that happens to publish a profile
+/// named `claude` or `claude-code`.
+///
+/// The namespace list comes from `package_status` so both modules agree on what counts as the
+/// official pack.
+fn is_official_claude_pack(profile_path: &Path) -> bool {
     let Ok(store) = crate::package::package_store_dir() else {
         return false;
     };
-    profile_path_is_in_pack(profile_path, &store, "always-further", "claude")
+    crate::package_status::official_claude_pack_namespaces()
+        .any(|ns| profile_path_is_in_pack(profile_path, &store, ns, "claude"))
 }
 
 /// Pure path-component matcher: does `profile_path` live under
@@ -3001,7 +3013,16 @@ fn load_registry_profile(name_or_path: &str, cli_extends: &[String]) -> Result<P
     // Find the profile JSON in the installed pack
     for artifact in &manifest.artifacts {
         if artifact.artifact_type == crate::package::ArtifactType::Profile {
-            let install_name = artifact.install_as.as_deref().unwrap_or(&artifact.path);
+            let Some(install_name) = artifact.install_as.as_deref() else {
+                // `nono pull` rejects profile artifacts without `install_as`,
+                // so this only happens for a hand-built store.
+                tracing::warn!(
+                    "pack '{}' declares profile artifact '{}' without install_as; skipping",
+                    package_ref.key(),
+                    artifact.path
+                );
+                continue;
+            };
             let profile_path = install_dir
                 .join("profiles")
                 .join(format!("{install_name}.json"));
@@ -4249,6 +4270,35 @@ mod tests {
             "always-further",
             "claude"
         ));
+    }
+
+    /// Wrapped in `with_config_env` so `package_store_dir()` returns the same
+    /// path here and inside `is_official_claude_pack`. It reads
+    /// `XDG_CONFIG_HOME` live on every call, so without holding `ENV_LOCK` a
+    /// parallel test swapping the env between the two reads would make them
+    /// disagree.
+    #[test]
+    fn official_claude_pack_matches_both_published_namespaces() {
+        with_config_env(|_config_dir| {
+            let store = crate::package::package_store_dir().expect("package store dir");
+
+            for ns in ["nolabs-ai", "always-further"] {
+                let path = store.join(ns).join("claude").join("profiles/claude.json");
+                assert!(
+                    is_official_claude_pack(&path),
+                    "{ns}/claude is the official claude pack"
+                );
+            }
+
+            let third_party = store
+                .join("someone-else")
+                .join("claude")
+                .join("profiles/claude.json");
+            assert!(
+                !is_official_claude_pack(&third_party),
+                "a third-party pack publishing a `claude` profile must not trigger legacy cleanup"
+            );
+        });
     }
 
     #[test]
@@ -9462,17 +9512,7 @@ mod tests {
     where
         F: FnOnce(&Path) -> R,
     {
-        let _guard = match crate::test_env::ENV_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        let tmp = tempdir().expect("tmpdir");
-        let config_dir = tmp.path().canonicalize().expect("canonicalize");
-        let _env = crate::test_env::EnvVarGuard::set_all(&[(
-            "XDG_CONFIG_HOME",
-            config_dir.to_str().expect("utf8"),
-        )]);
-        f(&config_dir)
+        crate::test_env::with_isolated_config_home(f)
     }
 
     /// Build a minimal pack store under `config_dir` (used as XDG_CONFIG_HOME).
@@ -9491,39 +9531,15 @@ mod tests {
         profile_json: &str,
         hook_file: Option<&str>,
     ) -> PathBuf {
-        let install_dir = config_dir
-            .join("nono")
-            .join("packages")
-            .join(ns)
-            .join(pack_name);
-        std::fs::create_dir_all(install_dir.join("profiles")).expect("create profiles dir");
-        if let Some(hf) = hook_file {
-            let hooks_dir = install_dir.join("hooks");
-            std::fs::create_dir_all(&hooks_dir).expect("create hooks dir");
-            std::fs::write(hooks_dir.join(hf), "#!/bin/sh\n").expect("write hook file");
-        }
-        // Write package.json manifest
-        let manifest = format!(
-            r#"{{
-              "schema_version": 1,
-              "name": "{pack_name}",
-              "artifacts": [{{
-                "type": "profile",
-                "path": "profiles/{install_as}.json",
-                "install_as": "{install_as}"
-              }}]
-            }}"#
-        );
-        std::fs::write(install_dir.join("package.json"), &manifest).expect("write package.json");
-        // Write profile JSON
-        std::fs::write(
-            install_dir
-                .join("profiles")
-                .join(format!("{install_as}.json")),
+        crate::test_env::write_fake_pack(
+            config_dir,
+            ns,
+            pack_name,
+            install_as,
             profile_json,
+            &[],
+            hook_file,
         )
-        .expect("write profile json");
-        install_dir
     }
 
     /// Test 1: A hook script starting with `$PACK_DIR` in a registry-pack profile
@@ -9955,6 +9971,93 @@ mod tests {
             after.source_pack.as_ref().map(PackageRef::key).as_deref(),
             Some("acme/widget-pack"),
             "absolute-path after hook must still have source_pack set"
+        );
+    }
+
+    #[test]
+    fn test_load_profile_extends_resolves_registry_refs_via_pack_store() {
+        let (from_ref, from_install_as) = with_config_env(|config_dir| {
+            build_fake_pack_store(
+                config_dir,
+                "acme",
+                "widget-pack",
+                "widget",
+                r#"{
+                    "meta": { "name": "widget" },
+                    "extends": ["node-dev", "default"]
+                }"#,
+                None,
+            );
+            (
+                load_profile_extends("acme/widget-pack"),
+                load_profile_extends("widget"),
+            )
+        });
+
+        assert_eq!(
+            from_ref.as_deref(),
+            Some(["node-dev".to_string(), "default".to_string()].as_slice()),
+            "registry ref must report the pack profile's bases"
+        );
+        assert_eq!(
+            from_ref, from_install_as,
+            "registry ref and install_as short name must agree"
+        );
+    }
+
+    #[test]
+    fn test_load_profile_extends_returns_none_for_unknown_registry_ref() {
+        let extends = with_config_env(|_config_dir| load_profile_extends("acme/not-installed"));
+        assert!(
+            extends.is_none(),
+            "an uninstalled pack ref has no resolvable bases"
+        );
+    }
+
+    #[test]
+    fn test_profile_artifact_without_install_as_is_rejected_by_load_and_extends() {
+        let (loaded, extends) = with_config_env(|config_dir| {
+            let install_dir = config_dir
+                .join("nono")
+                .join("packages")
+                .join("acme")
+                .join("no-install-as");
+            std::fs::create_dir_all(install_dir.join("profiles")).expect("create profiles dir");
+            std::fs::write(
+                install_dir.join("package.json"),
+                r#"{
+                  "schema_version": 1,
+                  "name": "no-install-as",
+                  "artifacts": [{
+                    "type": "profile",
+                    "path": "widget"
+                  }]
+                }"#,
+            )
+            .expect("write package.json");
+            std::fs::write(
+                install_dir.join("profiles").join("widget.json"),
+                r#"{
+                    "meta": { "name": "widget" },
+                    "extends": "nolabs-ai/claude"
+                }"#,
+            )
+            .expect("write pack profile");
+
+            (
+                load_profile_no_migrate("acme/no-install-as"),
+                load_profile_extends("acme/no-install-as"),
+            )
+        });
+
+        let err = loaded.expect_err("artifact without install_as must not resolve");
+        assert!(
+            err.to_string().contains("no profile found in pack"),
+            "expected a no-profile-found error, got: {err}"
+        );
+        assert!(
+            extends.is_none(),
+            "extends resolution must agree with the loader and report no bases"
         );
     }
 
