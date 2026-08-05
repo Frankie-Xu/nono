@@ -864,7 +864,7 @@ pub enum NetworkMode {
         /// The localhost port the proxy listens on
         port: u16,
         /// Ports the sandboxed process is allowed to bind and accept connections on.
-        /// This enables servers like OpenClaw gateway to listen while still routing
+        /// This enables servers that need to accept inbound connections while still routing
         /// outbound HTTP through the credential proxy.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         bind_ports: Vec<u16>,
@@ -1101,8 +1101,8 @@ impl CapabilitySet {
     ///
     /// Like `proxy_only`, but also allows the sandboxed process to bind and accept
     /// inbound connections on the specified ports. This is useful for servers that
-    /// need to listen (e.g., OpenClaw gateway on port 18789) while still routing
-    /// outbound HTTP through the credential injection proxy.
+    /// need to accept inbound connections while still routing outbound HTTP
+    /// through the credential injection proxy.
     ///
     /// On macOS: Seatbelt cannot filter by port, so this adds blanket
     /// `(allow network-bind)` and `(allow network-inbound)`.
