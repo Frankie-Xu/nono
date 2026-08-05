@@ -11,8 +11,6 @@
 name: Project automation
 
 on:
-  issues:
-    types: [opened]
   schedule:
     - cron: "*/10 * * * *" # triage reconcile
     - cron: "30 6 * * 1" # weekly backlog grooming (Mondays 06:30 UTC)
@@ -33,17 +31,6 @@ env:
   EXEMPT_LABELS: "pinned,keep,roadmap,epic" # never groom issues with these labels
 
 jobs:
-  # Unchanged behaviour: label brand-new issues for triage.
-  add-triage-label:
-    if: github.event_name == 'issues'
-    runs-on: ubuntu-latest
-    steps:
-      - run: gh issue edit "$NUMBER" --add-label "triage"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          NUMBER: ${{ github.event.issue.number }}
-
   # Remove the "triage" label once an issue has moved out of Backlog on the board.
   drop-triage-when-promoted:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
