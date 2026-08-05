@@ -287,17 +287,48 @@ All filesystem grants, denials, and deny-rule exemptions live under this single 
 
 | Field               | Type            | Description |
 |---------------------|-----------------|-------------|
-| `allow`             | array of string | Directories with read+write access. |
-| `read`              | array of string | Directories with read-only access. |
-| `write`             | array of string | Directories with write-only access. |
+| `allow`             | array of string | Directories with read+write access. Supports glob patterns (see below). |
+| `read`              | array of string | Directories or files with read-only access. Supports glob patterns (see below). |
+| `write`             | array of string | Directories with write-only access. Supports glob patterns (see below). |
 | `allow_file`        | array of string | Single files with read+write access. |
 | `read_file`         | array of string | Single files with read-only access. |
 | `write_file`        | array of string | Single files with write-only access. |
-| `deny`              | array of string | Paths denied filesystem access. |
-| `bypass_protection` | array of string | Paths exempted from deny groups. **This flag does not implicitly grant access** — `bypass_protection` only removes the deny rule; each path must also appear in `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant) to become accessible. |
+| `deny`              | array of string | Paths denied filesystem access. Supports glob patterns (see below). |
+| `bypass_protection` | array of string | Paths exempted from deny groups. **This flag does not implicitly grant access** — `bypass_protection` only removes the deny rule; each path must also appear in `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant) to become accessible. Supports glob patterns (see below). |
 | `ignore`            | array of string | Paths whose runtime denials should not be offered in save-profile prompts. Does not grant access or hide diagnostics. |
 
 All path fields support variable expansion (see Section 6).
+
+#### Glob patterns in path fields
+
+`allow`, `read`, `write`, `deny`, and `bypass_protection` support `*` and `**` glob patterns:
+
+| Pattern | Matches |
+|---------|---------|
+| `*` | Any filename within a single directory level. Does not cross `/`. |
+| `**` | Zero or more path segments, including across directories. `foo/**` matches everything *inside* `foo/`, at any depth, but does **not** match `foo` itself — add a separate literal entry for `foo` if you need that too. |
+| `**/<name>` | A file or directory named `<name>` at any depth, including at the root of the pattern. |
+
+Patterns without an absolute prefix (e.g. `**/.env`) are rooted at the workdir.
+
+Patterns are expanded at sandbox start against the filesystem as it exists at that moment.
+
+Only `*` and `**` are wildcards — every other character, including in real path segments the pattern happens to walk through (e.g. a directory literally named `[locale]`), is matched literally. `?` and character classes (`[abc]`) are rejected with a parse error rather than silently treated as wildcards.
+
+**Symlinks**: a glob only ever matches entries whose real, resolved location stays inside the directory the pattern is rooted at. A symlink inside that directory pointing elsewhere on disk (e.g. `$WORKDIR/link -> ~/.ssh`) is skipped, and the pattern never follows it to grant access outside the intended root — even though a symlink pointing *within* the root still matches normally.
+
+**macOS**: `filesystem.deny` glob patterns also emit a Seatbelt regex rule that enforces the deny at runtime, including for files created after the sandbox starts.
+
+**Linux**: glob patterns are expanded once at sandbox start. Files created after the sandbox starts are not covered.
+
+```json
+{
+  "filesystem": {
+    "deny": ["**/.env", "**/.secrets"],
+    "read": ["$WORKDIR/src/*"]
+  }
+}
+```
 
 ### workdir
 
