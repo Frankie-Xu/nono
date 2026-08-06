@@ -1202,7 +1202,7 @@ async fn enforce_endpoint_policy(
             )
             .await;
             match decision {
-                Ok(Ok(Ok(decision))) if decision.is_granted() => {
+                Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Granted))) => {
                     audit::log_l7_policy_decision(
                         ctx.audit_log,
                         audit::ProxyMode::Reverse,
@@ -1218,18 +1218,37 @@ async fn enforce_endpoint_policy(
                     );
                     Ok(true)
                 }
-                Ok(Ok(Ok(decision))) => {
-                    let backend_reason = match &decision {
-                        nono::supervisor::ApprovalDecision::Denied { reason }
-                            if !reason.is_empty() =>
-                        {
-                            format!(": {reason}")
-                        }
-                        _ => String::new(),
+                Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Denied { reason }))) => {
+                    let backend_reason = if reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {reason}")
                     };
                     let deny_reason = format!(
                         "endpoint approval denied by {}: {} {} on service '{}'{}",
                         rule_label, method, upstream_path, service, backend_reason
+                    );
+                    warn!("{}", crate::approval::sanitize_reason_for_log(&deny_reason));
+                    audit::log_l7_policy_decision(
+                        ctx.audit_log,
+                        audit::ProxyMode::Reverse,
+                        &approval_ctx,
+                        service,
+                        None,
+                        method,
+                        upstream_path,
+                        nono::undo::NetworkAuditDecision::ApproveDenied,
+                        "approve",
+                        &rule_label,
+                        Some(&deny_reason),
+                    );
+                    send_error(stream, 403, "Forbidden").await?;
+                    Ok(false)
+                }
+                Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Timeout))) => {
+                    let deny_reason = format!(
+                        "endpoint approval backend reported timeout for {} {} on service '{}'",
+                        method, upstream_path, service
                     );
                     warn!("{}", deny_reason);
                     audit::log_l7_policy_decision(
@@ -1240,7 +1259,7 @@ async fn enforce_endpoint_policy(
                         None,
                         method,
                         upstream_path,
-                        nono::undo::NetworkAuditDecision::ApproveDenied,
+                        nono::undo::NetworkAuditDecision::ApproveTimeout,
                         "approve",
                         &rule_label,
                         Some(&deny_reason),

@@ -540,7 +540,7 @@ pub(crate) async fn select_intercept_route<'a>(
                 )
                 .await;
                 match decision {
-                    Ok(Ok(Ok(decision))) if decision.is_granted() => {
+                    Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Granted))) => {
                         audit::log_l7_policy_decision(
                             audit_log,
                             audit::ProxyMode::ConnectIntercept,
@@ -561,20 +561,14 @@ pub(crate) async fn select_intercept_route<'a>(
                             endpoint_authorized = true;
                         }
                     }
-                    Ok(Ok(Ok(decision))) => {
-                        // Any non-granted decision is an authoritative deny for
-                        // this request: the approve rule gated it and the backend
-                        // (or its timeout variant) refused. Dropping the route and
-                        // forwarding without the credential would silently
-                        // downgrade enforcement, so fail closed like the explicit
-                        // deny arm above.
-                        let deny_reason = match &decision {
-                            nono::supervisor::ApprovalDecision::Denied { reason }
-                                if !reason.is_empty() =>
-                            {
-                                format!("endpoint approval denied: {reason}")
-                            }
-                            _ => "endpoint approval denied".to_string(),
+                    Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Denied { reason }))) => {
+                        // A refusal is authoritative for this request. Dropping
+                        // the route and forwarding without its credential would
+                        // silently downgrade enforcement.
+                        let deny_reason = if reason.is_empty() {
+                            "endpoint approval denied".to_string()
+                        } else {
+                            format!("endpoint approval denied: {reason}")
                         };
                         audit::log_l7_policy_decision(
                             audit_log,
@@ -585,6 +579,30 @@ pub(crate) async fn select_intercept_route<'a>(
                             method,
                             path,
                             nono::undo::NetworkAuditDecision::ApproveDenied,
+                            "approve",
+                            &rule_label,
+                            Some(&deny_reason),
+                        );
+                        warn!(
+                            "tls_intercept: {}",
+                            crate::approval::sanitize_reason_for_log(&deny_reason)
+                        );
+                        return RouteSelection::Rejected(403);
+                    }
+                    Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Timeout))) => {
+                        let deny_reason = format!(
+                            "endpoint approval backend reported timeout for {} {} on route '{}'",
+                            method, path, prefix
+                        );
+                        audit::log_l7_policy_decision(
+                            audit_log,
+                            audit::ProxyMode::ConnectIntercept,
+                            &approval_ctx,
+                            host,
+                            Some(port),
+                            method,
+                            path,
+                            nono::undo::NetworkAuditDecision::ApproveTimeout,
                             "approve",
                             &rule_label,
                             Some(&deny_reason),
@@ -2081,9 +2099,9 @@ mod tests {
     fn decision_registry(
         decision: fn() -> nono::Result<nono::ApprovalDecision>,
     ) -> crate::approval::ApprovalBackendRegistry {
-        crate::approval::ApprovalBackendRegistry::singleton(std::sync::Arc::new(
-            DecisionBackend { decision },
-        ))
+        crate::approval::ApprovalBackendRegistry::singleton(std::sync::Arc::new(DecisionBackend {
+            decision,
+        }))
     }
 
     /// A denied endpoint approval on a managed-credential route must reject
@@ -2149,6 +2167,47 @@ mod tests {
                 panic!("backend error must reject the request, got Selected({selected:?})")
             }
         }
+    }
+
+    /// A backend may return an explicit timeout decision before the outer task
+    /// deadline. It still fails closed, but must be audited as a timeout rather
+    /// than an operator denial.
+    #[tokio::test]
+    async fn select_intercept_route_approve_timeout_rejects_and_audits_timeout() {
+        let store = RouteStore::load(&[approval_gated_route("gated")])
+            .await
+            .unwrap();
+        let registry = decision_registry(|| Ok(nono::ApprovalDecision::Timeout));
+        let audit_log = audit::new_audit_log();
+
+        match select_intercept_route(
+            &store,
+            "example.com",
+            443,
+            "GET",
+            "/gated",
+            Some(&audit_log),
+            Some(&registry),
+        )
+        .await
+        {
+            RouteSelection::Rejected(status) => assert_eq!(status, 403),
+            RouteSelection::Selected(selected) => {
+                panic!("timed-out approval must reject the request, got Selected({selected:?})")
+            }
+        }
+
+        let events = audit::drain_audit_events(&audit_log);
+        assert!(
+            events.iter().any(|event| {
+                event.decision == nono::undo::NetworkAuditDecision::ApproveTimeout
+            })
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| { event.decision == nono::undo::NetworkAuditDecision::ApproveDenied })
+        );
     }
 
     /// A granted endpoint approval selects the managed-credential route so the
