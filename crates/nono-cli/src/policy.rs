@@ -973,12 +973,21 @@ pub(crate) fn add_glob_deny_rules(
     #[cfg(target_os = "macos")]
     {
         // Canonicalize the literal prefix so the regex matches kernel-resolved paths.
+        // The prefix directory may not exist yet (denying a path before the sandboxed
+        // process creates it is the normal use case for this feature) — plain
+        // `canonicalize()` fails in that case, so fall back to resolving symlinks in
+        // the nearest existing ancestor instead of using the raw, unresolved prefix.
+        // Skipping that fallback would silently defeat the deny on macOS, where common
+        // roots like /tmp, /etc, and /var are themselves symlinks into /private.
         let star = pattern.find('*').unwrap_or(pattern.len());
         let prefix_end = pattern[..star].rfind('/').map(|i| i + 1).unwrap_or(0);
         let (raw_prefix, glob_suffix) = pattern.split_at(prefix_end);
-        let canonical_prefix = Path::new(raw_prefix.trim_end_matches('/'))
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(raw_prefix.trim_end_matches('/')));
+        let raw_prefix_path = Path::new(raw_prefix.trim_end_matches('/'));
+        let canonical_prefix = match raw_prefix_path.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(_) => resolve_parent_symlinks(raw_prefix_path)?
+                .unwrap_or_else(|| raw_prefix_path.to_path_buf()),
+        };
         let prefix_str = format!("{}/", canonical_prefix.display());
         let re = glob_to_seatbelt_regex_with_literal_prefix(&prefix_str, glob_suffix)?;
         caps.add_platform_rule(format!("(allow file-read-metadata (regex #\"{re}\"))"))?;
@@ -2351,6 +2360,54 @@ mod tests {
                     .any(|r| r.contains("deny file-read-data") && r.contains("regex"))
             );
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_add_glob_deny_rules_prefix_not_yet_existing_resolves_symlinked_ancestor() {
+        // The deny prefix directory does not exist yet at setup time — denying a
+        // path before the sandboxed process creates it is the normal use case for
+        // this feature. `tempfile::tempdir()` on macOS lives under `/var/...`,
+        // itself a symlink to `/private/var/...`, so this exercises the exact
+        // real-world condition: a not-yet-existing directory whose *existing*
+        // ancestor is a symlink. Regression test for the bug where a bare
+        // `canonicalize()` failure fell back to the raw, unresolved prefix,
+        // producing a regex anchored on `/var/...` that the kernel (which only
+        // ever reports `/private/var/...`) would never match.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_yet = dir.path().join("not-yet-created");
+        assert!(!not_yet.exists(), "precondition: prefix must not exist yet");
+
+        let pattern = format!("{}/**", not_yet.display());
+        let mut caps = CapabilitySet::new();
+        let mut deny_paths: Vec<PathBuf> = Vec::new();
+        add_glob_deny_rules(&pattern, &mut caps, &mut deny_paths).expect("must not error");
+
+        let rules = caps.platform_rules();
+        let deny_rule = rules
+            .iter()
+            .find(|r| r.contains("deny file-read-data") && r.contains("regex"))
+            .expect("macOS regex deny rule must be emitted even when the prefix is missing");
+
+        // Extract the regex out of `(deny file-read-data (regex #"...^...$"))`.
+        let re_str = deny_rule
+            .split("#\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("regex literal must be embeddable in the platform rule string");
+        let re = regex::Regex::new(re_str).expect("emitted regex must compile");
+
+        let canonical_leak_path = dir
+            .path()
+            .canonicalize()
+            .expect("canon dir")
+            .join("not-yet-created")
+            .join("leak.json");
+        assert!(
+            re.is_match(canonical_leak_path.to_str().expect("utf8")),
+            "regex {re_str:?} must match the kernel-resolved (canonical) path {canonical_leak_path:?} \
+             — falling back to the raw, unresolved prefix would silently defeat the deny"
+        );
     }
 
     #[test]
