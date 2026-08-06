@@ -94,7 +94,7 @@ Precedence is: CLI flag, then `NONO_THEME`, then config file, then the default `
 |---------|---------|
 | OpenCode | `nono run --profile nolabs-ai/opencode -- opencode` |
 | OpenClaw | `nono run --profile nolabs-ai/openclaw -- openclaw gateway` |
-| Swival | `nono run --profile nolabs-ai/swival -- swival` |
+| Swival | `nono run --profile jedisct1/swival -- swival` (officially maintained by Swival's creator) |
 
 ## Profile Inheritance
 

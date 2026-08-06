@@ -190,7 +190,8 @@ fn recommended_pack_profile(program: &Path) -> Option<&'static str> {
         "codex" => Some("nolabs-ai/codex"),
         "opencode" => Some("nolabs-ai/opencode"),
         "openclaw" => Some("nolabs-ai/openclaw"),
-        "swival" => Some("nolabs-ai/swival"),
+        // swival ships under the creator's own namespace, not nolabs-ai.
+        "swival" => Some("jedisct1/swival"),
         _ => None,
     }
 }

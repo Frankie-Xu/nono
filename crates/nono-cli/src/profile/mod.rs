@@ -4867,7 +4867,7 @@ mod tests {
         //   codex               → nolabs-ai/codex    (formerly always-further/codex, removed v0.43.0)
         //   opencode            → nolabs-ai/opencode (formerly always-further/opencode, removed)
         //   openclaw            → nolabs-ai/openclaw (removed v0.71.0)
-        //   swival              → nolabs-ai/swival   (removed v0.71.0)
+        //   swival              → jedisct1/swival   (removed v0.71.0; official namespace of Swival's creator)
         assert!(!profiles.contains(&"claude-code".to_string()));
         assert!(!profiles.contains(&"codex".to_string()));
         assert!(!profiles.contains(&"opencode".to_string()));

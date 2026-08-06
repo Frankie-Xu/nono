@@ -53,7 +53,8 @@ mod tests {
 
     #[test]
     fn test_swival_no_longer_inbuilt() {
-        // Removed in v0.71.0: swival is now shipped via the registry pack nolabs-ai/swival.
+        // Removed in v0.71.0: swival is now shipped via the registry pack jedisct1/swival,
+        // officially maintained by Swival's creator under their own namespace.
         assert!(get_builtin("swival").is_none());
     }
 
@@ -89,7 +90,7 @@ mod tests {
         //   codex       → nolabs-ai/codex    (formerly always-further/codex, removed v0.43.0)
         //   opencode    → nolabs-ai/opencode (formerly always-further/opencode, removed)
         //   openclaw    → nolabs-ai/openclaw (removed v0.71.0)
-        //   swival      → nolabs-ai/swival   (removed v0.71.0)
+        //   swival      → jedisct1/swival   (removed v0.71.0; official namespace of Swival's creator)
         // Tool Sandbox examples should also live outside embedded built-ins.
         assert!(!profiles.contains(&"claude-code".to_string()));
         assert!(!profiles.contains(&"claude-no-kc".to_string()));
