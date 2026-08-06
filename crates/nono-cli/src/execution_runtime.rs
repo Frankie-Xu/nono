@@ -183,14 +183,15 @@ fn logical_workdir(
     Some(absolute.components().collect())
 }
 
-fn recommended_builtin_profile(program: &Path) -> Option<&'static str> {
+fn recommended_pack_profile(program: &Path) -> Option<&'static str> {
     let name = program.file_name()?.to_str()?;
     match name {
-        "claude" => Some("claude-code"),
-        "codex" => Some("codex"),
-        "opencode" => Some("opencode"),
-        "openclaw" => Some("openclaw"),
-        "swival" => Some("swival"),
+        "claude" => Some("nolabs-ai/claude"),
+        "codex" => Some("nolabs-ai/codex"),
+        "opencode" => Some("nolabs-ai/opencode"),
+        "openclaw" => Some("nolabs-ai/openclaw"),
+        // swival ships under the creator's own namespace, not nolabs-ai.
+        "swival" => Some("jedisct1/swival"),
         _ => None,
     }
 }
@@ -244,7 +245,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     // against comes from JSON, so it is valid UTF-8.
     let program_display = command[0].to_string_lossy().into_owned();
 
-    let known_builtin_profile = recommended_builtin_profile(&resolved_program);
+    let known_builtin_profile = recommended_pack_profile(&resolved_program);
     let recommended_profile = if flags.session.profile_name.is_none() {
         known_builtin_profile
     } else {
@@ -256,8 +257,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         .and_then(|name| name.to_str())
         .unwrap_or(&program_display);
 
-    if let Some(profile) = recommended_profile {
-        output::print_profile_hint(recommended_program_name, profile, flags.silent);
+    if let Some(pack_ref) = recommended_profile {
+        output::print_profile_hint(recommended_program_name, pack_ref, flags.silent);
     }
     let plain_domain_entries = proxy
         .and_then(|p| p.domain_filter.as_ref())
@@ -842,7 +843,7 @@ fn write_capability_state_file(
 #[cfg(test)]
 mod tests {
     use super::{
-        child_pwd_for, compute_executable_identity, recommended_builtin_profile,
+        child_pwd_for, compute_executable_identity, recommended_pack_profile,
         validate_command_policy_execution_support,
     };
     use sha2::{Digest, Sha256};
@@ -991,20 +992,20 @@ mod tests {
     }
 
     #[test]
-    fn recommended_builtin_profile_matches_known_agent_commands() {
+    fn recommended_pack_profile_matches_known_agent_commands() {
         assert_eq!(
-            recommended_builtin_profile(Path::new("/usr/local/bin/claude")),
-            Some("claude-code")
+            recommended_pack_profile(Path::new("/usr/local/bin/claude")),
+            Some("nolabs-ai/claude")
         );
         assert_eq!(
-            recommended_builtin_profile(Path::new("/usr/local/bin/codex")),
-            Some("codex")
+            recommended_pack_profile(Path::new("/usr/local/bin/codex")),
+            Some("nolabs-ai/codex")
         );
     }
 
     #[test]
-    fn recommended_builtin_profile_ignores_unknown_commands() {
-        assert_eq!(recommended_builtin_profile(Path::new("/usr/bin/env")), None);
+    fn recommended_pack_profile_ignores_unknown_commands() {
+        assert_eq!(recommended_pack_profile(Path::new("/usr/bin/env")), None);
     }
 
     #[test]

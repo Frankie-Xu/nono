@@ -46,43 +46,16 @@ mod tests {
     }
 
     #[test]
-    fn test_get_builtin_openclaw() {
-        let profile = get_builtin("openclaw").expect("Profile not found");
-        assert_eq!(profile.meta.name, "openclaw");
-        assert!(!profile.network.block); // network allowed
-        assert!(
-            profile
-                .filesystem
-                .allow
-                .contains(&"$HOME/.openclaw".to_string())
-        );
+    fn test_openclaw_no_longer_inbuilt() {
+        // Removed in v0.71.0: openclaw is now shipped via the registry pack nolabs-ai/openclaw.
+        assert!(get_builtin("openclaw").is_none());
     }
 
     #[test]
-    fn test_get_builtin_swival() {
-        let profile = get_builtin("swival").expect("Profile not found");
-        assert_eq!(profile.meta.name, "swival");
-        assert_eq!(profile.workdir.access, WorkdirAccess::ReadWrite);
-        assert!(profile.interactive);
-        assert!(!profile.network.block);
-        assert!(
-            profile
-                .filesystem
-                .allow
-                .contains(&"$HOME/.config/swival".to_string())
-        );
-        assert!(
-            profile
-                .groups
-                .include
-                .contains(&"python_runtime".to_string())
-        );
-        assert!(
-            profile
-                .groups
-                .include
-                .contains(&"unlink_protection".to_string())
-        );
+    fn test_swival_no_longer_inbuilt() {
+        // Removed in v0.71.0: swival is now shipped via the registry pack jedisct1/swival,
+        // officially maintained by Swival's creator under their own namespace.
+        assert!(get_builtin("swival").is_none());
     }
 
     #[test]
@@ -112,26 +85,27 @@ mod tests {
         let profiles = list_builtin();
         assert!(profiles.contains(&"default".to_string()));
         assert!(profiles.contains(&"linux-host-compat".to_string()));
-        assert!(profiles.contains(&"openclaw".to_string()));
-        assert!(profiles.contains(&"swival".to_string()));
         // Profiles that ship via registry packs instead of as built-ins:
         //   claude-code → nolabs-ai/claude   (formerly always-further/claude, removed v0.43.0)
         //   codex       → nolabs-ai/codex    (formerly always-further/codex, removed v0.43.0)
         //   opencode    → nolabs-ai/opencode (formerly always-further/opencode, removed)
+        //   openclaw    → nolabs-ai/openclaw (removed v0.71.0)
+        //   swival      → jedisct1/swival   (removed v0.71.0; official namespace of Swival's creator)
         // Tool Sandbox examples should also live outside embedded built-ins.
         assert!(!profiles.contains(&"claude-code".to_string()));
         assert!(!profiles.contains(&"claude-no-kc".to_string()));
         assert!(!profiles.contains(&"codex".to_string()));
         assert!(!profiles.contains(&"linux-tool-sandbox-git-ssh".to_string()));
         assert!(!profiles.contains(&"opencode".to_string()));
+        assert!(!profiles.contains(&"openclaw".to_string()));
+        assert!(!profiles.contains(&"swival".to_string()));
     }
 
     #[test]
     fn test_profile_group_merging() {
-        // Use swival as a representative inbuilt profile that extends
-        // `default` and adds its own groups (opencode, codex, and claude-code
-        // moved to registry packs).
-        let profile = get_builtin("swival").expect("Profile not found");
+        // Use linux-host-compat as a representative built-in that extends
+        // `default` and adds its own groups.
+        let profile = get_builtin("linux-host-compat").expect("Profile not found");
         // Should have default profile groups (inherited via extends).
         assert!(
             profile
@@ -140,12 +114,11 @@ mod tests {
                 .contains(&"deny_credentials".to_string())
         );
         // Should have profile-specific groups
-        assert!(profile.groups.include.contains(&"node_runtime".to_string()));
         assert!(
             profile
                 .groups
                 .include
-                .contains(&"unlink_protection".to_string())
+                .contains(&"linux_runtime_state".to_string())
         );
     }
 
@@ -153,13 +126,13 @@ mod tests {
     fn test_profile_exclusion_mechanism() {
         // Verify that built-in profiles resolve exclusions through the shared
         // group-exclusion path. Current embedded profiles do not exclude any.
-        let profile = get_builtin("openclaw").expect("Profile not found");
+        let profile = get_builtin("linux-host-compat").expect("Profile not found");
         let default = get_builtin("default").expect("default profile");
         // All default groups should be present since embedded exclusions are empty.
         for group in &default.groups.include {
             assert!(
                 profile.groups.include.contains(group),
-                "openclaw should contain default profile group '{}'",
+                "linux-host-compat should contain default profile group '{}'",
                 group
             );
         }
@@ -234,28 +207,28 @@ mod tests {
     }
 
     #[test]
-    fn test_linux_interactive_profiles_include_sysfs_but_not_runtime_state_or_temp() {
-        let profile = get_builtin("swival").expect("Profile not found");
+    fn test_linux_host_compat_includes_runtime_state_and_sysfs_and_temp() {
+        let profile = get_builtin("linux-host-compat").expect("Profile not found");
         assert!(
-            !profile
+            profile
                 .groups
                 .include
                 .contains(&"linux_runtime_state".to_string()),
-            "swival should not include linux_runtime_state"
+            "linux-host-compat should include linux_runtime_state"
         );
         assert!(
             profile
                 .groups
                 .include
                 .contains(&"linux_sysfs_read".to_string()),
-            "swival should include linux_sysfs_read"
+            "linux-host-compat should include linux_sysfs_read"
         );
         assert!(
-            !profile
+            profile
                 .groups
                 .include
                 .contains(&"linux_temp_read".to_string()),
-            "swival should not include linux_temp_read"
+            "linux-host-compat should include linux_temp_read"
         );
     }
 
