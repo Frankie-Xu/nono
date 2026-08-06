@@ -305,30 +305,45 @@ All path fields support variable expansion (see Section 6).
 
 | Pattern | Matches |
 |---------|---------|
-| `*` | Any filename within a single directory level. Does not cross `/`. |
+| `*` | Any filename within a single directory level. Does not cross `/`. Matches hidden files too — `src/*` matches `src/.env` the same as `src/index.js` (unlike a shell, which skips leading-dot names by default). |
 | `**` | Zero or more path segments, including across directories. `foo/**` matches everything *inside* `foo/`, at any depth, but does **not** match `foo` itself — add a separate literal entry for `foo` if you need that too. |
 | `**/<name>` | A file or directory named `<name>` at any depth, including at the root of the pattern. |
 
-Patterns without an absolute prefix (e.g. `**/.env`) are rooted at the workdir.
+Patterns without an absolute prefix (e.g. `**/.env`) are rooted at the workdir. Patterns are expanded at sandbox start against the filesystem as it exists at that moment.
 
-Patterns are expanded at sandbox start against the filesystem as it exists at that moment.
+Basic example — grant read access to every `.json` config file directly under `config/`, without touching anything else in that directory:
+
+```json
+{
+  "filesystem": {
+    "read": ["$WORKDIR/config/*.json"]
+  }
+}
+```
+
+**Matching a directory grants everything inside it, recursively — regardless of `*` vs `**`.** The `*`/`**` distinction only controls what the *search* finds, not how much access a found directory grants. If `proj/*` matches a subdirectory `proj/sub`, that whole subdirectory becomes a normal recursive directory grant — the same as writing `"allow": ["proj/sub"]` directly — so everything under `sub`, at any depth, is included even though the pattern that found it only looked one level deep. To grant only specific files and exclude their siblings' subdirectories, target files by name/extension (`proj/*.json`) rather than matching the directory that contains them.
 
 Only `*` and `**` are wildcards — every other character, including in real path segments the pattern happens to walk through (e.g. a directory literally named `[locale]`), is matched literally. `?` and character classes (`[abc]`) are rejected with a parse error rather than silently treated as wildcards.
 
 **Symlinks**: a glob only ever matches entries whose real, resolved location stays inside the directory the pattern is rooted at. A symlink inside that directory pointing elsewhere on disk (e.g. `$WORKDIR/link -> ~/.ssh`) is skipped, and the pattern never follows it to grant access outside the intended root — even though a symlink pointing *within* the root still matches normally.
 
-**macOS**: `filesystem.deny` glob patterns also emit a Seatbelt regex rule that enforces the deny at runtime, including for files created after the sandbox starts.
+**Platform differences**:
+- **macOS**: `filesystem.deny` glob patterns also emit a Seatbelt regex rule that enforces the deny at runtime, including for files created after the sandbox starts.
+- **Linux**: glob patterns are expanded once at sandbox start. Files created after the sandbox starts are not covered.
+- **Linux and `deny`-within-`allow`**: Landlock is strictly allow-list — it has no kernel-level "deny" primitive, so it cannot carve an exception out of a broader grant. If a `deny` pattern overlaps a path already covered by `allow`/`read`/`write` (e.g. `deny: ["$WORKDIR/src/.env"]` alongside `allow: ["$WORKDIR/src"]`), nono refuses to start on Linux rather than silently leave the deny unenforced. This is a hard error, not a warning — Seatbelt on macOS *can* express this and enforces it correctly, so the same profile behaves differently across platforms.
 
-**Linux**: glob patterns are expanded once at sandbox start. Files created after the sandbox starts are not covered.
+For a profile that works identically on both, write the `allow`/`read`/`write` patterns narrowly enough that they never match what you want denied, instead of granting broadly and subtracting after the fact:
 
 ```json
 {
   "filesystem": {
-    "deny": ["**/.env", "**/.secrets"],
-    "read": ["$WORKDIR/src/*"]
+    "read": ["$WORKDIR/src/**/*.ts", "$WORKDIR/src/**/*.tsx"],
+    "deny": ["**/.env", "**/.secrets"]
   }
 }
 ```
+
+Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`/`.secrets` — the `deny` entries are a backstop that costs nothing on either platform, rather than a carve-out that only macOS can honor. If your files can't be filtered by a naming pattern, list the specific files/directories you need instead of granting their parent wholesale.
 
 ### workdir
 
