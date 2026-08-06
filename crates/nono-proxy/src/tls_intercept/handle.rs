@@ -561,7 +561,21 @@ pub(crate) async fn select_intercept_route<'a>(
                             endpoint_authorized = true;
                         }
                     }
-                    Ok(Ok(Ok(_))) => {
+                    Ok(Ok(Ok(decision))) => {
+                        // Any non-granted decision is an authoritative deny for
+                        // this request: the approve rule gated it and the backend
+                        // (or its timeout variant) refused. Dropping the route and
+                        // forwarding without the credential would silently
+                        // downgrade enforcement, so fail closed like the explicit
+                        // deny arm above.
+                        let deny_reason = match &decision {
+                            nono::supervisor::ApprovalDecision::Denied { reason }
+                                if !reason.is_empty() =>
+                            {
+                                format!("endpoint approval denied: {reason}")
+                            }
+                            _ => "endpoint approval denied".to_string(),
+                        };
                         audit::log_l7_policy_decision(
                             audit_log,
                             audit::ProxyMode::ConnectIntercept,
@@ -573,11 +587,10 @@ pub(crate) async fn select_intercept_route<'a>(
                             nono::undo::NetworkAuditDecision::ApproveDenied,
                             "approve",
                             &rule_label,
-                            Some("endpoint approval denied"),
+                            Some(&deny_reason),
                         );
-                        if !route.requires_managed_credential {
-                            has_endpoint_only_route = true;
-                        }
+                        warn!("tls_intercept: {}", deny_reason);
+                        return RouteSelection::Rejected(403);
                     }
                     Ok(Ok(Err(err))) => {
                         let deny_reason = format!("endpoint approval backend error: {err}");
@@ -595,9 +608,7 @@ pub(crate) async fn select_intercept_route<'a>(
                             Some(&deny_reason),
                         );
                         warn!("{}", deny_reason);
-                        if !route.requires_managed_credential {
-                            has_endpoint_only_route = true;
-                        }
+                        return RouteSelection::Rejected(403);
                     }
                     Ok(Err(err)) => {
                         let deny_reason = format!("endpoint approval task failed: {err}");
@@ -615,9 +626,7 @@ pub(crate) async fn select_intercept_route<'a>(
                             Some(&deny_reason),
                         );
                         warn!("{}", deny_reason);
-                        if !route.requires_managed_credential {
-                            has_endpoint_only_route = true;
-                        }
+                        return RouteSelection::Rejected(403);
                     }
                     Err(_) => {
                         let deny_reason = format!(
@@ -638,9 +647,7 @@ pub(crate) async fn select_intercept_route<'a>(
                             Some(&deny_reason),
                         );
                         warn!("{}", deny_reason);
-                        if !route.requires_managed_credential {
-                            has_endpoint_only_route = true;
-                        }
+                        return RouteSelection::Rejected(403);
                     }
                 }
             }
@@ -2010,6 +2017,166 @@ mod tests {
             RouteSelection::Rejected(status) => assert_eq!(status, 429),
             RouteSelection::Selected(selected) => {
                 panic!("second request must be rate limited with 429, got Selected({selected:?})")
+            }
+        }
+    }
+
+    /// Approval backend returning a fixed decision, to exercise the approve
+    /// arms of `select_intercept_route`.
+    struct DecisionBackend {
+        decision: fn() -> nono::Result<nono::ApprovalDecision>,
+    }
+
+    impl nono::ApprovalBackend for DecisionBackend {
+        fn request_approval(
+            &self,
+            _request: &nono::ApprovalRequest,
+        ) -> nono::Result<nono::ApprovalDecision> {
+            (self.decision)()
+        }
+
+        fn backend_name(&self) -> &str {
+            "test-backend"
+        }
+    }
+
+    /// Managed-credential route whose explicit endpoint policy routes
+    /// `GET /gated` through an approval backend and denies everything else.
+    fn approval_gated_route(prefix: &str) -> crate::config::RouteConfig {
+        crate::config::RouteConfig {
+            prefix: prefix.to_string(),
+            upstream: "https://example.com".to_string(),
+            credential_key: Some(format!("env://{}_TOKEN", prefix.to_uppercase())),
+            inject_mode: crate::config::InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            endpoint_policy: Some(crate::config::EndpointPolicyConfig {
+                default: crate::config::EndpointPolicyDefault::default(),
+                deny: vec![],
+                approve: vec![crate::config::EndpointPolicyRule {
+                    method: "GET".to_string(),
+                    path: "/gated".to_string(),
+                    backend: None,
+                    reason: None,
+                    timeout_secs: Some(2),
+                }],
+                allow: vec![],
+            }),
+            spiffe: None,
+            rate_limit: None,
+        }
+    }
+
+    fn decision_registry(
+        decision: fn() -> nono::Result<nono::ApprovalDecision>,
+    ) -> crate::approval::ApprovalBackendRegistry {
+        crate::approval::ApprovalBackendRegistry::singleton(std::sync::Arc::new(
+            DecisionBackend { decision },
+        ))
+    }
+
+    /// A denied endpoint approval on a managed-credential route must reject
+    /// the request outright. Regression test: the denied route was previously
+    /// dropped from selection, so the request forwarded upstream without the
+    /// credential — approval "deny" only withheld injection instead of
+    /// blocking (fail-open).
+    #[tokio::test]
+    async fn select_intercept_route_approve_denied_rejects_403() {
+        let store = RouteStore::load(&[approval_gated_route("gated")])
+            .await
+            .unwrap();
+        let registry = decision_registry(|| {
+            Ok(nono::ApprovalDecision::Denied {
+                reason: "operator said no".to_string(),
+            })
+        });
+
+        match select_intercept_route(
+            &store,
+            "example.com",
+            443,
+            "GET",
+            "/gated",
+            None,
+            Some(&registry),
+        )
+        .await
+        {
+            RouteSelection::Rejected(status) => assert_eq!(status, 403),
+            RouteSelection::Selected(selected) => {
+                panic!("denied approval must reject the request, got Selected({selected:?})")
+            }
+        }
+    }
+
+    /// An approval backend failure must fail closed, mirroring the reverse
+    /// proxy path, not forward the request without its credential.
+    #[tokio::test]
+    async fn select_intercept_route_approve_backend_error_rejects_403() {
+        let store = RouteStore::load(&[approval_gated_route("gated")])
+            .await
+            .unwrap();
+        let registry = decision_registry(|| {
+            Err(nono::NonoError::SandboxInit(
+                "approval backend unreachable".to_string(),
+            ))
+        });
+
+        match select_intercept_route(
+            &store,
+            "example.com",
+            443,
+            "GET",
+            "/gated",
+            None,
+            Some(&registry),
+        )
+        .await
+        {
+            RouteSelection::Rejected(status) => assert_eq!(status, 403),
+            RouteSelection::Selected(selected) => {
+                panic!("backend error must reject the request, got Selected({selected:?})")
+            }
+        }
+    }
+
+    /// A granted endpoint approval selects the managed-credential route so the
+    /// credential is injected for the approved request.
+    #[tokio::test]
+    async fn select_intercept_route_approve_granted_selects_route() {
+        let store = RouteStore::load(&[approval_gated_route("gated")])
+            .await
+            .unwrap();
+        let registry = decision_registry(|| Ok(nono::ApprovalDecision::Granted));
+
+        match select_intercept_route(
+            &store,
+            "example.com",
+            443,
+            "GET",
+            "/gated",
+            None,
+            Some(&registry),
+        )
+        .await
+        {
+            RouteSelection::Selected(Some((svc, _))) => assert_eq!(svc, "gated"),
+            RouteSelection::Selected(None) => {
+                panic!("granted approval must select the gated route, not passthrough")
+            }
+            RouteSelection::Rejected(status) => {
+                panic!("granted approval must be allowed, got rejection with status {status}")
             }
         }
     }

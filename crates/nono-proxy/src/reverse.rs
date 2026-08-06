@@ -1216,9 +1216,38 @@ async fn enforce_endpoint_policy(
                         &rule_label,
                         None,
                     );
-                    return Ok(true);
+                    Ok(true)
                 }
-                Ok(Ok(Ok(_))) => {}
+                Ok(Ok(Ok(decision))) => {
+                    let backend_reason = match &decision {
+                        nono::supervisor::ApprovalDecision::Denied { reason }
+                            if !reason.is_empty() =>
+                        {
+                            format!(": {reason}")
+                        }
+                        _ => String::new(),
+                    };
+                    let deny_reason = format!(
+                        "endpoint approval denied by {}: {} {} on service '{}'{}",
+                        rule_label, method, upstream_path, service, backend_reason
+                    );
+                    warn!("{}", deny_reason);
+                    audit::log_l7_policy_decision(
+                        ctx.audit_log,
+                        audit::ProxyMode::Reverse,
+                        &approval_ctx,
+                        service,
+                        None,
+                        method,
+                        upstream_path,
+                        nono::undo::NetworkAuditDecision::ApproveDenied,
+                        "approve",
+                        &rule_label,
+                        Some(&deny_reason),
+                    );
+                    send_error(stream, 403, "Forbidden").await?;
+                    Ok(false)
+                }
                 Ok(Ok(Err(err))) => {
                     let deny_reason = format!("endpoint approval backend error: {err}");
                     audit::log_l7_policy_decision(
@@ -1236,7 +1265,7 @@ async fn enforce_endpoint_policy(
                     );
                     warn!("{}", deny_reason);
                     send_error(stream, 403, "Forbidden").await?;
-                    return Ok(false);
+                    Ok(false)
                 }
                 Ok(Err(err)) => {
                     let deny_reason = format!("endpoint approval task failed: {err}");
@@ -1255,7 +1284,7 @@ async fn enforce_endpoint_policy(
                     );
                     warn!("{}", deny_reason);
                     send_error(stream, 403, "Forbidden").await?;
-                    return Ok(false);
+                    Ok(false)
                 }
                 Err(_) => {
                     let deny_reason = format!(
@@ -1277,29 +1306,9 @@ async fn enforce_endpoint_policy(
                     );
                     warn!("{}", deny_reason);
                     send_error(stream, 403, "Forbidden").await?;
-                    return Ok(false);
+                    Ok(false)
                 }
             }
-            let deny_reason = format!(
-                "endpoint approval denied by {}: {} {} on service '{}'",
-                rule_label, method, upstream_path, service
-            );
-            warn!("{}", deny_reason);
-            audit::log_l7_policy_decision(
-                ctx.audit_log,
-                audit::ProxyMode::Reverse,
-                &approval_ctx,
-                service,
-                None,
-                method,
-                upstream_path,
-                nono::undo::NetworkAuditDecision::ApproveDenied,
-                "approve",
-                &rule_label,
-                Some(&deny_reason),
-            );
-            send_error(stream, 403, "Forbidden").await?;
-            Ok(false)
         }
     }
 }

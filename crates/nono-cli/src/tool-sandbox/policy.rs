@@ -576,6 +576,19 @@ pub(super) fn resolve_approval_route(
     })
 }
 
+/// Deny reason for a non-granted approval decision, carrying the backend's
+/// stated reason when it provided one so audit entries record who refused
+/// and why, not just that a refusal happened.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn approval_deny_reason(decision: &nono::supervisor::ApprovalDecision) -> String {
+    match decision {
+        nono::supervisor::ApprovalDecision::Denied { reason } if !reason.is_empty() => {
+            format!("approval_denied: {reason}")
+        }
+        _ => "approval_denied".to_string(),
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn policy_credential_names(
     policy: &crate::command_policy::CommandSandboxConfig,
