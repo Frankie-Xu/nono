@@ -512,7 +512,7 @@ Set a fixed port for the credential injection proxy (default: OS-assigned epheme
 
 ```bash
 # Use a fixed proxy port for applications that need base URL configuration
-nono run --profile openclaw --proxy-port 19999 --listen-port 18789 -- openclaw gateway
+nono run --profile nolabs-ai/openclaw --proxy-port 19999 --listen-port 18789 -- openclaw gateway
 
 # The credential proxy will always be at http://127.0.0.1:19999
 # Configure the application to use this base URL for API calls
@@ -563,7 +563,7 @@ Allow the sandboxed process to listen on a TCP port. Required when running serve
 
 ```bash
 # Allow OpenClaw gateway to listen on its default port
-nono run --profile openclaw --listen-port 18789 \
+nono run --profile nolabs-ai/openclaw --listen-port 18789 \
   --credential openai -- openclaw gateway
 
 # Allow a development server
@@ -805,7 +805,7 @@ Use a named profile (from installed packs or `~/.config/nono/profiles/`).
 
 ```bash
 nono run --profile nolabs-ai/claude -- claude
-nono run -p openclaw -- openclaw gateway
+nono run -p nolabs-ai/openclaw -- openclaw gateway
 ```
 
 #### `--extends`
