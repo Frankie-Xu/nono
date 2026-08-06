@@ -1,8 +1,8 @@
 //! Profile system for pre-configured capability sets
 //!
-//! Profiles provide named configurations for common applications like
-//! claude-code, openclaw, and opencode. They can be built-in (compiled
-//! into the binary) or user-defined (in `$XDG_CONFIG_HOME/nono/profiles/`).
+//! Profiles provide named capability configurations for sandboxed processes.
+//! They can be built-in (compiled into the binary), installed from registry
+//! packs (e.g. nolabs-ai/claude), or user-defined (in `$XDG_CONFIG_HOME/nono/profiles/`).
 
 pub(crate) mod builtin;
 mod credential_provider;
@@ -2558,6 +2558,14 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
             .and_then(|p| p.extends);
     }
 
+    // Registry refs are not valid bare profile names, so resolve them from the
+    // pack store before the name check below rejects them.
+    if is_registry_ref(name_or_path) {
+        return find_pack_store_profile(name_or_path)
+            .and_then(|(profile_path, _)| parse_profile_file(&profile_path).ok())
+            .and_then(|p| p.extends);
+    }
+
     if !is_valid_profile_name(name_or_path) {
         return None;
     }
@@ -2750,7 +2758,7 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
         // bypassing the post-pull cleanup hook in `migration::check_and_run`.
         // Idempotent: silent no-op when no legacy artifacts exist, so safe
         // to fire on every claude resolution.
-        if is_always_further_claude_pack(&profile_path) {
+        if is_official_claude_pack(&profile_path) {
             crate::legacy_cleanup::check_and_offer_cleanup()?;
         }
         return Ok(Some(profile));
@@ -2772,15 +2780,19 @@ fn load_profile_inner(name_or_path: &str, cli_extends: &[String]) -> Result<Opti
     Ok(None)
 }
 
-/// True when `profile_path` lives inside `<package_store>/nolabs-ai/claude/`.
-/// Used to gate legacy-cleanup invocation on the canonical claude pack
-/// rather than any pack that happens to publish a profile named `claude`
-/// or `claude-code`.
-fn is_always_further_claude_pack(profile_path: &Path) -> bool {
+/// Returns `true` when `profile_path` lives inside `<package_store>/<ns>/claude/` for one of the
+/// namespaces the official claude pack has been published under. Used to gate legacy-cleanup
+/// invocation on the canonical claude pack rather than any pack that happens to publish a profile
+/// named `claude` or `claude-code`.
+///
+/// The namespace list comes from `package_status` so both modules agree on what counts as the
+/// official pack.
+fn is_official_claude_pack(profile_path: &Path) -> bool {
     let Ok(store) = crate::package::package_store_dir() else {
         return false;
     };
-    profile_path_is_in_pack(profile_path, &store, "always-further", "claude")
+    crate::package_status::official_claude_pack_namespaces()
+        .any(|ns| profile_path_is_in_pack(profile_path, &store, ns, "claude"))
 }
 
 /// Pure path-component matcher: does `profile_path` live under
@@ -3003,7 +3015,16 @@ fn load_registry_profile(name_or_path: &str, cli_extends: &[String]) -> Result<P
     // Find the profile JSON in the installed pack
     for artifact in &manifest.artifacts {
         if artifact.artifact_type == crate::package::ArtifactType::Profile {
-            let install_name = artifact.install_as.as_deref().unwrap_or(&artifact.path);
+            let Some(install_name) = artifact.install_as.as_deref() else {
+                // `nono pull` rejects profile artifacts without `install_as`,
+                // so this only happens for a hand-built store.
+                tracing::warn!(
+                    "pack '{}' declares profile artifact '{}' without install_as; skipping",
+                    package_ref.key(),
+                    artifact.path
+                );
+                continue;
+            };
             let profile_path = install_dir
                 .join("profiles")
                 .join(format!("{install_name}.json"));
@@ -3384,7 +3405,8 @@ fn load_base_profile_raw(
     // 1. User profiles take precedence.
     let profile_path = resolve_user_profile_path(name)?;
     if profile_path.exists() {
-        return Ok(ResolvedBase::Global(parse_profile_file(&profile_path)?));
+        let (profile, source_path) = parse_file_backed_profile(&profile_path)?;
+        return Ok(ResolvedBase::Sibling(profile, source_path));
     }
 
     // 2. Pack-store: any installed pack with a matching `install_as`.
@@ -4252,6 +4274,35 @@ mod tests {
         ));
     }
 
+    /// Wrapped in `with_config_env` so `package_store_dir()` returns the same
+    /// path here and inside `is_official_claude_pack`. It reads
+    /// `XDG_CONFIG_HOME` live on every call, so without holding `ENV_LOCK` a
+    /// parallel test swapping the env between the two reads would make them
+    /// disagree.
+    #[test]
+    fn official_claude_pack_matches_both_published_namespaces() {
+        with_config_env(|_config_dir| {
+            let store = crate::package::package_store_dir().expect("package store dir");
+
+            for ns in ["nolabs-ai", "always-further"] {
+                let path = store.join(ns).join("claude").join("profiles/claude.json");
+                assert!(
+                    is_official_claude_pack(&path),
+                    "{ns}/claude is the official claude pack"
+                );
+            }
+
+            let third_party = store
+                .join("someone-else")
+                .join("claude")
+                .join("profiles/claude.json");
+            assert!(
+                !is_official_claude_pack(&third_party),
+                "a third-party pack publishing a `claude` profile must not trigger legacy cleanup"
+            );
+        });
+    }
+
     #[test]
     fn test_groups_config_deserializes() {
         let json = r#"{
@@ -4361,7 +4412,7 @@ mod tests {
     #[test]
     fn test_valid_profile_names() {
         assert!(is_valid_profile_name("claude-code"));
-        assert!(is_valid_profile_name("openclaw"));
+        assert!(is_valid_profile_name("linux-host-compat"));
         assert!(is_valid_profile_name("my-app-2"));
         assert!(!is_valid_profile_name(""));
         assert!(!is_valid_profile_name("-invalid"));
@@ -4532,8 +4583,8 @@ mod tests {
 
     #[test]
     fn test_load_builtin_profile() {
-        let profile = load_profile("openclaw").expect("Failed to load profile");
-        assert_eq!(profile.meta.name, "openclaw");
+        let profile = load_profile("linux-host-compat").expect("Failed to load profile");
+        assert_eq!(profile.meta.name, "linux-host-compat");
         assert!(!profile.network.block); // network allowed by default
     }
 
@@ -4625,6 +4676,81 @@ mod tests {
                 "/tmp/cli-b".to_string(),
                 "/tmp/json-base".to_string(),
                 "/tmp/child".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cli_extends_preserves_global_file_source_context()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempdir()?;
+        let config_dir = dir.path().join("config");
+        let profiles_dir = config_dir.join("nono").join("profiles");
+        let referent_dir = dir.path().join("referent");
+        let selected_dir = dir.path().join("selected");
+        std::fs::create_dir_all(&profiles_dir)?;
+        std::fs::create_dir_all(&referent_dir)?;
+        std::fs::create_dir_all(&selected_dir)?;
+        let config_dir_string = config_dir.to_string_lossy().into_owned();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            config_dir_string.as_str(),
+        )]);
+
+        std::fs::write(
+            referent_dir.join("referent-base.json"),
+            r#"{
+                "meta": { "name": "referent-base" },
+                "filesystem": { "read": ["/tmp/referent-base"] }
+            }"#,
+        )?;
+        std::fs::write(
+            referent_dir.join("linked-parent.json"),
+            r#"{
+                "extends": "referent-base",
+                "meta": { "name": "linked-parent" }
+            }"#,
+        )?;
+        std::os::unix::fs::symlink(
+            referent_dir.join("linked-parent.json"),
+            profiles_dir.join("linked-parent.json"),
+        )?;
+        std::fs::write(
+            profiles_dir.join("user-layer.json"),
+            r#"{
+                "extends": "linked-parent",
+                "meta": { "name": "user-layer" },
+                "filesystem": { "read": ["/tmp/user-layer"] }
+            }"#,
+        )?;
+        let selected_path = selected_dir.join("selected.json");
+        std::fs::write(
+            &selected_path,
+            r#"{
+                "meta": { "name": "selected" },
+                "filesystem": { "read": ["/tmp/selected"] }
+            }"#,
+        )?;
+
+        let profile = load_profile_with_extends(
+            selected_path
+                .to_str()
+                .ok_or("selected path is not valid UTF-8")?,
+            &["user-layer".to_string()],
+        )?;
+
+        assert_eq!(
+            profile.filesystem.read,
+            vec![
+                "/tmp/referent-base".to_string(),
+                "/tmp/user-layer".to_string(),
+                "/tmp/selected".to_string(),
             ]
         );
         Ok(())
@@ -4737,15 +4863,18 @@ mod tests {
         let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", canonical_str)]);
 
         let profiles = list_profiles();
-        assert!(profiles.contains(&"openclaw".to_string()));
-        assert!(profiles.contains(&"swival".to_string()));
+        assert!(profiles.contains(&"linux-host-compat".to_string()));
         // These profiles were removed from built-ins; they ship via registry packs:
         //   claude-code / claude → nolabs-ai/claude   (formerly always-further/claude, removed v0.43.0)
         //   codex               → nolabs-ai/codex    (formerly always-further/codex, removed v0.43.0)
         //   opencode            → nolabs-ai/opencode (formerly always-further/opencode, removed)
+        //   openclaw            → nolabs-ai/openclaw (removed v0.71.0)
+        //   swival              → jedisct1/swival   (removed v0.71.0; official namespace of Swival's creator)
         assert!(!profiles.contains(&"claude-code".to_string()));
         assert!(!profiles.contains(&"codex".to_string()));
         assert!(!profiles.contains(&"opencode".to_string()));
+        assert!(!profiles.contains(&"openclaw".to_string()));
+        assert!(!profiles.contains(&"swival".to_string()));
     }
 
     #[test]
@@ -6820,7 +6949,7 @@ mod tests {
         std::fs::write(
             &profile_path,
             r#"{
-                "extends": "openclaw",
+                "extends": "linux-host-compat",
                 "meta": { "name": "ext-test" },
                 "filesystem": { "allow": ["/tmp/ext-test"] }
             }"#,
@@ -6832,11 +6961,11 @@ mod tests {
             Err(err) => panic!("load extended profile: {err}"),
         };
         assert_eq!(profile.meta.name, "ext-test");
-        // Should inherit openclaw's filesystem paths
+        // Should inherit linux-host-compat's groups (non-empty)
         assert!(
-            profile.filesystem.allow.len() > 1,
-            "Expected inherited paths from openclaw, got: {:?}",
-            profile.filesystem.allow
+            !profile.groups.include.is_empty(),
+            "Expected inherited groups from linux-host-compat, got: {:?}",
+            profile.groups.include
         );
         assert!(
             profile
@@ -6931,15 +7060,15 @@ mod tests {
 
     #[test]
     fn test_extends_chain_three_levels() {
-        // Test A -> B -> openclaw (built-in)
+        // Test A -> B -> linux-host-compat (built-in)
         let dir = tempdir().expect("tmpdir");
 
-        // B extends openclaw
+        // B extends linux-host-compat
         let b_path = dir.path().join("b.json");
         std::fs::write(
             &b_path,
             r#"{
-                "extends": "openclaw",
+                "extends": "linux-host-compat",
                 "meta": { "name": "b-profile" },
                 "filesystem": { "allow": ["/b/path"] }
             }"#,
@@ -7571,9 +7700,12 @@ mod tests {
 
     #[test]
     fn test_extends_duplicate_base_deduplicates() {
-        // extends: ["openclaw", "openclaw"] — duplicate is silently skipped
+        // extends: ["linux-host-compat", "linux-host-compat"] — duplicate is silently skipped
         let profile = Profile {
-            extends: Some(vec!["openclaw".to_string(), "openclaw".to_string()]),
+            extends: Some(vec![
+                "linux-host-compat".to_string(),
+                "linux-host-compat".to_string(),
+            ]),
             ..Default::default()
         };
 
@@ -7622,7 +7754,7 @@ mod tests {
         std::fs::write(
             &profile_path,
             r#"{
-                "extends": ["openclaw", "openclaw"],
+                "extends": ["linux-host-compat", "linux-host-compat"],
                 "meta": { "name": "shared-base-test" }
             }"#,
         )
@@ -8168,12 +8300,12 @@ mod tests {
     #[test]
     fn test_extends_can_clear_inherited_network_profile_with_null() {
         let dir = tempfile::tempdir().expect("tmpdir");
-        let profile_path = dir.path().join("openclaw-netopen.json");
+        let profile_path = dir.path().join("mise-netopen.json");
         std::fs::write(
             &profile_path,
             r#"{
-                "meta": { "name": "openclaw-netopen" },
-                "extends": "openclaw",
+                "meta": { "name": "mise-netopen" },
+                "extends": "mise-dev",
                 "network": { "network_profile": null }
             }"#,
         )
@@ -8183,13 +8315,10 @@ mod tests {
         assert_eq!(profile.network.resolved_network_profile(), None);
         assert!(profile.network.resolved_credentials().is_empty());
         assert!(profile.network.allow_domain.is_empty());
+        // Groups from mise-dev should still be inherited
         assert!(
-            profile
-                .filesystem
-                .allow
-                .iter()
-                .any(|path| path == "$HOME/.openclaw"),
-            "expected filesystem grants from openclaw to still be inherited",
+            profile.groups.include.contains(&"mise_manager".to_string()),
+            "expected groups from mise-dev to still be inherited",
         );
     }
 
@@ -9388,17 +9517,7 @@ mod tests {
     where
         F: FnOnce(&Path) -> R,
     {
-        let _guard = match crate::test_env::ENV_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        let tmp = tempdir().expect("tmpdir");
-        let config_dir = tmp.path().canonicalize().expect("canonicalize");
-        let _env = crate::test_env::EnvVarGuard::set_all(&[(
-            "XDG_CONFIG_HOME",
-            config_dir.to_str().expect("utf8"),
-        )]);
-        f(&config_dir)
+        crate::test_env::with_isolated_config_home(f)
     }
 
     /// Build a minimal pack store under `config_dir` (used as XDG_CONFIG_HOME).
@@ -9417,39 +9536,15 @@ mod tests {
         profile_json: &str,
         hook_file: Option<&str>,
     ) -> PathBuf {
-        let install_dir = config_dir
-            .join("nono")
-            .join("packages")
-            .join(ns)
-            .join(pack_name);
-        std::fs::create_dir_all(install_dir.join("profiles")).expect("create profiles dir");
-        if let Some(hf) = hook_file {
-            let hooks_dir = install_dir.join("hooks");
-            std::fs::create_dir_all(&hooks_dir).expect("create hooks dir");
-            std::fs::write(hooks_dir.join(hf), "#!/bin/sh\n").expect("write hook file");
-        }
-        // Write package.json manifest
-        let manifest = format!(
-            r#"{{
-              "schema_version": 1,
-              "name": "{pack_name}",
-              "artifacts": [{{
-                "type": "profile",
-                "path": "profiles/{install_as}.json",
-                "install_as": "{install_as}"
-              }}]
-            }}"#
-        );
-        std::fs::write(install_dir.join("package.json"), &manifest).expect("write package.json");
-        // Write profile JSON
-        std::fs::write(
-            install_dir
-                .join("profiles")
-                .join(format!("{install_as}.json")),
+        crate::test_env::write_fake_pack(
+            config_dir,
+            ns,
+            pack_name,
+            install_as,
             profile_json,
+            &[],
+            hook_file,
         )
-        .expect("write profile json");
-        install_dir
     }
 
     /// Test 1: A hook script starting with `$PACK_DIR` in a registry-pack profile
@@ -9881,6 +9976,93 @@ mod tests {
             after.source_pack.as_ref().map(PackageRef::key).as_deref(),
             Some("acme/widget-pack"),
             "absolute-path after hook must still have source_pack set"
+        );
+    }
+
+    #[test]
+    fn test_load_profile_extends_resolves_registry_refs_via_pack_store() {
+        let (from_ref, from_install_as) = with_config_env(|config_dir| {
+            build_fake_pack_store(
+                config_dir,
+                "acme",
+                "widget-pack",
+                "widget",
+                r#"{
+                    "meta": { "name": "widget" },
+                    "extends": ["node-dev", "default"]
+                }"#,
+                None,
+            );
+            (
+                load_profile_extends("acme/widget-pack"),
+                load_profile_extends("widget"),
+            )
+        });
+
+        assert_eq!(
+            from_ref.as_deref(),
+            Some(["node-dev".to_string(), "default".to_string()].as_slice()),
+            "registry ref must report the pack profile's bases"
+        );
+        assert_eq!(
+            from_ref, from_install_as,
+            "registry ref and install_as short name must agree"
+        );
+    }
+
+    #[test]
+    fn test_load_profile_extends_returns_none_for_unknown_registry_ref() {
+        let extends = with_config_env(|_config_dir| load_profile_extends("acme/not-installed"));
+        assert!(
+            extends.is_none(),
+            "an uninstalled pack ref has no resolvable bases"
+        );
+    }
+
+    #[test]
+    fn test_profile_artifact_without_install_as_is_rejected_by_load_and_extends() {
+        let (loaded, extends) = with_config_env(|config_dir| {
+            let install_dir = config_dir
+                .join("nono")
+                .join("packages")
+                .join("acme")
+                .join("no-install-as");
+            std::fs::create_dir_all(install_dir.join("profiles")).expect("create profiles dir");
+            std::fs::write(
+                install_dir.join("package.json"),
+                r#"{
+                  "schema_version": 1,
+                  "name": "no-install-as",
+                  "artifacts": [{
+                    "type": "profile",
+                    "path": "widget"
+                  }]
+                }"#,
+            )
+            .expect("write package.json");
+            std::fs::write(
+                install_dir.join("profiles").join("widget.json"),
+                r#"{
+                    "meta": { "name": "widget" },
+                    "extends": "nolabs-ai/claude"
+                }"#,
+            )
+            .expect("write pack profile");
+
+            (
+                load_profile_no_migrate("acme/no-install-as"),
+                load_profile_extends("acme/no-install-as"),
+            )
+        });
+
+        let err = loaded.expect_err("artifact without install_as must not resolve");
+        assert!(
+            err.to_string().contains("no profile found in pack"),
+            "expected a no-profile-found error, got: {err}"
+        );
+        assert!(
+            extends.is_none(),
+            "extends resolution must agree with the loader and report no bases"
         );
     }
 

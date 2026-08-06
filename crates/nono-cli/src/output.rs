@@ -1182,7 +1182,7 @@ pub fn prompt_cwd_sharing(cwd: &Path, access: &AccessMode) -> Result<bool> {
     Ok(answer == "y" || answer == "yes")
 }
 
-pub fn print_profile_hint(program: &str, profile: &str, silent: bool) {
+pub fn print_profile_hint(program: &str, pack_ref: &str, silent: bool) {
     if silent {
         return;
     }
@@ -1192,7 +1192,7 @@ pub fn print_profile_hint(program: &str, profile: &str, silent: bool) {
         "  {}",
         fg(
             &format!(
-                "Hint: `{program}` usually needs the built-in `{profile}` profile for its state and auth paths."
+                "Hint: `{program}` has a registry profile `{pack_ref}` with its required state and auth paths."
             ),
             t.yellow,
         )
@@ -1200,7 +1200,9 @@ pub fn print_profile_hint(program: &str, profile: &str, silent: bool) {
     eprintln!(
         "  {}",
         fg(
-            &format!("Try: nono run --profile {profile} -- {program}"),
+            &format!(
+                "Try: nono run --profile {pack_ref} -- {program}  (install first: nono pull {pack_ref})"
+            ),
             t.subtext,
         )
     );
@@ -1258,7 +1260,7 @@ mod tests {
 
     #[test]
     fn print_profile_hint_is_noop_when_silent() {
-        print_profile_hint("claude", "claude-code", true);
+        print_profile_hint("claude", "nolabs-ai/claude", true);
     }
 
     #[test]

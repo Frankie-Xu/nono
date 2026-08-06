@@ -709,34 +709,6 @@
       "workdir": { "access": "none" },
       "interactive": false
     },
-    "openclaw": {
-      "extends": "default",
-      "meta": {
-        "name": "openclaw",
-        "version": "1.0.0",
-        "description": "OpenClaw messaging gateway",
-        "author": "nolabs-ai"
-      },
-      "groups": {
-        "include": ["node_runtime"]
-      },
-      "security": {
-        "signal_mode": "isolated"
-      },
-      "filesystem": {
-        "allow": [
-          "$HOME/.openclaw",
-          "$HOME/.config/openclaw",
-          "$TMPDIR/openclaw-$UID"
-        ]
-      },
-      "network": { "block": false },
-      "workdir": { "access": "read" },
-      "undo": {
-        "exclude_patterns": ["node_modules", ".next"]
-      },
-      "interactive": false
-    },
     "mise-dev": {
       "extends": "default",
       "meta": {
@@ -873,43 +845,6 @@
       "network": { "block": false, "network_profile": "developer" },
       "workdir": { "access": "readwrite" },
       "interactive": false
-    },
-    "swival": {
-      "extends": "default",
-      "meta": {
-        "name": "swival",
-        "version": "1.0.0",
-        "description": "Swival CLI coding agent",
-        "author": "nolabs-ai"
-      },
-      "groups": {
-        "include": [
-          "python_runtime",
-          "node_runtime",
-          "user_caches_macos",
-          "user_caches_linux",
-          "linux_sysfs_read",
-          "git_config",
-          "unlink_protection"
-        ]
-      },
-      "security": {
-        "signal_mode": "isolated",
-        "capability_elevation": false
-      },
-      "filesystem": {
-        "allow": [
-          "$HOME/.config/swival",
-          "$HOME/.local/share/swival"
-        ]
-      },
-      "network": { "block": false },
-      "workdir": { "access": "readwrite" },
-      "undo": {
-        "exclude_patterns": ["node_modules", "__pycache__", ".swival"],
-        "exclude_globs": ["*.pyc"]
-      },
-      "interactive": true
     }
   }
 }

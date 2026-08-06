@@ -2313,7 +2313,7 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(suggested_run_profile_name(None, "openclaw"), None);
+        assert_eq!(suggested_run_profile_name(None, "linux-host-compat"), None);
     }
 
     #[test]
@@ -2615,8 +2615,8 @@ mod tests {
             ),
         ]);
 
-        // `openclaw` is a known built-in; writing to that user path would shadow it.
-        assert!(would_shadow_existing_profile("openclaw"));
+        // `linux-host-compat` is a known built-in; writing to that user path would shadow it.
+        assert!(would_shadow_existing_profile("linux-host-compat"));
         // Names that don't exist as built-ins or pack profiles are fine.
         assert!(!would_shadow_existing_profile("my-unique-saved-profile"));
     }
@@ -2678,15 +2678,15 @@ mod tests {
 
         // Pre-create a user override of a built-in. A subsequent save to the
         // same name is an update, not a new shadow, and must be allowed.
-        let path = profile::get_user_profile_path("openclaw").expect("profile path");
+        let path = profile::get_user_profile_path("linux-host-compat").expect("profile path");
         std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
         std::fs::write(
             &path,
-            "{\"meta\":{\"name\":\"openclaw\",\"version\":\"1.0.0\"}}\n",
+            "{\"meta\":{\"name\":\"linux-host-compat\",\"version\":\"1.0.0\"}}\n",
         )
         .expect("write");
 
-        assert!(!would_shadow_existing_profile("openclaw"));
+        assert!(!would_shadow_existing_profile("linux-host-compat"));
     }
 
     #[test]
