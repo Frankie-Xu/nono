@@ -71,6 +71,51 @@ fn python3_available() -> bool {
         .unwrap_or(false)
 }
 
+#[test]
+#[cfg(target_os = "linux")]
+fn cli_auto_block_net_uses_static_seccomp_baseline() {
+    if !python3_available() {
+        eprintln!("skipping: python3 unavailable");
+        return;
+    }
+
+    let (_tmp, home, workspace) = setup_isolated_home("network-baseline");
+    let script = "import ctypes, socket
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    print('UDP_OPEN')
+except OSError as e:
+    print('UDP_BLOCKED', e.errno)
+libc = ctypes.CDLL(None, use_errno=True)
+result = libc.syscall(425, 1, None)
+print('IO_URING', result, ctypes.get_errno())";
+
+    let output = run_nono(
+        &[
+            "run",
+            "--allow-cwd",
+            "--block-net",
+            "--no-rollback",
+            "--",
+            "python3",
+            "-c",
+            script,
+        ],
+        &home,
+        &workspace,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "baseline probe failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("UDP_BLOCKED 1"), "stdout: {stdout}");
+    assert!(!stdout.contains("UDP_OPEN"), "stdout: {stdout}");
+    assert!(stdout.contains("IO_URING -1 1"), "stdout: {stdout}");
+}
+
 #[cfg(target_os = "linux")]
 fn cc_available() -> bool {
     Command::new("cc")

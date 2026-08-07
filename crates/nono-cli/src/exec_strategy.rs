@@ -1017,7 +1017,10 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 }
 
                 let sandbox_result = match config.sandbox_policy {
-                    crate::profile::LinuxSandboxPolicy::Auto => Sandbox::apply_auto(effective_caps),
+                    crate::profile::LinuxSandboxPolicy::Auto => Sandbox::apply_seccomp(
+                        effective_caps,
+                        nono::SeccompOpts::network_baseline(),
+                    ),
                     crate::profile::LinuxSandboxPolicy::Landlock => {
                         Sandbox::apply_landlock(effective_caps)
                             .map(|_| nono::sandbox::SeccompNetFallback::None)

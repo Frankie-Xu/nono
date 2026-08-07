@@ -846,7 +846,8 @@ pub enum IpcMode {
 /// forcing all traffic through the nono proxy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkMode {
-    /// All network access blocked (Landlock deny-all TCP, Seatbelt deny network*)
+    /// All network access blocked (static seccomp + Landlock on Linux,
+    /// Seatbelt deny network* on macOS).
     Blocked,
     /// All network access allowed (no filtering)
     #[default]
@@ -924,9 +925,10 @@ pub struct CapabilitySet {
     /// These apply regardless of NetworkMode.
     ///
     /// On macOS (Seatbelt), outbound is scoped to localhost per-port.
-    /// On Linux (Landlock), ConnectTcp/BindTcp filter by port only, not
-    /// by destination IP. Use with `--block-net` or proxy mode to ensure
-    /// only localhost is reachable.
+    /// On Linux (Landlock), ConnectTcp/BindTcp filter by port only, not by
+    /// destination or bind address. `--block-net` blocks other ports but does
+    /// not narrow this grant to localhost; use proxy mode for destination-host
+    /// enforcement.
     localhost_ports: Vec<u16>,
     /// Inclusive port ranges for bidirectional localhost IPC (connect + bind).
     ///

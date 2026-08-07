@@ -1985,12 +1985,14 @@ pub struct DiagnosticsConfig {
 
 /// Which sandboxing mechanism nono should install on Linux.
 ///
-/// Defaults to `auto`, which reflects the historical behaviour.
+/// Defaults to `auto`, which layers a static seccomp network baseline under
+/// Landlock for restricted network policies.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum LinuxSandboxPolicy {
-    /// Landlock with automatic seccomp fallback when the kernel ABI lacks
-    /// network support (< V4). This is the default.
+    /// Landlock plus a static seccomp baseline for restricted networking, with
+    /// automatic seccomp fallback when the kernel ABI lacks network support
+    /// (< V4). This is the default.
     #[default]
     Auto,
     /// Landlock only. Returns an error at startup if the kernel cannot
