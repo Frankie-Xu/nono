@@ -338,6 +338,45 @@ pub(crate) fn expand_path(path_str: &str) -> Result<PathBuf> {
 /// Results are sorted and deduplicated. Empty match emits a warning and returns
 /// an empty `Vec` — not an error. `?` and `[` are unsupported and return an error.
 pub(crate) fn expand_glob_path(pattern: &str) -> Result<Vec<PathBuf>> {
+    let (matches, _escaped) = expand_glob_path_impl(pattern)?;
+    if matches.is_empty() {
+        warn!(
+            "Glob pattern {pattern:?} matched no existing paths; \
+             the rule will have no effect until matching files are created"
+        );
+    }
+    Ok(matches)
+}
+
+/// Like [`expand_glob_path`], but for deny callers: also includes the literal
+/// path of any glob match that is a symlink resolving outside the walk root.
+///
+/// [`expand_glob_path`] drops those matches (with a warning) because for an
+/// *allow* glob, following the symlink would grant access at an arbitrary
+/// location outside the intended directory. For a *deny* glob the same
+/// escape must not have the opposite effect of silently un-denying the
+/// match — the symlink itself is still inside the walk root and named like
+/// the pattern, so it must still be covered. The escaped target is not
+/// added here: denying it too is harmless, but it's `add_deny_access_rules`
+/// (called by every user of this function) that already canonicalizes each
+/// returned path and denies both forms.
+pub(crate) fn expand_glob_deny_paths(pattern: &str) -> Result<Vec<PathBuf>> {
+    let (mut matches, escaped) = expand_glob_path_impl(pattern)?;
+    if matches.is_empty() && escaped.is_empty() {
+        warn!(
+            "Glob pattern {pattern:?} matched no existing paths; \
+             the rule will have no effect until matching files are created"
+        );
+    }
+    matches.extend(escaped);
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
+}
+
+/// Shared implementation for [`expand_glob_path`] and [`expand_glob_deny_paths`].
+/// Returns `(in_root_matches, escaped_symlink_literal_paths)`.
+fn expand_glob_path_impl(pattern: &str) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     if !pattern.starts_with('/') {
         return Err(NonoError::ConfigParse(format!(
             "expand_glob_path requires an absolute pattern; got {pattern:?}. \
@@ -346,7 +385,7 @@ pub(crate) fn expand_glob_path(pattern: &str) -> Result<Vec<PathBuf>> {
     }
 
     if !pattern.contains('*') {
-        return Ok(vec![expand_path(pattern)?]);
+        return Ok((vec![expand_path(pattern)?], Vec::new()));
     }
 
     // Split at the first glob component so expand_path can validate and expand
@@ -400,11 +439,7 @@ pub(crate) fn expand_glob_path(pattern: &str) -> Result<Vec<PathBuf>> {
     let canonical_root = match walk_root.canonicalize() {
         Ok(root) => root,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            warn!(
-                "Glob pattern {pattern:?} matched no existing paths; \
-                 the rule will have no effect until matching files are created"
-            );
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         Err(source) => {
             return Err(NonoError::PathCanonicalization {
@@ -415,18 +450,20 @@ pub(crate) fn expand_glob_path(pattern: &str) -> Result<Vec<PathBuf>> {
     };
 
     let mut matches: Vec<PathBuf> = Vec::new();
-    walk_and_match(&walk_root, &canonical_root, &matcher, &mut matches);
+    let mut escaped: Vec<PathBuf> = Vec::new();
+    walk_and_match(
+        &walk_root,
+        &canonical_root,
+        &matcher,
+        &mut matches,
+        &mut escaped,
+    );
     matches.sort();
     matches.dedup();
+    escaped.sort();
+    escaped.dedup();
 
-    if matches.is_empty() {
-        warn!(
-            "Glob pattern {pattern:?} matched no existing paths; \
-             the rule will have no effect until matching files are created"
-        );
-    }
-
-    Ok(matches)
+    Ok((matches, escaped))
 }
 
 /// Backslash-escapes globset metacharacters (`\`, `?`, `[`, `]`, `{`, `}`) so a
@@ -450,6 +487,7 @@ fn walk_and_match(
     canonical_root: &Path,
     matcher: &globset::GlobSet,
     out: &mut Vec<PathBuf>,
+    escaped_out: &mut Vec<PathBuf>,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -460,14 +498,21 @@ fn walk_and_match(
             // A symlink resolving outside the walk root would otherwise let the
             // grant it's turned into (by canonicalizing again downstream) point
             // at an arbitrary location, e.g. `$WORKDIR/escape -> ~/.ssh`. Only
-            // accept matches whose real, resolved location stays under the root.
+            // accept matches whose real, resolved location stays under the root
+            // as an *allow* target. The literal symlink path itself is still
+            // collected separately (`escaped_out`) — deny callers need it so
+            // the escape can't be used to bypass a deny rule (see
+            // `expand_glob_deny_paths`); allow callers ignore that list.
             match path.canonicalize() {
                 Ok(resolved) if resolved.starts_with(canonical_root) => out.push(path.clone()),
-                Ok(resolved) => warn!(
-                    "Skipping glob match {} — resolves outside the walk root ({})",
-                    path.display(),
-                    resolved.display()
-                ),
+                Ok(resolved) => {
+                    warn!(
+                        "Skipping glob match {} — resolves outside the walk root ({})",
+                        path.display(),
+                        resolved.display()
+                    );
+                    escaped_out.push(path.clone());
+                }
                 Err(_) => {} // broken symlink or race; skip like a non-existent path
             }
         }
@@ -476,7 +521,7 @@ fn walk_and_match(
         // scope escape and causing infinite recursion on cycles.
         let is_real_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_real_dir {
-            walk_and_match(&path, canonical_root, matcher, out);
+            walk_and_match(&path, canonical_root, matcher, out, escaped_out);
         }
     }
 }
@@ -966,7 +1011,7 @@ pub(crate) fn add_glob_deny_rules(
     caps: &mut CapabilitySet,
     deny_paths: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    for path in expand_glob_path(pattern)? {
+    for path in expand_glob_deny_paths(pattern)? {
         add_deny_access_rules(path_to_utf8(&path)?, caps, deny_paths)?;
     }
 
@@ -2343,7 +2388,10 @@ mod tests {
         let root = dir.path().join("runtime-sockets");
         std::fs::create_dir(&root).expect("mkdir");
         let sock_path = root.join("agent.sock");
-        assert!(!sock_path.exists(), "precondition: socket must not exist yet");
+        assert!(
+            !sock_path.exists(),
+            "precondition: socket must not exist yet"
+        );
 
         let pattern = format!("{}/*.sock", root.display());
         let mut caps = CapabilitySet::new();
