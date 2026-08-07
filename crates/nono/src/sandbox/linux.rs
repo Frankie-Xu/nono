@@ -93,10 +93,15 @@ fn move_fd_above_stdio(fd: OwnedFd) -> std::io::Result<OwnedFd> {
     // Prepared descriptors must survive child stdio wiring.  F_DUPFD_CLOEXEC
     // creates an independent slot at or above 3; dropping `fd` then restores
     // the caller's originally closed stdio slot.
+    // SAFETY: `fd` is a valid, open descriptor owned by this `OwnedFd` for the
+    // duration of the call, so passing its raw value to `fcntl` is valid.
     let duplicate = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
     if duplicate < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: `duplicate` is >= 0 here, so `fcntl` succeeded and returned a
+    // fresh, uniquely-owned descriptor; wrapping it in `OwnedFd` is valid and
+    // gives us sole ownership.
     Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 
