@@ -993,6 +993,8 @@ pub(crate) fn add_glob_deny_rules(
         caps.add_platform_rule(format!("(allow file-read-metadata (regex #\"{re}\"))"))?;
         caps.add_platform_rule(format!("(deny file-read-data (regex #\"{re}\"))"))?;
         caps.add_platform_rule(format!("(deny file-write* (regex #\"{re}\"))"))?;
+        // Unix socket connect(2) is mediated as network-outbound, not file I/O.
+        caps.add_platform_rule(format!("(deny network-outbound (regex #\"{re}\"))"))?;
     }
 
     #[cfg(target_os = "linux")]
@@ -2331,6 +2333,30 @@ mod tests {
                     .any(|r| r.contains("deny file-write*") && r.contains("regex"))
             );
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_glob_deny_blocks_future_unix_socket_connections() {
+        // Socket does not exist yet at sandbox start — the normal case.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("runtime-sockets");
+        std::fs::create_dir(&root).expect("mkdir");
+        let sock_path = root.join("agent.sock");
+        assert!(!sock_path.exists(), "precondition: socket must not exist yet");
+
+        let pattern = format!("{}/*.sock", root.display());
+        let mut caps = CapabilitySet::new();
+        let mut deny_paths: Vec<PathBuf> = Vec::new();
+        add_glob_deny_rules(&pattern, &mut caps, &mut deny_paths).expect("must not error");
+
+        let rules = caps.platform_rules();
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.contains("deny network-outbound") && r.contains("regex")),
+            "glob deny must emit a network-outbound regex rule to cover future Unix socket connects"
+        );
     }
 
     #[test]
