@@ -3427,9 +3427,9 @@ mod tests {
         let xdg_str = xdg.to_str().expect("utf8 xdg");
         let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
 
-        // `openclaw` is a known built-in profile; init to the default path must be blocked.
+        // `linux-host-compat` is a known built-in profile; init to the default path must be blocked.
         let result = cmd_init(ProfileInitArgs {
-            name: "openclaw".to_string(),
+            name: "linux-host-compat".to_string(),
             extends: None,
             groups: vec![],
             description: None,
@@ -3457,10 +3457,10 @@ mod tests {
         let xdg_str = xdg.to_str().expect("utf8 xdg");
         let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
 
-        let out = dir.path().join("openclaw-draft.json");
+        let out = dir.path().join("linux-host-compat-draft.json");
         // Shadow check applies even when --output points to a custom path.
         let result = cmd_init(ProfileInitArgs {
-            name: "openclaw".to_string(),
+            name: "linux-host-compat".to_string(),
             extends: None,
             groups: vec![],
             description: None,
@@ -3819,21 +3819,22 @@ mod tests {
             "expected 'default' in profiles"
         );
         assert!(
-            profiles.contains(&"openclaw".to_string()),
-            "expected 'openclaw' in profiles"
+            profiles.contains(&"linux-host-compat".to_string()),
+            "expected 'linux-host-compat' in profiles"
         );
     }
 
     #[test]
     fn test_show_resolves_inheritance() {
-        let profile = profile::load_profile("openclaw").expect("openclaw profile should load");
+        let profile = profile::load_profile("linux-host-compat")
+            .expect("linux-host-compat profile should load");
         assert!(
             !profile.groups.include.is_empty(),
-            "openclaw should have groups"
+            "linux-host-compat should have groups"
         );
-        // openclaw extends default, so it should have default's base groups
+        // linux-host-compat extends default, so it should have default's base groups
         let has_deny = profile.groups.include.iter().any(|g| g.contains("deny"));
-        assert!(has_deny, "openclaw should inherit deny groups");
+        assert!(has_deny, "linux-host-compat should inherit deny groups");
     }
 
     #[test]
@@ -3919,7 +3920,7 @@ mod tests {
     #[test]
     fn test_diff_shows_differences() {
         let p1 = profile::load_profile("default").expect("default should load");
-        let p2 = profile::load_profile("openclaw").expect("openclaw should load");
+        let p2 = profile::load_profile("linux-host-compat").expect("linux-host-compat should load");
 
         let g1: BTreeSet<&str> = p1.groups.include.iter().map(|s| s.as_str()).collect();
         let g2: BTreeSet<&str> = p2.groups.include.iter().map(|s| s.as_str()).collect();
@@ -3927,7 +3928,7 @@ mod tests {
         let added: BTreeSet<&&str> = g2.difference(&g1).collect();
         assert!(
             !added.is_empty(),
-            "openclaw should have additional groups over default"
+            "linux-host-compat should have additional groups over default"
         );
     }
 

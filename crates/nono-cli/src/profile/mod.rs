@@ -1,8 +1,8 @@
 //! Profile system for pre-configured capability sets
 //!
-//! Profiles provide named configurations for common applications like
-//! claude-code, openclaw, and opencode. They can be built-in (compiled
-//! into the binary) or user-defined (in `$XDG_CONFIG_HOME/nono/profiles/`).
+//! Profiles provide named capability configurations for sandboxed processes.
+//! They can be built-in (compiled into the binary), installed from registry
+//! packs (e.g. nolabs-ai/claude), or user-defined (in `$XDG_CONFIG_HOME/nono/profiles/`).
 
 pub(crate) mod builtin;
 mod credential_provider;
@@ -4410,7 +4410,7 @@ mod tests {
     #[test]
     fn test_valid_profile_names() {
         assert!(is_valid_profile_name("claude-code"));
-        assert!(is_valid_profile_name("openclaw"));
+        assert!(is_valid_profile_name("linux-host-compat"));
         assert!(is_valid_profile_name("my-app-2"));
         assert!(!is_valid_profile_name(""));
         assert!(!is_valid_profile_name("-invalid"));
@@ -4581,8 +4581,8 @@ mod tests {
 
     #[test]
     fn test_load_builtin_profile() {
-        let profile = load_profile("openclaw").expect("Failed to load profile");
-        assert_eq!(profile.meta.name, "openclaw");
+        let profile = load_profile("linux-host-compat").expect("Failed to load profile");
+        assert_eq!(profile.meta.name, "linux-host-compat");
         assert!(!profile.network.block); // network allowed by default
     }
 
@@ -4861,15 +4861,18 @@ mod tests {
         let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", canonical_str)]);
 
         let profiles = list_profiles();
-        assert!(profiles.contains(&"openclaw".to_string()));
-        assert!(profiles.contains(&"swival".to_string()));
+        assert!(profiles.contains(&"linux-host-compat".to_string()));
         // These profiles were removed from built-ins; they ship via registry packs:
         //   claude-code / claude → nolabs-ai/claude   (formerly always-further/claude, removed v0.43.0)
         //   codex               → nolabs-ai/codex    (formerly always-further/codex, removed v0.43.0)
         //   opencode            → nolabs-ai/opencode (formerly always-further/opencode, removed)
+        //   openclaw            → nolabs-ai/openclaw (removed v0.71.0)
+        //   swival              → jedisct1/swival   (removed v0.71.0; official namespace of Swival's creator)
         assert!(!profiles.contains(&"claude-code".to_string()));
         assert!(!profiles.contains(&"codex".to_string()));
         assert!(!profiles.contains(&"opencode".to_string()));
+        assert!(!profiles.contains(&"openclaw".to_string()));
+        assert!(!profiles.contains(&"swival".to_string()));
     }
 
     #[test]
@@ -6944,7 +6947,7 @@ mod tests {
         std::fs::write(
             &profile_path,
             r#"{
-                "extends": "openclaw",
+                "extends": "linux-host-compat",
                 "meta": { "name": "ext-test" },
                 "filesystem": { "allow": ["/tmp/ext-test"] }
             }"#,
@@ -6956,11 +6959,11 @@ mod tests {
             Err(err) => panic!("load extended profile: {err}"),
         };
         assert_eq!(profile.meta.name, "ext-test");
-        // Should inherit openclaw's filesystem paths
+        // Should inherit linux-host-compat's groups (non-empty)
         assert!(
-            profile.filesystem.allow.len() > 1,
-            "Expected inherited paths from openclaw, got: {:?}",
-            profile.filesystem.allow
+            !profile.groups.include.is_empty(),
+            "Expected inherited groups from linux-host-compat, got: {:?}",
+            profile.groups.include
         );
         assert!(
             profile
@@ -7055,15 +7058,15 @@ mod tests {
 
     #[test]
     fn test_extends_chain_three_levels() {
-        // Test A -> B -> openclaw (built-in)
+        // Test A -> B -> linux-host-compat (built-in)
         let dir = tempdir().expect("tmpdir");
 
-        // B extends openclaw
+        // B extends linux-host-compat
         let b_path = dir.path().join("b.json");
         std::fs::write(
             &b_path,
             r#"{
-                "extends": "openclaw",
+                "extends": "linux-host-compat",
                 "meta": { "name": "b-profile" },
                 "filesystem": { "allow": ["/b/path"] }
             }"#,
@@ -7695,9 +7698,12 @@ mod tests {
 
     #[test]
     fn test_extends_duplicate_base_deduplicates() {
-        // extends: ["openclaw", "openclaw"] — duplicate is silently skipped
+        // extends: ["linux-host-compat", "linux-host-compat"] — duplicate is silently skipped
         let profile = Profile {
-            extends: Some(vec!["openclaw".to_string(), "openclaw".to_string()]),
+            extends: Some(vec![
+                "linux-host-compat".to_string(),
+                "linux-host-compat".to_string(),
+            ]),
             ..Default::default()
         };
 
@@ -7746,7 +7752,7 @@ mod tests {
         std::fs::write(
             &profile_path,
             r#"{
-                "extends": ["openclaw", "openclaw"],
+                "extends": ["linux-host-compat", "linux-host-compat"],
                 "meta": { "name": "shared-base-test" }
             }"#,
         )
@@ -8292,12 +8298,12 @@ mod tests {
     #[test]
     fn test_extends_can_clear_inherited_network_profile_with_null() {
         let dir = tempfile::tempdir().expect("tmpdir");
-        let profile_path = dir.path().join("openclaw-netopen.json");
+        let profile_path = dir.path().join("mise-netopen.json");
         std::fs::write(
             &profile_path,
             r#"{
-                "meta": { "name": "openclaw-netopen" },
-                "extends": "openclaw",
+                "meta": { "name": "mise-netopen" },
+                "extends": "mise-dev",
                 "network": { "network_profile": null }
             }"#,
         )
@@ -8307,13 +8313,10 @@ mod tests {
         assert_eq!(profile.network.resolved_network_profile(), None);
         assert!(profile.network.resolved_credentials().is_empty());
         assert!(profile.network.allow_domain.is_empty());
+        // Groups from mise-dev should still be inherited
         assert!(
-            profile
-                .filesystem
-                .allow
-                .iter()
-                .any(|path| path == "$HOME/.openclaw"),
-            "expected filesystem grants from openclaw to still be inherited",
+            profile.groups.include.contains(&"mise_manager".to_string()),
+            "expected groups from mise-dev to still be inherited",
         );
     }
 

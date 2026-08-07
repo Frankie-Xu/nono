@@ -85,7 +85,7 @@ The proxy resolves DNS itself and checks all resolved IPs against the deny list 
 By default the proxy binds to an OS-assigned ephemeral port. Use `--proxy-port` to fix it when the application requires a known port:
 
 ```bash
-nono run --profile openclaw --proxy-port 19999 --listen-port 18789 -- openclaw gateway
+nono run --profile nolabs-ai/openclaw --proxy-port 19999 --listen-port 18789 -- openclaw gateway
 ```
 
 Applications that read `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, etc. from the environment don't need `--proxy-port` — nono sets these automatically.

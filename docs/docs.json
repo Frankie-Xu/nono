@@ -121,7 +121,7 @@
         "group": "Reference",
         "pages": [
           "cli/usage/flags",
-          "cli/clients/claude-code",
+          "cli/clients/claude",
           "cli/clients/codex",
           "cli/clients/opencode",
           "cli/clients/openclaw"
