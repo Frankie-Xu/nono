@@ -288,7 +288,7 @@ fn matching_deny_path<'a>(
         .iter()
         .filter(|deny| {
             let resolved_deny = nono::try_canonicalize(deny);
-            resolved == resolved_deny || resolved.starts_with(&resolved_deny)
+            resolved.starts_with(&resolved_deny)
         })
         .max_by_key(|deny| deny.as_os_str().len())
 }
