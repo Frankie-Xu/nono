@@ -80,14 +80,14 @@ fn cli_auto_block_net_uses_static_seccomp_baseline() {
     }
 
     let (_tmp, home, workspace) = setup_isolated_home("network-baseline");
-    let script = "import ctypes, socket\n\
-try:\n\
- socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
- print('UDP_OPEN')\n\
-except OSError as e:\n\
- print('UDP_BLOCKED', e.errno)\n\
-libc = ctypes.CDLL(None, use_errno=True)\n\
-result = libc.syscall(425, 1, None)\n\
+    let script = "import ctypes, socket
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    print('UDP_OPEN')
+except OSError as e:
+    print('UDP_BLOCKED', e.errno)
+libc = ctypes.CDLL(None, use_errno=True)
+result = libc.syscall(425, 1, None)
 print('IO_URING', result, ctypes.get_errno())";
 
     let output = run_nono(
