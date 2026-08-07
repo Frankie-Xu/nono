@@ -160,6 +160,9 @@ pub struct CommandPolicyAuditEvent {
     pub env_display: Vec<CommandPolicyEnvAuditEntry>,
     /// Redacted current working directory display.
     pub cwd_display: String,
+    /// Exact normalized filesystem proposal for approval decisions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filesystem: Vec<crate::supervisor::CommandFilesystemGrant>,
     /// Command exit code, when a command was launched.
     pub exit_code: Option<i32>,
     /// Captured stdio accounting.

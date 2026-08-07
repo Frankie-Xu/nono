@@ -1262,8 +1262,9 @@
         },
         "commands": {
           "type": "object",
+          "propertyNames": { "$ref": "#/$defs/CommandPolicyReference" },
           "additionalProperties": { "$ref": "#/$defs/CommandPolicyConfig" },
-          "description": "Policy-controlled command definitions. A non-empty object activates tool-sandbox."
+          "description": "Policy-controlled command definitions. A non-empty object activates tool-sandbox. The '*' key is a fallback for otherwise-unlisted external commands discovered by name on trusted PATH directories."
         },
         "deny_direct_exec_bypass": {
           "type": "array",
@@ -1520,8 +1521,8 @@
         },
         "can_use": {
           "type": "array",
-          "items": { "$ref": "#/$defs/CommandPolicyIdentifier" },
-          "description": "Other commands this command may invoke through tool-sandbox chaining. If no explicit self-invocation entry is configured, self-invocation keeps the command's current effective policy and does not require listing the command here."
+          "items": { "$ref": "#/$defs/CommandPolicyReference" },
+          "description": "Other commands this command may invoke through tool-sandbox chaining. '*' permits commands selected by the wildcard fallback. If no explicit self-invocation entry is configured, self-invocation keeps the command's current effective policy and does not require listing the command here."
         },
         "sandbox": {
           "$ref": "#/$defs/CommandSandboxConfig",
@@ -1614,6 +1615,10 @@
           "items": { "type": "string" },
           "description": "Exact file write grants for the selected child-tool-sandbox policy."
         },
+        "approval_fs": {
+          "$ref": "#/$defs/CommandApprovalFilesystemConfig",
+          "description": "Ceilings for explicit invocation-scoped filesystem requests. Paths are granted only after approval and only for that command launch."
+        },
         "use_credentials": {
           "type": "array",
           "items": { "$ref": "#/$defs/CommandPolicyIdentifier" },
@@ -1661,6 +1666,31 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "macOS-only. Expert escape hatch: raw Seatbelt S-expression rules appended to this command's child sandbox profile, emitted after the generated denies (including the exec gate's (deny process-exec*)), so a later (allow ...) wins under Seatbelt's last-matching-rule semantics. Scoped to a single command or per-intercept override. Ignored on Linux."
+        }
+      }
+    },
+    "CommandApprovalFilesystemConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "read_roots": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Directory roots beneath which exact read requests may be approved."
+        },
+        "write_roots": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Directory roots beneath which exact write or read-write requests may be approved."
+        },
+        "backend": {
+          "$ref": "#/$defs/CommandPolicyIdentifier",
+          "description": "Named approval backend. Uses approval_defaults.backend when omitted."
+        },
+        "timeout_secs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Approval timeout for invocation-scoped filesystem requests."
         }
       }
     },
@@ -1927,6 +1957,13 @@
         "enum": [".", "..", "session"]
       },
       "description": "tool-sandbox command or credential identifier."
+    },
+    "CommandPolicyReference": {
+      "oneOf": [
+        { "$ref": "#/$defs/CommandPolicyIdentifier" },
+        { "type": "string", "const": "*" }
+      ],
+      "description": "A concrete tool-sandbox command identifier or the wildcard fallback marker."
     },
     "WorkdirConfig": {
       "type": "object",

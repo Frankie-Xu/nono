@@ -12,6 +12,31 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+/// An exact filesystem capability proposed for a Tool Sandbox command launch.
+///
+/// Unlike Linux seccomp-notify elevation, this capability is applied to a new
+/// child sandbox before exec. Approval backends therefore see the complete,
+/// normalized capability proposal before deciding whether the command may run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandFilesystemGrant {
+    /// Canonical filesystem path that would be granted to the child.
+    pub path: PathBuf,
+    /// Requested access mode.
+    pub access: AccessMode,
+    /// Whether `path` is an exact file or a recursive directory grant.
+    pub kind: CommandFilesystemGrantKind,
+}
+
+/// Scope of an approval-gated Tool Sandbox filesystem capability.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandFilesystemGrantKind {
+    /// Grant one exact file.
+    File,
+    /// Grant a directory recursively.
+    Directory,
+}
+
 /// A request from the sandboxed child for additional filesystem access.
 ///
 /// This is the IPC wire type sent over the supervisor Unix socket. The
@@ -98,7 +123,8 @@ pub enum ApprovalRequest {
         /// Session identifier
         session_id: String,
     },
-    /// An Tool Sandbox  command-launch approval request (from the `Approve` intercept action).
+    /// A Tool Sandbox command-launch approval request, including invocation
+    /// policy, intercept, and invocation-scoped filesystem proposals.
     Command {
         /// Unique identifier for this request
         request_id: String,
@@ -112,6 +138,9 @@ pub enum ApprovalRequest {
         intercept_rule: String,
         /// Human-readable reason (may be empty)
         reason: Option<String>,
+        /// Exact invocation-scoped filesystem capabilities awaiting approval.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        filesystem: Vec<CommandFilesystemGrant>,
         /// PID of the shim process that sent the request
         child_pid: u32,
         /// Session identifier

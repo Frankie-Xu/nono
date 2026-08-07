@@ -268,7 +268,6 @@ impl CommandPoliciesConfig {
     /// True if any command's sandbox (session-level or any `from` edge) declares
     /// an `open_urls` policy. Used to decide whether the tool-sandbox runtime
     /// needs to bind a URL-open listener socket at all.
-    #[cfg(any(test, target_os = "linux", target_os = "macos"))]
     pub(crate) fn any_command_allows_url_open(&self) -> bool {
         self.commands.values().any(|command| {
             command
@@ -760,6 +759,10 @@ pub struct CommandSandboxConfig {
     pub fs_write: Vec<String>,
     #[serde(default)]
     pub fs_write_file: Vec<String>,
+    /// Optional ceilings for invocation-scoped filesystem capabilities
+    /// explicitly requested by the shim caller and approved before launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_fs: Option<CommandApprovalFilesystemConfig>,
     #[serde(default)]
     pub use_credentials: Vec<String>,
     #[serde(default)]
@@ -810,6 +813,10 @@ impl CommandSandboxConfig {
             fs_read_file: dedup_append(&self.fs_read_file, &child.fs_read_file),
             fs_write: dedup_append(&self.fs_write, &child.fs_write),
             fs_write_file: dedup_append(&self.fs_write_file, &child.fs_write_file),
+            approval_fs: child
+                .approval_fs
+                .clone()
+                .or_else(|| self.approval_fs.clone()),
             use_credentials: dedup_append(&self.use_credentials, &child.use_credentials),
             credentials: dedup_append(&self.credentials, &child.credentials),
             argv_prepend: append_args(&self.argv_prepend, &child.argv_prepend),
@@ -831,6 +838,28 @@ impl CommandSandboxConfig {
             exec_paths: dedup_append(&self.exec_paths, &child.exec_paths),
         }
     }
+}
+
+/// Policy ceiling for explicit, approval-gated filesystem requests made at a
+/// Tool Sandbox command boundary. These paths are not ambient grants: a child
+/// receives nothing unless its invocation requests exact paths and the selected
+/// approval backend grants that request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommandApprovalFilesystemConfig {
+    /// Directory roots under which exact read requests may be approved.
+    #[serde(default)]
+    pub read_roots: Vec<String>,
+    /// Directory roots under which write/read-write requests may be approved.
+    #[serde(default)]
+    pub write_roots: Vec<String>,
+    /// Approval backend for filesystem requests. Falls back to the global
+    /// approval default when omitted.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// Per-request approval timeout. Falls back through backend/global values.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1132,7 +1161,11 @@ pub(crate) fn validate_command_policies(
         ),
     );
 
-    validate_identifier_set("command", config.commands.keys(), &mut report);
+    validate_identifier_set(
+        "command",
+        config.commands.keys().filter(|name| name.as_str() != "*"),
+        &mut report,
+    );
     validate_identifier_set("credential", config.credentials.keys(), &mut report);
     validate_identifier_set(
         "approval backend",
@@ -1164,6 +1197,13 @@ pub(crate) fn validate_command_policies(
 
     for (command_name, command) in &config.commands {
         validate_command(command_name, command, config, scope, &mut report);
+    }
+
+    if config.commands.contains_key("*") && config.any_command_allows_url_open() {
+        report.error(
+            "wildcard_url_open_conflict",
+            "commands.* cannot currently be combined with open_urls because both require ownership of the reserved 'open' shim name",
+        );
     }
 
     if scope == CommandPolicyValidationScope::Resolved {
@@ -1255,7 +1295,11 @@ pub(crate) fn resolve_policy_command_binaries(
     // `config.commands` is a `BTreeMap`, so iteration order (and therefore
     // warning order) is already deterministic; chunking in that order and
     // reassembling chunk-by-chunk below preserves it exactly.
-    let entries: Vec<(&String, &CommandPolicyConfig)> = config.commands.iter().collect();
+    let entries: Vec<(&String, &CommandPolicyConfig)> = config
+        .commands
+        .iter()
+        .filter(|(name, _)| name.as_str() != "*")
+        .collect();
     let worker_count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -1331,6 +1375,153 @@ pub(crate) fn resolve_policy_command_binaries(
     }
 
     Ok(ResolvedCommandBinaries { commands, warnings })
+}
+
+/// A PATH entry recorded for the wildcard command policy without reading or
+/// hashing the executable.  The selected entry is resolved fully only when its
+/// shim is invoked; `matches` retains every PATH-visible identity for the same
+/// name so the outer exec gate can reject absolute-path bypasses.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredCommandBinary {
+    pub name: String,
+    pub selected: DeferredCommandCandidate,
+    pub matches: Vec<DeferredCommandCandidate>,
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeferredCommandCandidate {
+    pub canonical_path: PathBuf,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+const MAX_WILDCARD_COMMANDS: usize = 8192;
+
+/// Enumerate executable *names and identities* in PATH order for the `"*"`
+/// policy.  This deliberately does not open, hash, or classify executable
+/// contents; that expensive work is deferred until the corresponding shim is
+/// invoked.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+pub(crate) fn inventory_wildcard_commands(
+    config: &CommandPoliciesConfig,
+    search_dirs: &[PathBuf],
+) -> nono::Result<BTreeMap<String, DeferredCommandBinary>> {
+    if !config.commands.contains_key("*") {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut commands: BTreeMap<String, DeferredCommandBinary> = BTreeMap::new();
+    for dir in search_dirs {
+        let entries = fs::read_dir(dir).map_err(|source| nono::NonoError::ConfigRead {
+            path: dir.clone(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| nono::NonoError::ConfigRead {
+                path: dir.clone(),
+                source,
+            })?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if matches!(name.as_str(), "*" | "nono-shim-src")
+                || config.commands.contains_key(&name)
+                || !is_valid_identifier(&name)
+            {
+                continue;
+            }
+
+            let path = entry.path();
+            let Ok(canonical_path) = path.canonicalize() else {
+                continue;
+            };
+            let Ok(metadata) = fs::metadata(&canonical_path) else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+            let candidate = DeferredCommandCandidate {
+                canonical_path,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            };
+            match commands.get_mut(&name) {
+                Some(command) => {
+                    if !command.matches.iter().any(|existing| {
+                        existing.dev == candidate.dev && existing.ino == candidate.ino
+                    }) {
+                        command.matches.push(candidate);
+                    }
+                }
+                None => {
+                    if commands.len() >= MAX_WILDCARD_COMMANDS {
+                        return Err(nono::NonoError::SandboxInit(format!(
+                            "wildcard command inventory exceeds the {MAX_WILDCARD_COMMANDS}-command limit"
+                        )));
+                    }
+                    commands.insert(
+                        name.clone(),
+                        DeferredCommandBinary {
+                            name,
+                            selected: candidate.clone(),
+                            matches: vec![candidate],
+                        },
+                    );
+                }
+            }
+        }
+    }
+    Ok(commands)
+}
+
+/// Resolve and hash one previously inventoried wildcard command.  Identity is
+/// checked against the inventory snapshot before the regular launch-time
+/// identity check, so replacement between startup and invocation fails closed.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+pub(crate) fn resolve_deferred_command_binary(
+    deferred: &DeferredCommandBinary,
+) -> nono::Result<ResolvedCommandBinary> {
+    let mut cache = load_command_hash_cache();
+    let Some((selected, update)) =
+        candidate_command_match(&deferred.selected.canonical_path, &cache)?
+    else {
+        return Err(nono::NonoError::SandboxInit(format!(
+            "wildcard command '{}' is no longer an executable file: {}",
+            deferred.name,
+            deferred.selected.canonical_path.display()
+        )));
+    };
+    if selected.dev != deferred.selected.dev || selected.ino != deferred.selected.ino {
+        return Err(nono::NonoError::SandboxInit(format!(
+            "wildcard command '{}' changed identity after PATH inventory: {}",
+            deferred.name,
+            deferred.selected.canonical_path.display()
+        )));
+    }
+    if let Some(update) = update {
+        cache.insert(update.0, update.1);
+        save_command_hash_cache(&cache);
+    }
+    Ok(ResolvedCommandBinary {
+        name: deferred.name.clone(),
+        canonical_path: selected.canonical_path,
+        dev: selected.dev,
+        ino: selected.ino,
+        size: selected.size,
+        mtime_nanos: selected.mtime_nanos,
+        sha256: selected.sha256,
+        duplicate_paths: deferred
+            .matches
+            .iter()
+            .skip(1)
+            .map(|candidate| candidate.canonical_path.clone())
+            .collect(),
+        shape: selected.shape,
+    })
 }
 
 /// Resolve a contiguous slice of `command_policies.commands` entries.
@@ -1553,11 +1744,30 @@ fn validate_command(
     scope: CommandPolicyValidationScope,
     report: &mut CommandPolicyValidationReport,
 ) {
+    let named_callees = command
+        .can_use
+        .iter()
+        .filter(|name| name.as_str() != "*")
+        .cloned()
+        .collect::<Vec<_>>();
     validate_identifier_list(
         &format!("commands.{command_name}.can_use"),
-        &command.can_use,
+        &named_callees,
         report,
     );
+
+    if command_name == "*"
+        && (command.executable.is_some()
+            || command.allow_writable_executable
+            || !command.allow_direct_exec_bypass.is_empty()
+            || command.allow_direct_exec_bypass_with_credentials
+            || command.daemon_pid_source.is_some())
+    {
+        report.error(
+            "invalid_wildcard_command_options",
+            "command_policies.commands.* cannot set executable, writable-executable, direct-exec-bypass, or daemon attribution options",
+        );
+    }
 
     if let Some(executable) = &command.executable {
         validate_absolute_file_path_list(
@@ -1644,7 +1854,7 @@ fn validate_command(
                 "reserved_caller",
                 format!("command '{command_name}' uses from.user; use from.session"),
             );
-        } else if caller != "session" {
+        } else if caller != "session" && caller != "*" {
             validate_identifier(&format!("commands.{command_name}.from"), caller, report);
         }
 
@@ -1906,6 +2116,47 @@ fn validate_sandbox(
 
     if let Some(environment) = &sandbox.environment {
         validate_environment(command_name, caller, environment, report);
+    }
+
+    if let Some(approval_fs) = &sandbox.approval_fs {
+        let label = format!("command '{command_name}' from.{caller} approval_fs");
+        if approval_fs.read_roots.is_empty() && approval_fs.write_roots.is_empty() {
+            report.error(
+                "approval_fs_missing_roots",
+                format!("{label} must define read_roots or write_roots"),
+            );
+        }
+        for root in approval_fs
+            .read_roots
+            .iter()
+            .chain(approval_fs.write_roots.iter())
+        {
+            if root.is_empty() || root.as_bytes().contains(&0) {
+                report.error(
+                    "invalid_approval_fs_root",
+                    format!("{label} contains an empty path or NUL byte"),
+                );
+            }
+        }
+        validate_positive_timeout(
+            &format!("commands.{command_name}.from.{caller}.approval_fs.timeout_secs"),
+            approval_fs.timeout_secs,
+            report,
+        );
+        if let Some(backend) = approval_fs.backend.as_deref()
+            && !config.approval_backends.contains_key(backend)
+        {
+            report.error(
+                "unknown_approval_backend",
+                format!("{label} references unknown approval backend '{backend}'"),
+            );
+        }
+        if approval_fs.backend.is_none() && config.approval_defaults.backend.is_none() {
+            report.error(
+                "approval_fs_missing_backend",
+                format!("{label} requires a backend or command_policies.approval_defaults.backend"),
+            );
+        }
     }
 
     validate_argv_prepend(command_name, caller, &sandbox.argv_prepend, report);
@@ -3238,7 +3489,7 @@ fn validate_identifier(label: &str, name: &str, report: &mut CommandPolicyValida
     }
 }
 
-fn is_valid_identifier(name: &str) -> bool {
+pub(crate) fn is_valid_identifier(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
@@ -3344,6 +3595,64 @@ mod tests {
         let mut permissions = fs::metadata(path).expect("stat executable").permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).expect("make executable");
+    }
+
+    fn wildcard_config() -> CommandPoliciesConfig {
+        CommandPoliciesConfig {
+            commands: BTreeMap::from([(
+                "*".to_string(),
+                CommandPolicyConfig {
+                    sandbox: Some(CommandSandboxConfig::default()),
+                    can_use: vec!["*".to_string()],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wildcard_command_is_valid_and_not_eagerly_resolved() {
+        let config = wildcard_config();
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(report.is_ok(), "{:?}", report.errors);
+
+        let resolved = resolve_policy_command_binaries(&config, None).expect("resolve explicit");
+        assert!(resolved.commands.is_empty());
+    }
+
+    #[test]
+    fn wildcard_inventory_preserves_path_precedence_and_skips_explicit_names() {
+        let dir = tempdir().expect("tempdir");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        fs::create_dir_all(&first).expect("first dir");
+        fs::create_dir_all(&second).expect("second dir");
+        write_executable(&first.join("curl"), b"first");
+        write_executable(&second.join("curl"), b"second");
+        write_executable(&first.join("cat"), b"cat");
+
+        let mut config = wildcard_config();
+        config.commands.insert(
+            "cat".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig::default()),
+                ..Default::default()
+            },
+        );
+        let inventory =
+            inventory_wildcard_commands(&config, &[first.clone(), second]).expect("inventory");
+        assert!(!inventory.contains_key("cat"));
+        let curl = inventory.get("curl").expect("curl fallback");
+        assert_eq!(
+            curl.selected.canonical_path,
+            first.join("curl").canonicalize().expect("canonical curl")
+        );
+        assert_eq!(curl.matches.len(), 2);
+        let resolved = resolve_deferred_command_binary(curl).expect("lazy resolve");
+        assert_eq!(resolved.name, "curl");
+        assert_eq!(resolved.sha256.len(), 64);
     }
 
     #[test]

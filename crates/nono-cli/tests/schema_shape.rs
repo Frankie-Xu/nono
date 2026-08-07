@@ -167,6 +167,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
         &[
             "allow_launch_services",
             "allow_raw_file_credentials_in_chained_policy",
+            "approval_fs",
             "argv_prepend",
             "credentials",
             "environment",
@@ -181,6 +182,11 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "unsafe_macos_seatbelt_rules",
             "use_credentials",
         ],
+    );
+    assert_schema_properties(
+        &schema,
+        "CommandApprovalFilesystemConfig",
+        &["backend", "read_roots", "timeout_secs", "write_roots"],
     );
     assert_schema_properties(
         &schema,

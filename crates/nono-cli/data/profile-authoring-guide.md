@@ -122,6 +122,10 @@ tool-sandbox policies live under `command_policies`. Use `commands.<name>.execut
 
 Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_file`) may use dynamic provider tokens. `@git:config-files` expands to trusted global/system Git config files, Git file settings (attributes, excludes, commit templates), and the declared target of every `include.path` and `includeIf.*.path` directive — including conditional includes that do not currently fire. `@git:hooks-path` expands to trusted global/system `core.hooksPath` directories. `@git:common-dir` expands to the git common directory (`.git` in a regular repo, or the absolute path to the main repo's `.git` in a worktree). `@git:worktree` expands to the main worktree root (empty in a regular repo). `@git:toplevel` expands to the current checkout root. `@git:toplevel-parent` expands to the parent of the current checkout root. These tokens are opt-in per profile and ignore repo-local/worktree Git config so a checkout cannot grant itself extra host filesystem access.
 
+The prototype `commands.<name>.sandbox.approval_fs` field defines `read_roots` and `write_roots` ceilings plus an optional approval backend and timeout. A shim caller requests exact existing paths with the reserved `NONO_TOOL_SANDBOX_FS_REQUEST` JSON environment variable; nono canonicalizes and bounds the proposal before approval, then adds it only to that invocation's fresh child sandbox. This explicit pre-launch intent works on both Linux and macOS, where a running Seatbelt sandbox cannot be widened.
+
+The special `commands."*"` policy captures otherwise-unlisted external commands from trusted original-`PATH` directories. Startup enumerates names and inode identities only; hashing and executable classification are lazy on first invocation. Explicit command entries take precedence. `can_use: ["*"]` permits wildcard chaining, paired with `commands."*".from.<caller>` or `from."*"`. Shell builtins/functions and commands added to `PATH` after startup are outside this mechanism.
+
 ```json
 {
   "command_policies": {

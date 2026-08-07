@@ -36,6 +36,8 @@ pub(crate) mod dynamic_providers;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod env;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod fs_approval;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod launch;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod policy;

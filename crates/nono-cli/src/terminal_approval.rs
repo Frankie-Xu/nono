@@ -63,6 +63,7 @@ impl ApprovalBackend for TerminalApproval {
                 caller,
                 intercept_rule,
                 reason,
+                filesystem,
                 ..
             } => {
                 eprintln!("[nono] tool-sandbox command launch requires approval:");
@@ -82,6 +83,14 @@ impl ApprovalBackend for TerminalApproval {
                 );
                 if let Some(r) = reason {
                     eprintln!("[nono]   Reason: {}", sanitize_for_terminal(r));
+                }
+                for grant in filesystem {
+                    eprintln!(
+                        "[nono]   Filesystem: {} {} ({:?})",
+                        format_access_mode(&grant.access),
+                        sanitize_for_terminal(&grant.path.display().to_string()),
+                        grant.kind
+                    );
                 }
             }
             ApprovalRequest::Endpoint {
@@ -234,6 +243,7 @@ mod tests {
             caller: "session".to_string(),
             intercept_rule: "push --force".to_string(),
             reason: None,
+            filesystem: Vec::new(),
             child_pid: 42,
             session_id: "sess-001".to_string(),
         }

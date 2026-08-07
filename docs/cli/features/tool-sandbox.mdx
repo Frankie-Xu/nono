@@ -82,6 +82,7 @@ The selected `sandbox` object describes what the child receives:
 |---|---|---|
 | `fs_read` / `fs_write` | directory path arrays | Directory grants. |
 | `fs_read_file` / `fs_write_file` | file path arrays | Exact file grants. |
+| `approval_fs` | object | Ceiling and approval route for exact, invocation-scoped filesystem grants requested at the shim boundary. |
 | `exec_paths` | path arrays | Linux-only. Extra paths the child may execute, for multi-call tools (e.g. `git`) that re-exec their own helpers by absolute path from a compiled-in exec-path. A directory entry covers everything beneath it; a matching `fs_read` grant is still required, and missing paths are skipped so profiles can list per-distro candidates. Ignored on macOS. |
 | `network` | object | Child network grants. |
 | `environment` | object | Environment allow-list and injected static variables. |
@@ -208,6 +209,37 @@ The `@git:common-dir` token runs `git rev-parse --git-common-dir` from nono's wo
 
 `invocation_policy` and endpoint policies use the same decision values: `deny`, `approve`, and `allow`. A decision may also route approval with an object such as `{ "decision": "approve", "backend": "terminal", "timeout_secs": 30 }`.
 
+### Approval-Gated Filesystem Requests (Prototype)
+
+`approval_fs` lets a command request an exact file or directory grant for one invocation. It is a ceiling, not an ambient grant: the supervisor canonicalizes the proposal, checks it against `read_roots`, `write_roots`, and the resolved deny list, sends the normalized proposal to the selected approval backend, and only adds it to the fresh child sandbox after approval. A backend cannot grant a path outside the configured roots. The normalized proposal and approval decision are also recorded in the command-policy audit event.
+
+Because macOS cannot widen a running Seatbelt sandbox or trap an arbitrary failed `open(2)` like Linux seccomp-notify, the caller must describe its intent before the child starts. The prototype carries that intent in the reserved `NONO_TOOL_SANDBOX_FS_REQUEST` environment variable:
+
+```sh
+NONO_TOOL_SANDBOX_FS_REQUEST='{"filesystem":[{"path":"/srv/data/input.json","access":"read","kind":"file"}]}' jq . /srv/data/input.json
+```
+
+The value is removed from the child environment. `access` is `read`, `write`, or `read_write`; `kind` is `file` or `directory`. Because Tool Sandbox write policies permit the normal read-modify-write workflow, `write` is normalized to `read_write` before the backend sees the proposal. Requested paths and ceiling roots must already exist, `/` cannot be granted, directory requests that contain a denied path are rejected, and each request is limited to 32 grants. Request an existing parent directory with `write` when the command needs to create a new file beneath it.
+
+```jsonc
+{
+  "approval_backends": {
+    "operator": { "type": "terminal" }
+  },
+  "approval_defaults": { "backend": "operator", "timeout_secs": 30 },
+  "commands": {
+    "jq": {
+      "sandbox": {
+        "approval_fs": {
+          "read_roots": ["/srv/data"],
+          "write_roots": ["/srv/results"]
+        }
+      }
+    }
+  }
+}
+```
+
 ## Command Resolution
 
 By default, Tool Sandbox resolves a command to the first executable found on the original `PATH`, before the shim directory is prepended. Pin a command to an exact executable when PATH order should not decide the security boundary:
@@ -226,6 +258,44 @@ By default, Tool Sandbox resolves a command to the first executable found on the
 ```
 
 `executable` is canonicalized at startup and bound by path, inode, and digest. The command name still uses the shim, so `nono run --profile my-profile -- aws ...` reaches the pinned executable.
+
+Use the special `commands."*"` entry to mediate otherwise-unlisted external commands. Explicit command entries win. At startup, nono enumerates executable names and inode identities in trusted original-`PATH` directories so it can create the exact shim filenames required by normal shell lookup and block absolute-path bypasses. It does not read, hash, or classify every executable: those steps happen lazily when a particular wildcard shim is first invoked and are cached for that runtime. The inventory fails closed above 8,192 distinct command names.
+
+```jsonc
+{
+  "command_policies": {
+    "approval_backends": {
+      "operator": { "type": "terminal" }
+    },
+    "approval_defaults": { "backend": "operator" },
+    "commands": {
+      "mytoolA": {
+        "sandbox": {},
+        "can_use": ["*"]
+      },
+      "*": {
+        "sandbox": {
+          "approval_fs": {
+            "read_roots": ["/srv/data"],
+            "write_roots": ["/srv/results"]
+          }
+        },
+        "from": {
+          "*": {
+            "approval_fs": {
+              "read_roots": ["/srv/data"],
+              "write_roots": ["/srv/results"]
+            }
+          }
+        },
+        "can_use": ["*"]
+      }
+    }
+  }
+}
+```
+
+The wildcard covers external executables reached through `PATH`; it cannot replace shell builtins, aliases, shell functions, or commands introduced into `PATH` after runtime preparation. A newly installed command requires a new nono session so its shim can be inventoried. The prototype rejects combining `commands."*"` with `open_urls`, because URL delegation and wildcard command capture would both need to own the reserved `open` shim name.
 
 Tool Sandbox rejects executables and executable parent directories that are writable through the outer sandbox capability set. This prevents a profile from both trusting a command target and granting the agent write or replace access to that same target. Homebrew-style or otherwise user-writable host toolchains are allowed when the sandbox does not grant write access to the executable or its parent.
 

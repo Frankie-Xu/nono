@@ -31,8 +31,8 @@ pub mod types;
 
 pub use socket::{SupervisorListener, SupervisorSocket};
 pub use types::{
-    ApprovalDecision, ApprovalRequest, AuditEntry, CapabilityRequest, SupervisorMessage,
-    SupervisorResponse, UrlOpenRequest,
+    ApprovalDecision, ApprovalRequest, AuditEntry, CapabilityRequest, CommandFilesystemGrant,
+    CommandFilesystemGrantKind, SupervisorMessage, SupervisorResponse, UrlOpenRequest,
 };
 
 use crate::error::Result;
@@ -213,6 +213,7 @@ mod tests {
             caller: "session".to_string(),
             intercept_rule: "push".to_string(),
             reason: None,
+            filesystem: Vec::new(),
             child_pid: 99,
             session_id: "sess-003".to_string(),
         };

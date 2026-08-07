@@ -918,6 +918,11 @@ mod list_tests {
                 value_display: "/bin".to_string(),
             }],
             cwd_display: "/work".to_string(),
+            filesystem: vec![nono::CommandFilesystemGrant {
+                path: PathBuf::from("/srv/data/input.json"),
+                access: nono::AccessMode::Read,
+                kind: nono::CommandFilesystemGrantKind::File,
+            }],
             exit_code: None,
             stdio: Some(CommandPolicyStdioAudit {
                 stdout: Some(CommandPolicyStdioStreamAudit {
@@ -938,6 +943,7 @@ mod list_tests {
         assert_eq!(event["sequence"], 0);
         assert_eq!(event["session_id"], "sess-tool_sandbox");
         assert_eq!(event["decision"], "denied");
+        assert_eq!(event["filesystem"][0]["path"], "/srv/data/input.json");
         assert_eq!(event["caller"], "git");
         assert_eq!(event["caller_kind"], "command");
         assert_eq!(event["caller_command"], "git");

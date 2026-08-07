@@ -425,7 +425,11 @@ fn query_command_policy(
         };
     };
 
-    let Some(command_policy) = policies.commands.get(command) else {
+    let Some(command_policy) = policies
+        .commands
+        .get(command)
+        .or_else(|| policies.commands.get("*"))
+    else {
         return query_ext::QueryResult::Denied {
             reason: "command_not_policy_controlled".to_string(),
             details: Some(format!(

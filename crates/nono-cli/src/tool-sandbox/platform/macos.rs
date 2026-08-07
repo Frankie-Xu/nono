@@ -3,8 +3,8 @@ use crate::audit_integrity::{
     CommandPolicyStdioStreamAudit,
 };
 use crate::command_policy::{
-    CommandPoliciesConfig, CommandSandboxConfig, InterceptActionConfig, ResolvedCommandBinaries,
-    ResolvedCommandBinary, has_explicit_self_invocation_entry,
+    CommandPoliciesConfig, CommandSandboxConfig, DeferredCommandBinary, InterceptActionConfig,
+    ResolvedCommandBinaries, ResolvedCommandBinary, has_explicit_self_invocation_entry,
 };
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
@@ -151,6 +151,10 @@ struct ToolSandboxState {
     /// these is rejected (the agent's broad allow may otherwise cover them).
     deny_paths: Vec<PathBuf>,
     plan: ResolvedToolSandboxPlan,
+    /// Wildcard binaries are content-resolved on first invocation, then kept
+    /// for the lifetime of this runtime. The mutex also serializes hash-cache
+    /// updates from concurrent first invocations.
+    deferred_resolved: Mutex<BTreeMap<String, ResolvedCommandBinary>>,
     shims_by_command: BTreeMap<String, ShimIdentity>,
     shims_by_path: BTreeMap<PathBuf, String>,
     credential_handles: BTreeMap<String, ResolvedCredential>,
@@ -176,6 +180,7 @@ struct ResolvedToolSandboxPlan {
     /// Pre-resolved `daemon_pid_source` helpers, keyed by command name.
     /// Identity is captured here for the same TOCTOU protection as `exec_helpers`.
     daemon_pid_source_helpers: BTreeMap<String, ResolvedCommandBinary>,
+    wildcard_commands: BTreeMap<String, DeferredCommandBinary>,
     deny_only: BTreeMap<String, ResolvedDenyOnlyCommand>,
     allowed_direct_bypass_ids: HashSet<FileId>,
 }
@@ -222,6 +227,9 @@ impl ResolvedToolSandboxPlan {
         )?;
         let search_dirs = command_search_dirs(config, path_env, outer_caps)?;
         validate_trusted_executable_dirs(&search_dirs, outer_caps)?;
+        let wildcard_commands =
+            crate::command_policy::inventory_wildcard_commands(config, &search_dirs)?;
+        validate_wildcard_binary_immutability(config, &wildcard_commands, outer_caps)?;
         // BMETE command policies are scoped to command_policies.commands.
         // Legacy startup command denies must not be folded into tool-sandbox as
         // deny-only commands; doing so makes inherited dangerous-command
@@ -237,6 +245,7 @@ impl ResolvedToolSandboxPlan {
             resolved,
             exec_helpers,
             daemon_pid_source_helpers,
+            wildcard_commands,
             deny_only,
             allowed_direct_bypass_ids,
         })
@@ -291,6 +300,7 @@ impl PreparedToolSandboxRuntime {
         let mut shims_by_command = BTreeMap::new();
         let mut shims_by_path = BTreeMap::new();
         let mut shim_names: BTreeSet<String> = plan.resolved.commands.keys().cloned().collect();
+        shim_names.extend(plan.wildcard_commands.keys().cloned());
         shim_names.extend(plan.deny_only.keys().cloned());
         let shim_source = materialize_shim_source(&shim_dir)?;
         for name in shim_names {
@@ -329,6 +339,7 @@ impl PreparedToolSandboxRuntime {
                 outer_caps: outer_caps.clone(),
                 deny_paths: deny_paths.to_vec(),
                 plan,
+                deferred_resolved: Mutex::new(BTreeMap::new()),
                 shims_by_command,
                 shims_by_path,
                 credential_handles,
@@ -400,9 +411,6 @@ impl PreparedToolSandboxRuntime {
             &self.inner.shim_dir,
             AccessMode::Read,
         )?);
-        for shim in self.inner.shims_by_command.values() {
-            caps.add_fs(FsCapability::new_file(&shim.path, AccessMode::Read)?);
-        }
         caps.add_unix_socket(UnixSocketCapability::new_file(
             &self.inner.socket_path,
             UnixSocketMode::Connect,
@@ -456,6 +464,7 @@ impl PreparedToolSandboxRuntime {
         Ok(check_exec_gate(
             &self.inner.plan.allowed_direct_bypass_ids,
             &self.inner.plan.resolved.commands,
+            &self.inner.plan.wildcard_commands,
             &self.inner.plan.deny_only,
             original_program,
             resolved_program,
@@ -1196,6 +1205,7 @@ fn handle_shim_stream_inner(
                     caller: caller_label(&caller),
                     intercept_rule: rule_label,
                     reason,
+                    filesystem: Vec::new(),
                     child_pid: auth.peer_pid,
                     session_id: session_id.to_string(),
                 };
@@ -1238,6 +1248,7 @@ fn handle_shim_stream_inner(
         .config
         .commands
         .get(&request.command)
+        .or_else(|| state.plan.config.commands.get("*"))
         .ok_or_else(|| {
             NonoError::SandboxInit(format!("missing command config for {}", request.command))
         })?;
@@ -1267,7 +1278,7 @@ fn handle_shim_stream_inner(
     // A matched intercept rule may carry a sandbox that replaces the command's
     // selected sandbox for the process this rule launches (every action except
     // `respond`, which launches nothing). Absent -> the command's selected sandbox.
-    let effective_sandbox = intercept.sandbox.unwrap_or(policy);
+    let mut effective_sandbox = intercept.sandbox.unwrap_or(policy).clone();
 
     // ── Respond ──────────────────────────────────────────────────────────
     if let InterceptActionConfig::Respond { stdout } = intercept_action {
@@ -1284,6 +1295,105 @@ fn handle_shim_stream_inner(
             Some(0),
         )?;
         return Ok((0, stdout.as_bytes().to_vec()));
+    }
+
+    let approved_filesystem = match super::fs_approval::resolve_requested_filesystem(
+        &request.env,
+        &request.cwd,
+        &effective_sandbox,
+        &state.policy_root,
+        &state.deny_paths,
+    ) {
+        Ok(grants) => grants,
+        Err(err) => {
+            record_command_policy_audit(
+                audit_recorder.as_ref(),
+                &request,
+                &state.redaction_policy,
+                session_id,
+                auth.peer_pid,
+                session_root_pid,
+                Some(&caller),
+                "filesystem_approve_denied",
+                Some(err.to_string()),
+                None,
+            )?;
+            return Err(err);
+        }
+    };
+    if !approved_filesystem.is_empty() {
+        let ceiling = effective_sandbox.approval_fs.as_ref().ok_or_else(|| {
+            NonoError::SandboxInit(
+                "resolved filesystem request lost its approval_fs ceiling".to_string(),
+            )
+        })?;
+        let (backend, timeout_secs) = super::fs_approval::approval_route(ceiling);
+        let approval_route =
+            super::resolve_approval_route(&state.plan.config, backend, timeout_secs)?;
+        let (_, backend) = state
+            .approval_backends
+            .resolve(Some(&approval_route.backend))
+            .map_err(|err| NonoError::BlockedCommand {
+                command: request.command.clone(),
+                reason: err.to_string(),
+            })?;
+        let argv_display: Vec<String> = request
+            .argv
+            .iter()
+            .filter_map(|arg| std::str::from_utf8(arg).ok().map(str::to_owned))
+            .collect();
+        let approval_request = ApprovalRequest::Command {
+            request_id: format!(
+                "tool-sandbox-filesystem-approve-{}-{}",
+                request.command,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0)
+            ),
+            command: request.command.clone(),
+            args: argv_display,
+            caller: caller_label(&caller),
+            intercept_rule: "approval_fs".to_string(),
+            reason: Some("invocation-scoped filesystem capability request".to_string()),
+            filesystem: approved_filesystem.clone(),
+            child_pid: auth.peer_pid,
+            session_id: session_id.to_string(),
+        };
+        let decision = run_with_timeout(
+            std::time::Duration::from_secs(approval_route.timeout_secs),
+            move || backend.request_approval(&approval_request),
+        )?;
+        let (audit_decision, deny_reason) = if decision.is_granted() {
+            ("filesystem_approve_granted", None)
+        } else {
+            (
+                "filesystem_approve_denied",
+                Some("approval_denied".to_string()),
+            )
+        };
+        record_command_policy_filesystem_audit(
+            audit_recorder.as_ref(),
+            &request,
+            &state.redaction_policy,
+            session_id,
+            auth.peer_pid,
+            session_root_pid,
+            Some(&caller),
+            audit_decision,
+            deny_reason.clone(),
+            &approved_filesystem,
+        )?;
+        if !decision.is_granted() {
+            return Err(NonoError::BlockedCommand {
+                command: request.command,
+                reason: deny_reason.unwrap_or_else(|| "approval_denied".to_string()),
+            });
+        }
+        super::fs_approval::add_approved_filesystem_to_policy(
+            &mut effective_sandbox,
+            &approved_filesystem,
+        )?;
     }
 
     // ── Approve ──────────────────────────────────────────────────────────
@@ -1307,6 +1417,7 @@ fn handle_shim_stream_inner(
             caller: caller_label(&caller),
             intercept_rule: intercept.rule_label(),
             reason: None,
+            filesystem: Vec::new(),
             child_pid: auth.peer_pid,
             session_id: session_id.to_string(),
         };
@@ -1397,7 +1508,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
+            let launch = build_child_launch_spec(state, &request, &effective_sandbox)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1483,7 +1594,7 @@ fn handle_shim_stream_inner(
             ));
         }
         let result = (|| {
-            let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
+            let launch = build_child_launch_spec(state, &request, &effective_sandbox)?;
             launch_child_with_capture(state, &request.command, &caller, launch, stdio)
         })();
         state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1561,7 +1672,7 @@ fn handle_shim_stream_inner(
             let launch = build_child_launch_spec_for_binary(
                 state,
                 &request,
-                policy,
+                &effective_sandbox,
                 helper,
                 &extra_args,
                 false,
@@ -1584,6 +1695,7 @@ fn handle_shim_stream_inner(
                         Some(reason.clone()),
                         None,
                         launch_result.stdio,
+                        &[],
                     )?;
                     return Err(NonoError::BlockedCommand {
                         command: request.command,
@@ -1602,6 +1714,7 @@ fn handle_shim_stream_inner(
                     None,
                     Some(launch_result.exit_code),
                     launch_result.stdio,
+                    &[],
                 )?;
                 Ok((launch_result.exit_code, Vec::new()))
             }
@@ -1644,7 +1757,7 @@ fn handle_shim_stream_inner(
         ));
     }
     let result = (|| {
-        let launch = build_child_launch_spec(state, &request, effective_sandbox)?;
+        let launch = build_child_launch_spec(state, &request, &effective_sandbox)?;
         launch_child(state, &request.command, &caller, launch, stdio)
     })();
     state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1663,6 +1776,7 @@ fn handle_shim_stream_inner(
                     Some(reason.clone()),
                     None,
                     launch_result.stdio,
+                    &[],
                 )?;
                 return Err(NonoError::BlockedCommand {
                     command: request.command,
@@ -1681,6 +1795,7 @@ fn handle_shim_stream_inner(
                 None,
                 Some(launch_result.exit_code),
                 launch_result.stdio,
+                &[],
             )?;
             Ok((launch_result.exit_code, Vec::new()))
         }
@@ -2516,15 +2631,35 @@ fn build_child_launch_spec(
     request: &ToolSandboxShimRequest,
     policy: &CommandSandboxConfig,
 ) -> Result<ToolSandboxChildLaunchSpec> {
-    let binary = state
+    let binary = resolved_binary_for_request(state, &request.command)?;
+    build_child_launch_spec_for_binary(state, request, policy, &binary, &[], true)
+}
+
+fn resolved_binary_for_request(
+    state: &ToolSandboxState,
+    command_name: &str,
+) -> Result<ResolvedCommandBinary> {
+    if let Some(binary) = state.plan.resolved.commands.get(command_name) {
+        return Ok(binary.clone());
+    }
+    let deferred = state
         .plan
-        .resolved
-        .commands
-        .get(&request.command)
+        .wildcard_commands
+        .get(command_name)
         .ok_or_else(|| {
-            NonoError::SandboxInit(format!("missing resolved binary for {}", request.command))
+            NonoError::SandboxInit(format!(
+                "missing resolved or wildcard binary for {command_name}"
+            ))
         })?;
-    build_child_launch_spec_for_binary(state, request, policy, binary, &[], true)
+    let mut resolved = state.deferred_resolved.lock().map_err(|_| {
+        NonoError::SandboxInit("tool-sandbox wildcard resolution lock poisoned".to_string())
+    })?;
+    if let Some(binary) = resolved.get(command_name) {
+        return Ok(binary.clone());
+    }
+    let binary = crate::command_policy::resolve_deferred_command_binary(deferred)?;
+    resolved.insert(command_name.to_string(), binary.clone());
+    Ok(binary)
 }
 
 /// Build a child launch spec that runs `binary` (which may be the command's
@@ -2769,9 +2904,6 @@ fn add_executable_shape_baseline(
 
 fn add_chaining_control_caps(caps: &mut CapabilitySet, state: &ToolSandboxState) -> Result<()> {
     caps.add_fs(FsCapability::new_dir(&state.shim_dir, AccessMode::Read)?);
-    for shim in state.shims_by_command.values() {
-        caps.add_fs(FsCapability::new_file(&shim.path, AccessMode::Read)?);
-    }
     caps.add_unix_socket(UnixSocketCapability::new_file(
         &state.socket_path,
         UnixSocketMode::Connect,
@@ -2806,6 +2938,14 @@ fn add_outer_process_exec_gate(caps: &mut CapabilitySet, state: &ToolSandboxStat
     }
     for deny_only in state.plan.deny_only.values() {
         denied.insert(deny_only.path.clone());
+    }
+    for command in state.plan.wildcard_commands.values() {
+        denied.extend(
+            command
+                .matches
+                .iter()
+                .map(|candidate| candidate.canonical_path.clone()),
+        );
     }
     // The child sandbox is a routing guard, not the tool policy sandbox.
     // It permits ordinary agent process execution, then denies configured
@@ -2879,12 +3019,6 @@ fn add_child_process_exec_gate_with_policy(
         }
         allowed.push(interpreter);
     }
-    allowed.extend(
-        state
-            .shims_by_command
-            .values()
-            .map(|identity| identity.path.clone()),
-    );
     if let Some(policy) = policy {
         // A bare `open` always resolves to this shim (mediated $PATH puts the
         // shim dir first) once any command needs one, so both `open_urls` and
@@ -2903,7 +3037,11 @@ fn add_child_process_exec_gate_with_policy(
             }
         }
     }
-    add_process_exec_gate(caps, allowed)
+    add_process_exec_gate(caps, allowed)?;
+    let escaped =
+        crate::policy::escape_seatbelt_path(crate::policy::path_to_utf8(&state.shim_dir)?)?;
+    caps.add_platform_rule(format!("(allow process-exec* (subpath \"{escaped}\"))"))?;
+    Ok(())
 }
 
 fn add_process_exec_gate(
@@ -3979,7 +4117,7 @@ fn select_effective_policy<'a>(
     command_name: &str,
     caller: &Caller,
 ) -> Result<&'a CommandSandboxConfig> {
-    let command = plan.commands.get(command_name).ok_or_else(|| {
+    let command = configured_command(plan, command_name).ok_or_else(|| {
         NonoError::SandboxInit(format!("unknown tool-sandbox command '{command_name}'"))
     })?;
     match caller {
@@ -3999,16 +4137,24 @@ fn select_effective_policy<'a>(
                 })
         }
         Caller::Command { name } => {
-            let caller_command = plan.commands.get(name.as_str()).ok_or_else(|| {
+            let caller_command = configured_command(plan, name.as_str()).ok_or_else(|| {
                 NonoError::SandboxInit(format!("unknown tool-sandbox caller '{name}'"))
             })?;
-            if !caller_command.can_use.iter().any(|n| n == command_name) {
+            if !caller_command
+                .can_use
+                .iter()
+                .any(|n| n == command_name || n == "*")
+            {
                 return Err(NonoError::BlockedCommand {
                     command: command_name.to_string(),
                     reason: format!("{name}.can_use missing"),
                 });
             }
-            match command.from.get(name.as_str()) {
+            match command
+                .from
+                .get(name.as_str())
+                .or_else(|| command.from.get("*"))
+            {
                 Some(from) => from.sandbox().ok_or_else(|| NonoError::BlockedCommand {
                     command: command_name.to_string(),
                     reason: format!("from.{name} explicit deny"),
@@ -4027,7 +4173,7 @@ fn select_invocation_policy<'a>(
     command_name: &str,
     caller: &Caller,
 ) -> Option<&'a crate::command_policy::InvocationPolicyConfig> {
-    let command = config.commands.get(command_name)?;
+    let command = configured_command(config, command_name)?;
     match caller {
         Caller::Session => match command.from.get("session") {
             Some(crate::command_policy::CommandFromConfig::Edge(edge)) => {
@@ -4035,13 +4181,27 @@ fn select_invocation_policy<'a>(
             }
             _ => None,
         },
-        Caller::Command { name } => match command.from.get(name.as_str()) {
+        Caller::Command { name } => match command
+            .from
+            .get(name.as_str())
+            .or_else(|| command.from.get("*"))
+        {
             Some(crate::command_policy::CommandFromConfig::Edge(edge)) => {
                 edge.invocation_policy.as_ref()
             }
             _ => None,
         },
     }
+}
+
+fn configured_command<'a>(
+    config: &'a CommandPoliciesConfig,
+    command_name: &str,
+) -> Option<&'a crate::command_policy::CommandPolicyConfig> {
+    config
+        .commands
+        .get(command_name)
+        .or_else(|| config.commands.get("*"))
 }
 
 // ── Caller helpers ────────────────────────────────────────────────────────
@@ -4113,6 +4273,36 @@ fn record_command_policy_audit(
         reason,
         exit_code,
         None,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_command_policy_filesystem_audit(
+    recorder: Option<&Arc<Mutex<crate::audit_integrity::AuditRecorder>>>,
+    request: &ToolSandboxShimRequest,
+    redaction_policy: &nono::ScrubPolicy,
+    session_id: &str,
+    peer_pid: u32,
+    session_root_pid: u32,
+    caller: Option<&Caller>,
+    decision: &str,
+    reason: Option<String>,
+    filesystem: &[nono::CommandFilesystemGrant],
+) -> Result<()> {
+    record_command_policy_audit_with_stdio(
+        recorder,
+        request,
+        redaction_policy,
+        session_id,
+        peer_pid,
+        session_root_pid,
+        caller,
+        decision,
+        reason,
+        None,
+        None,
+        filesystem,
     )
 }
 
@@ -4129,6 +4319,7 @@ fn record_command_policy_audit_with_stdio(
     reason: Option<String>,
     exit_code: Option<i32>,
     stdio: Option<CommandPolicyStdioAudit>,
+    filesystem: &[nono::CommandFilesystemGrant],
 ) -> Result<()> {
     let Some(recorder) = recorder else {
         return Ok(());
@@ -4155,6 +4346,7 @@ fn record_command_policy_audit_with_stdio(
         env_names_display: env_names_display(&request.env, redaction_policy),
         env_display: env_display(&request.env, redaction_policy),
         cwd_display: cwd_display(&request.cwd, redaction_policy),
+        filesystem: filesystem.to_vec(),
         exit_code,
         stdio,
     };
@@ -4284,7 +4476,8 @@ fn command_search_dirs(
     path_env: Option<OsString>,
     outer_caps: &CapabilitySet,
 ) -> Result<Vec<PathBuf>> {
-    let mut dirs = BTreeSet::new();
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
     if let Some(path_env) = path_env {
         for dir in std::env::split_paths(&path_env) {
             if dir.as_os_str().is_empty() || !dir.exists() {
@@ -4293,8 +4486,9 @@ fn command_search_dirs(
             if let Ok(canonical) = dir.canonicalize()
                 && canonical.is_dir()
                 && implicit_executable_dir_is_trusted(&canonical, outer_caps)
+                && seen.insert(canonical.clone())
             {
-                dirs.insert(canonical);
+                dirs.push(canonical);
             }
         }
     }
@@ -4323,9 +4517,11 @@ fn command_search_dirs(
                 canonical.display()
             )));
         }
-        dirs.insert(canonical);
+        if seen.insert(canonical.clone()) {
+            dirs.push(canonical);
+        }
     }
-    Ok(dirs.into_iter().collect())
+    Ok(dirs)
 }
 
 fn implicit_executable_dir_is_trusted(dir: &Path, outer_caps: &CapabilitySet) -> bool {
@@ -4407,6 +4603,24 @@ fn validate_controlled_binary_immutability(
             "deny-only command",
             config.allow_writable_executables,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_wildcard_binary_immutability(
+    config: &CommandPoliciesConfig,
+    commands: &BTreeMap<String, DeferredCommandBinary>,
+    outer_caps: &CapabilitySet,
+) -> Result<()> {
+    for command in commands.values() {
+        for candidate in &command.matches {
+            validate_controlled_file(
+                &candidate.canonical_path,
+                outer_caps,
+                "wildcard policy command",
+                config.allow_writable_executables,
+            )?;
+        }
     }
     Ok(())
 }
@@ -4656,6 +4870,7 @@ fn find_first_executable(name: &str, dirs: &[PathBuf]) -> Result<Option<PathBuf>
 fn check_exec_gate(
     allowed_bypass_ids: &HashSet<FileId>,
     resolved_commands: &BTreeMap<String, ResolvedCommandBinary>,
+    wildcard_commands: &BTreeMap<String, DeferredCommandBinary>,
     deny_only: &BTreeMap<String, ResolvedDenyOnlyCommand>,
     original_program: &str,
     _resolved_program: &Path,
@@ -4670,6 +4885,20 @@ fn check_exec_gate(
                 command: original_program.to_string(),
                 reason: format!(
                     "tool-sandbox direct exec bypass denied for policy-controlled command '{name}'"
+                ),
+            });
+        }
+    }
+    for (name, command) in wildcard_commands {
+        if command
+            .matches
+            .iter()
+            .any(|candidate| candidate.dev == id.dev && candidate.ino == id.ino)
+        {
+            return Some(NonoError::BlockedCommand {
+                command: original_program.to_string(),
+                reason: format!(
+                    "tool-sandbox direct exec bypass denied for wildcard-controlled command '{name}'"
                 ),
             });
         }
@@ -4844,11 +5073,28 @@ fn materialize_shim_source(runtime_dir: &Path) -> Result<PathBuf> {
 fn materialize_shim(shim_source: &Path, runtime_dir: &Path, name: &str) -> Result<ShimIdentity> {
     let shim_path = runtime_dir.join(name);
     // macOS proc_pidpath may report any sibling hardlink for a shared inode,
-    // so each shim must be a distinct copied file for command authentication.
-    fs::copy(shim_source, &shim_path).map_err(|e| NonoError::ConfigWrite {
-        path: shim_path.clone(),
-        source: e,
-    })?;
+    // so each shim must have a distinct inode for command authentication. An
+    // APFS clone keeps wildcard inventories cheap without sharing that inode;
+    // fall back to a regular copy on filesystems that do not support clones.
+    let source_c = CString::new(shim_source.as_os_str().as_bytes())
+        .map_err(|_| NonoError::SandboxInit("tool-sandbox shim source contains NUL".to_string()))?;
+    let shim_c = CString::new(shim_path.as_os_str().as_bytes())
+        .map_err(|_| NonoError::SandboxInit("tool-sandbox shim path contains NUL".to_string()))?;
+    // SAFETY: both C strings are NUL-terminated filesystem paths and remain
+    // alive for the duration of clonefile.
+    let cloned = unsafe { libc::clonefile(source_c.as_ptr(), shim_c.as_ptr(), 0) } == 0;
+    if !cloned {
+        if shim_path.exists() {
+            fs::remove_file(&shim_path).map_err(|e| NonoError::ConfigWrite {
+                path: shim_path.clone(),
+                source: e,
+            })?;
+        }
+        fs::copy(shim_source, &shim_path).map_err(|e| NonoError::ConfigWrite {
+            path: shim_path.clone(),
+            source: e,
+        })?;
+    }
     fs::set_permissions(&shim_path, fs::Permissions::from_mode(0o500)).map_err(|e| {
         NonoError::ConfigWrite {
             path: shim_path.clone(),
@@ -4953,9 +5199,11 @@ mod tests {
                 },
                 exec_helpers: BTreeMap::new(),
                 daemon_pid_source_helpers: BTreeMap::new(),
+                wildcard_commands: BTreeMap::new(),
                 deny_only: BTreeMap::new(),
                 allowed_direct_bypass_ids: HashSet::new(),
             },
+            deferred_resolved: Mutex::new(BTreeMap::new()),
             shims_by_command: BTreeMap::new(),
             shims_by_path: BTreeMap::new(),
             credential_handles: BTreeMap::new(),
@@ -5892,11 +6140,43 @@ mod tests {
             &HashSet::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             "/usr/bin/env",
             Path::new("/usr/bin/env"),
             id,
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn exec_gate_blocks_wildcard_command_identity() {
+        let id = FileId { dev: 42, ino: 7 };
+        let wildcard = BTreeMap::from([(
+            "curl".to_string(),
+            DeferredCommandBinary {
+                name: "curl".to_string(),
+                selected: crate::command_policy::DeferredCommandCandidate {
+                    canonical_path: PathBuf::from("/usr/bin/curl"),
+                    dev: id.dev,
+                    ino: id.ino,
+                },
+                matches: vec![crate::command_policy::DeferredCommandCandidate {
+                    canonical_path: PathBuf::from("/usr/bin/curl"),
+                    dev: id.dev,
+                    ino: id.ino,
+                }],
+            },
+        )]);
+        let result = check_exec_gate(
+            &HashSet::new(),
+            &BTreeMap::new(),
+            &wildcard,
+            &BTreeMap::new(),
+            "/usr/bin/curl",
+            Path::new("/usr/bin/curl"),
+            id,
+        );
+        assert!(result.is_some());
     }
 
     #[test]
@@ -6907,6 +7187,51 @@ mod tests {
         let selected = select_effective_policy(&config, "git", &Caller::Session)?;
 
         assert_eq!(selected.fs_read, sandbox.fs_read);
+        Ok(())
+    }
+
+    #[test]
+    fn wildcard_policy_handles_session_and_chained_fallback_commands() -> Result<()> {
+        let session_sandbox = CommandSandboxConfig {
+            fs_read: vec!["session-root".to_string()],
+            ..CommandSandboxConfig::default()
+        };
+        let chained_sandbox = CommandSandboxConfig {
+            fs_read: vec!["chained-root".to_string()],
+            ..CommandSandboxConfig::default()
+        };
+        let mut config = CommandPoliciesConfig::default();
+        config.commands.insert(
+            "mytoolA".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig::default()),
+                can_use: vec!["*".to_string()],
+                ..CommandPolicyConfig::default()
+            },
+        );
+        config.commands.insert(
+            "*".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(session_sandbox.clone()),
+                from: BTreeMap::from([(
+                    "*".to_string(),
+                    CommandFromConfig::Policy(Box::new(chained_sandbox.clone())),
+                )]),
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        let selected = select_effective_policy(&config, "curl", &Caller::Session)?;
+        assert_eq!(selected.fs_read, session_sandbox.fs_read);
+
+        let selected = select_effective_policy(
+            &config,
+            "cat",
+            &Caller::Command {
+                name: "mytoolA".to_string(),
+            },
+        )?;
+        assert_eq!(selected.fs_read, chained_sandbox.fs_read);
         Ok(())
     }
 

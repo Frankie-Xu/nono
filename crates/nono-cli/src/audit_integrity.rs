@@ -211,6 +211,7 @@ mod tests {
                     value_display: "/bin".to_string(),
                 }],
                 cwd_display: "/work".to_string(),
+                filesystem: Vec::new(),
                 exit_code: None,
                 stdio: Some(CommandPolicyStdioAudit {
                     stdout: Some(CommandPolicyStdioStreamAudit {
