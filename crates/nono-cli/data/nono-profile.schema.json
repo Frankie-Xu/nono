@@ -1037,9 +1037,58 @@
     },
     "CustomCredentialDef": {
       "type": "object",
-      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. Must have exactly one of: credential_key, auth, or aws_auth (mutually exclusive).",
+      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. credential_key, auth, aws_auth, and spiffe are mutually exclusive — at most one may be set.",
       "additionalProperties": false,
       "required": ["upstream"],
+      "anyOf": [
+        { "required": ["credential_key"] },
+        { "required": ["auth"] },
+        { "required": ["aws_auth"], "properties": { "aws_auth": { "not": { "type": "null" } } } },
+        { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } }
+      ],
+      "allOf": [
+        { "not": { "allOf": [{ "required": ["credential_key"] }, { "required": ["auth"] }] } },
+        {
+          "not": {
+            "allOf": [
+              { "required": ["credential_key"] },
+              { "required": ["aws_auth"], "properties": { "aws_auth": { "not": { "type": "null" } } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
+              { "required": ["credential_key"] },
+              { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
+              { "required": ["auth"] },
+              { "required": ["aws_auth"], "properties": { "aws_auth": { "not": { "type": "null" } } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
+              { "required": ["auth"] },
+              { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } }
+            ]
+          }
+        },
+        {
+          "not": {
+            "allOf": [
+              { "required": ["aws_auth"], "properties": { "aws_auth": { "not": { "type": "null" } } } },
+              { "required": ["spiffe"], "properties": { "spiffe": { "not": { "type": "null" } } } }
+            ]
+          }
+        }
+      ],
       "properties": {
         "upstream": {
           "type": "string",
@@ -1257,6 +1306,33 @@
        "description": "OAuth2 client_credentials configuration for automatic token exchange. The proxy exchanges client_id + client_secret (or a client_assertion, e.g. SPIFFE private_key_jwt) for an access_token, caches it, and refreshes automatically before expiry. client_assertion is mutually exclusive with client_id/client_secret.",
        "additionalProperties": false,
        "required": ["token_url"],
+       "anyOf": [
+         { "required": ["client_id", "client_secret"] },
+         {
+           "required": ["client_assertion"],
+           "properties": {
+             "client_assertion": { "$ref": "#/$defs/ClientAssertionConfig" }
+           }
+         }
+       ],
+       "allOf": [
+         {
+           "not": {
+             "allOf": [
+               { "required": ["client_id"] },
+               { "required": ["client_assertion"], "properties": { "client_assertion": { "not": { "type": "null" } } } }
+             ]
+           }
+         },
+         {
+           "not": {
+             "allOf": [
+               { "required": ["client_secret"] },
+               { "required": ["client_assertion"], "properties": { "client_assertion": { "not": { "type": "null" } } } }
+             ]
+           }
+         }
+       ],
        "properties": {
          "token_url": {
            "type": "string",
@@ -1400,7 +1476,12 @@
            "allOf": [
              { "$ref": "#" },
              { "not": { "required": ["extends"] } },
-             { "not": { "required": ["platform_overrides"] } }
+             {
+               "not": {
+                 "required": ["platform_overrides"],
+                 "properties": { "platform_overrides": { "not": { "type": "null" } } }
+               }
+             }
            ],
            "description": "Override block applied only on macOS. Nesting extends or platform_overrides here is a parse error."
          },
@@ -1408,7 +1489,12 @@
            "allOf": [
              { "$ref": "#" },
              { "not": { "required": ["extends"] } },
-             { "not": { "required": ["platform_overrides"] } }
+             {
+               "not": {
+                 "required": ["platform_overrides"],
+                 "properties": { "platform_overrides": { "not": { "type": "null" } } }
+               }
+             }
            ],
            "description": "Override block applied only on Linux. Nesting extends or platform_overrides here is a parse error."
          },
@@ -1416,7 +1502,12 @@
            "allOf": [
              { "$ref": "#" },
              { "not": { "required": ["extends"] } },
-             { "not": { "required": ["platform_overrides"] } }
+             {
+               "not": {
+                 "required": ["platform_overrides"],
+                 "properties": { "platform_overrides": { "not": { "type": "null" } } }
+               }
+             }
            ],
            "description": "Override block applied only on Windows. Nesting extends or platform_overrides here is a parse error."
          }
