@@ -430,6 +430,26 @@ fn test_schema_validates_credential_key_with_explicit_null_spiffe_and_aws_auth()
 }
 
 #[test]
+fn test_schema_validates_aws_auth_with_explicit_null_credential_key_and_auth() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    // credential_key/auth are Option<T> in Rust, so an explicit null deserializes
+    // identically to an omitted field and must not be treated as a conflict.
+    let profile = json!({
+        "network": { "custom_credentials": { "internal-api": {
+            "upstream": "https://internal.example.com",
+            "credential_key": null,
+            "auth": null,
+            "aws_auth": { "region": "us-east-1" }
+        } } }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("aws_auth with explicitly-null credential_key/auth should validate");
+}
+
+#[test]
 fn test_schema_rejects_custom_credential_with_no_auth_mechanism() {
     let schema = load_schema();
     let validator = jsonschema::validator_for(&schema).expect("schema compiles");
