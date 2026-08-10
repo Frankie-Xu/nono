@@ -154,6 +154,32 @@
       "type": "array",
       "items": { "type": "string" },
       "description": "macOS-only. Expert escape hatch: raw Seatbelt S-expression rules applied verbatim to the sandbox policy. Each entry must be a valid S-expression, e.g. \"(allow iokit-open)\". Rules are validated at load time and rejected if malformed. Ignored on Linux. Surfaced prominently in 'nono profile show' output. If a rule pattern becomes common, prefer promoting it to a typed first-class capability instead."
+    },
+    "allow_parent_of_protected": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "null" }
+      ],
+      "description": "Opt-in to allow parent-of-protected-root grants on macOS. When true (and on macOS), --allow ~ is permitted because Seatbelt deny rules protect ~/.nono. Ignored on Linux. Set to null to inherit from the base profile. Default is false."
+    },
+    "skipdirs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Directory names to skip during trust scanning and rollback preflight. Treated like built-in heavy directories (for example \"target\")."
+    },
+    "binary": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Binary path or command name to run when no trailing -- <command> is given. Resolved via PATH lookup or canonicalized if absolute. Only honoured for user-authored profiles (ignored for pack and built-in profiles)."
+    },
+    "platform_overrides": {
+      "oneOf": [
+        { "$ref": "#/$defs/PlatformOverrides" },
+        { "type": "null" }
+      ],
+      "description": "Per-OS profile patches merged after extends resolution. Only the entry matching the current platform is applied. Nesting extends or platform_overrides inside an override block is a parse error."
     }
   },
   "$defs": {
@@ -346,6 +372,20 @@
           "items": { "$ref": "#/$defs/UrlOrigin" },
           "minItems": 1,
           "description": "API URL origins where phantom tokens issued by this provider may be resolved back to real credentials on egress."
+        },
+        "inject_header": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "HTTP header the resolved credential is injected into on api_hosts egress. Defaults to Authorization (OAuth Bearer APIs). Some providers (e.g. Vault) need a different header, such as X-Vault-Token. Must be a valid HTTP header name (RFC 7230 token)."
+        },
+        "credential_format": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Format applied to the resolved credential before injection; {} is replaced by the token. Defaults to \"Bearer {}\". Use \"{}\" alone for a raw token (e.g. Vault)."
         },
         "credential_store": {
           "oneOf": [
@@ -614,6 +654,13 @@
             { "type": "null" }
           ],
           "description": "Opt-in pathname AF_UNIX mediation. 'off' preserves compatibility. 'pathname' requires explicit filesystem.unix_socket* grants for pathname Unix socket connect/bind."
+        },
+        "sandbox_policy": {
+          "oneOf": [
+            { "$ref": "#/$defs/LinuxSandboxPolicy" },
+            { "type": "null" }
+          ],
+          "description": "Which Linux sandboxing mechanism to install. Defaults to 'auto' (Landlock plus a static seccomp network baseline, falling back to seccomp-only networking when the kernel ABI lacks Landlock network support)."
         }
       }
     },
@@ -621,6 +668,11 @@
       "type": "string",
       "enum": ["off", "pathname"],
       "description": "Linux pathname AF_UNIX mediation mode."
+    },
+    "LinuxSandboxPolicy": {
+      "type": "string",
+      "enum": ["auto", "landlock", "external"],
+      "description": "Which sandboxing mechanism nono installs on Linux. 'auto' (default): Landlock plus a static seccomp network baseline, with automatic seccomp fallback when the kernel ABI lacks Landlock network support (< V4). 'landlock': Landlock only; errors at startup if the kernel cannot satisfy network restrictions via Landlock alone. 'external': TCP network egress enforcement is managed externally (iptables, cgroups, systemd, etc.); nono still installs filesystem/process sandboxing and skips only its own TCP network lockdown."
     },
     "ProfileSignalMode": {
       "type": "string",
@@ -724,6 +776,36 @@
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
           "description": "Single files with write-only access."
+        },
+        "unix_socket": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Single AF_UNIX socket paths, connect only. Implies read access on the socket path."
+        },
+        "unix_socket_bind": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Single AF_UNIX socket paths, connect and bind. Implies read+write access on the socket path when it exists, or on its parent directory when it does not yet exist. Dangling symlinks are rejected at grant time; prefer unix_socket_dir_bind for runtime-generated filenames."
+        },
+        "unix_socket_dir": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Directories where any direct-child AF_UNIX socket may be connected to. Non-recursive. Implies read access on the directory."
+        },
+        "unix_socket_dir_bind": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Directories where any direct-child AF_UNIX socket may be connected to or bound. Non-recursive. Implies read+write access on the directory."
+        },
+        "unix_socket_subtree": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Directories where any descendant AF_UNIX socket may be connected to. Recursive. Implies read access on the directory."
+        },
+        "unix_socket_subtree_bind": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Directories where any descendant AF_UNIX socket may be connected to or bound. Recursive. Implies read+write access on the directory."
         },
         "deny": {
           "type": "array",
@@ -837,6 +919,36 @@
           "type": "array",
           "items": { "type": "integer" },
           "description": "Localhost TCP IPC (connect+bind). Port 0: macOS only (localhost:* outbound); Linux needs explicit ports."
+        },
+        "connect_port": {
+          "type": "array",
+          "items": { "type": "integer" },
+          "description": "Outbound TCP ports the sandboxed child may connect to (dial-only, no listen). Linux Landlock V4+ only; not supported on macOS: Seatbelt cannot filter outbound connections by TCP port."
+        },
+        "open_port_range": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "Inclusive port ranges for bidirectional localhost TCP IPC (connect + bind), e.g. [[3000, 3010], [8000, 8100]]. macOS enforces a combined limit of 16,384 unique ports across all ranges; Linux has no such restriction. Overlapping ranges are merged before applying rules."
+        },
+        "listen_port_range": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "Inclusive port ranges for TCP listen (bind only). Same platform behaviour as open_port_range for the bind side; no outbound connect rules are added. Overlapping ranges are merged before applying rules."
+        },
+        "deny_domain": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Domains to deny through the proxy regardless of the allowlist. Supports the same wildcard syntax as allow_domain (e.g. *.ads.example.com)."
         },
         "port_allow": {
           "type": "array",
@@ -1035,6 +1147,20 @@
             { "type": "null" }
           ],
           "description": "Optional per-route request-rate limit (RouteRateLimiter). Caps the rate of L7 requests forwarded to this credential's upstream to contain a runaway or compromised agent. Applies only to L7-visible traffic (reverse-proxy and TLS-intercepted CONNECT); it has no effect on opaque CONNECT tunnels."
+        },
+        "endpoint_policy": {
+          "oneOf": [
+            { "$ref": "#/$defs/EndpointPolicyConfig" },
+            { "type": "null" }
+          ],
+          "description": "Explicit L7 endpoint policy with allow/deny/approve routes. Alternative to endpoint_rules for more granular control."
+        },
+        "spiffe": {
+          "oneOf": [
+            { "$ref": "#/$defs/SpiffeAuthConfig" },
+            { "type": "null" }
+          ],
+          "description": "SPIFFE/SPIRE Workload API authentication. Mutually exclusive with credential_key, auth, and aws_auth."
         }
       }
     },
@@ -1128,9 +1254,9 @@
     },
     "OAuth2Config": {
        "type": "object",
-       "description": "OAuth2 client_credentials configuration for automatic token exchange. The proxy exchanges client_id + client_secret for an access_token, caches it, and refreshes automatically before expiry.",
+       "description": "OAuth2 client_credentials configuration for automatic token exchange. The proxy exchanges client_id + client_secret (or a client_assertion, e.g. SPIFFE private_key_jwt) for an access_token, caches it, and refreshes automatically before expiry. client_assertion is mutually exclusive with client_id/client_secret.",
        "additionalProperties": false,
-       "required": ["token_url", "client_id", "client_secret"],
+       "required": ["token_url"],
        "properties": {
          "token_url": {
            "type": "string",
@@ -1138,18 +1264,63 @@
          },
          "client_id": {
            "type": "string",
-           "description": "Client ID — plain value or credential reference (env://, file://, op://)."
+           "description": "Client ID — plain value or credential reference (env://, file://, op://). Mutually exclusive with client_assertion.",
+           "default": ""
          },
          "client_secret": {
            "type": "string",
-           "description": "Client secret — credential reference (env://, file://, op://)."
+           "description": "Client secret — credential reference (env://, file://, op://). Mutually exclusive with client_assertion.",
+           "default": ""
          },
          "scope": {
            "type": "string",
            "description": "OAuth2 scopes (space-separated). Empty or omitted means no scope parameter is sent.",
            "default": ""
+         },
+         "client_assertion": {
+           "oneOf": [
+             { "$ref": "#/$defs/ClientAssertionConfig" },
+             { "type": "null" }
+           ],
+           "description": "Client assertion configuration (e.g. SPIFFE private_key_jwt) used in place of client_id/client_secret."
+         },
+         "extra_params": {
+           "type": "object",
+           "additionalProperties": { "type": "string" },
+           "description": "Extra parameters merged into the token exchange POST body verbatim.",
+           "default": {}
          }
        }
+     },
+     "ClientAssertionConfig": {
+       "type": "object",
+       "description": "Client assertion used for OAuth2 token exchange instead of a client secret.",
+       "oneOf": [
+         {
+           "type": "object",
+           "additionalProperties": false,
+           "required": ["type", "workload_api_socket", "audience"],
+           "properties": {
+             "type": { "type": "string", "enum": ["spiffe_jwt"] },
+             "workload_api_socket": {
+               "type": "string",
+               "description": "Path to the SPIRE agent Unix domain socket."
+             },
+             "audience": {
+               "type": "array",
+               "items": { "type": "string" },
+               "description": "Audience(s) for the minted JWT-SVID."
+             },
+             "svid_hint": {
+               "oneOf": [
+                 { "type": "string" },
+                 { "type": "null" }
+               ],
+               "description": "Select a specific SVID by SPIFFE ID when the Workload API returns multiple SVIDs for the same workload."
+             }
+           }
+         }
+       ]
      },
      "AwsAuthConfig": {
        "type": "object",
@@ -1176,6 +1347,78 @@
              { "type": "null" }
            ],
            "description": "Explicit SigV4 service name (e.g., \"bedrock\", \"s3\"). If omitted, auto-detected from the upstream URL. Must be non-empty and contain no whitespace if set."
+         }
+       }
+     },
+     "SpiffeAuthConfig": {
+       "type": "object",
+       "description": "SPIFFE/SPIRE Workload API authentication. Currently only type \"jwt\" is supported: a JWT-SVID is fetched from the SPIRE Workload API and injected as a bearer token; the sandboxed process sends plain requests with no credentials.",
+       "additionalProperties": false,
+       "required": ["type", "workload_api_socket", "audience"],
+       "properties": {
+         "type": {
+           "type": "string",
+           "enum": ["jwt"],
+           "description": "SPIFFE auth variant. Only \"jwt\" is currently supported."
+         },
+         "workload_api_socket": {
+           "type": "string",
+           "description": "Path to the SPIRE agent Unix domain socket."
+         },
+         "audience": {
+           "type": "array",
+           "items": { "type": "string" },
+           "description": "Audience(s) for the minted JWT-SVID."
+         },
+         "inject_header": {
+           "type": "string",
+           "description": "HTTP header to inject the JWT into.",
+           "default": "Authorization"
+         },
+         "credential_format": {
+           "oneOf": [
+             { "type": "string" },
+             { "type": "null" }
+           ],
+           "description": "Template with {} for the token. Defaults to \"Bearer {}\"."
+         },
+         "svid_hint": {
+           "oneOf": [
+             { "type": "string" },
+             { "type": "null" }
+           ],
+           "description": "Select a specific SVID by SPIFFE ID when the Workload API returns multiple SVIDs for the same workload. When absent, the first SVID returned by the agent is used."
+         }
+       }
+     },
+     "PlatformOverrides": {
+       "type": "object",
+       "description": "Per-OS profile patches merged after extends resolution. Only the entry matching the current platform is applied; others are ignored.",
+       "additionalProperties": false,
+       "properties": {
+         "macos": {
+           "allOf": [
+             { "$ref": "#" },
+             { "not": { "required": ["extends"] } },
+             { "not": { "required": ["platform_overrides"] } }
+           ],
+           "description": "Override block applied only on macOS. Nesting extends or platform_overrides here is a parse error."
+         },
+         "linux": {
+           "allOf": [
+             { "$ref": "#" },
+             { "not": { "required": ["extends"] } },
+             { "not": { "required": ["platform_overrides"] } }
+           ],
+           "description": "Override block applied only on Linux. Nesting extends or platform_overrides here is a parse error."
+         },
+         "windows": {
+           "allOf": [
+             { "$ref": "#" },
+             { "not": { "required": ["extends"] } },
+             { "not": { "required": ["platform_overrides"] } }
+           ],
+           "description": "Override block applied only on Windows. Nesting extends or platform_overrides here is a parse error."
          }
        }
      },

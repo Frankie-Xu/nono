@@ -48,6 +48,172 @@ fn test_schema_has_canonical_top_level_commands() {
 }
 
 #[test]
+fn test_schema_network_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "NetworkConfig",
+        &[
+            "block",
+            "allow_http2",
+            "network_profile",
+            "allow_domain",
+            "proxy_allow",
+            "allow_proxy",
+            "deny_domain",
+            "credentials",
+            "proxy_credentials",
+            "open_port",
+            "port_allow",
+            "allow_port",
+            "open_port_range",
+            "listen_port",
+            "listen_port_range",
+            "connect_port",
+            "no_proxy",
+            "custom_credentials",
+            "tls_intercept",
+            "upstream_proxy",
+            "external_proxy",
+            "upstream_bypass",
+            "external_proxy_bypass",
+        ],
+    );
+}
+
+#[test]
+fn test_schema_top_level_profile_matches_rust_model() {
+    let schema = load_schema();
+    let props = schema
+        .pointer("/properties")
+        .and_then(Value::as_object)
+        .expect("root properties is an object");
+    let actual = props.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = [
+        "$schema",
+        "extends",
+        "meta",
+        "security",
+        "groups",
+        "commands",
+        "filesystem",
+        "network",
+        "diagnostics",
+        "linux",
+        "env_credentials",
+        "secrets",
+        "environment",
+        "command_policies",
+        "credential_capture",
+        "credential_providers",
+        "credential_routes",
+        "workdir",
+        "hooks",
+        "session_hooks",
+        "rollback",
+        "undo",
+        "open_urls",
+        "allow_launch_services",
+        "allow_gpu",
+        "allow_parent_of_protected",
+        "interactive",
+        "skipdirs",
+        "packs",
+        "binary",
+        "command_args",
+        "unsafe_macos_seatbelt_rules",
+        "platform_overrides",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual, expected,
+        "top-level Profile properties must match the Rust Profile model"
+    );
+}
+
+#[test]
+fn test_schema_validates_profile_with_platform_overrides_skipdirs_binary() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "skipdirs": ["vendor"],
+        "binary": "node",
+        "allow_parent_of_protected": true,
+        "platform_overrides": {
+            "macos": {
+                "network": { "block": true }
+            },
+            "linux": {
+                "filesystem": { "allow": ["/tmp"] }
+            }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("skipdirs/binary/allow_parent_of_protected/platform_overrides should validate");
+}
+
+#[test]
+fn test_schema_custom_credential_def_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "CustomCredentialDef",
+        &[
+            "upstream",
+            "credential_key",
+            "auth",
+            "aws_auth",
+            "spiffe",
+            "inject_mode",
+            "inject_header",
+            "credential_format",
+            "path_pattern",
+            "path_replacement",
+            "query_param_name",
+            "proxy",
+            "env_var",
+            "endpoint_rules",
+            "endpoint_policy",
+            "tls_ca",
+            "tls_client_cert",
+            "tls_client_key",
+            "rate_limit",
+        ],
+    );
+}
+
+#[test]
+fn test_schema_validates_custom_credential_with_spiffe_and_endpoint_policy() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "network": {
+            "custom_credentials": {
+                "internal-api": {
+                    "upstream": "https://internal.example.com",
+                    "spiffe": {
+                        "type": "jwt",
+                        "workload_api_socket": "/run/spire/sockets/agent.sock",
+                        "audience": ["internal-api"]
+                    },
+                    "endpoint_policy": {
+                        "default": "deny",
+                        "allow": [{ "method": "GET", "path": "/health" }]
+                    }
+                }
+            }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("custom credential with spiffe and endpoint_policy should validate");
+}
+
+#[test]
 fn test_schema_has_linux_af_unix_mediation() {
     let schema = load_schema();
     assert!(
@@ -475,23 +641,29 @@ fn test_schema_allows_empty_invocation_argv_matcher_for_compatibility() {
 }
 
 #[test]
-fn test_schema_filesystem_has_deny_and_bypass_protection() {
+fn test_schema_filesystem_config_matches_rust_model() {
     let schema = load_schema();
-    let props = schema
-        .pointer("/$defs/FilesystemConfig/properties")
-        .and_then(Value::as_object)
-        .expect("FilesystemConfig.properties is an object");
-    assert!(
-        props.contains_key("deny"),
-        "FilesystemConfig.deny missing from canonical schema"
-    );
-    assert!(
-        props.contains_key("bypass_protection"),
-        "FilesystemConfig.bypass_protection missing from canonical schema"
-    );
-    assert!(
-        props.contains_key("suppress_save_prompt"),
-        "FilesystemConfig.suppress_save_prompt missing from canonical schema"
+    assert_schema_properties(
+        &schema,
+        "FilesystemConfig",
+        &[
+            "allow",
+            "read",
+            "write",
+            "allow_file",
+            "read_file",
+            "write_file",
+            "unix_socket",
+            "unix_socket_bind",
+            "unix_socket_dir",
+            "unix_socket_dir_bind",
+            "unix_socket_subtree",
+            "unix_socket_subtree_bind",
+            "deny",
+            "bypass_protection",
+            "suppress_save_prompt",
+            "ignore",
+        ],
     );
 }
 
@@ -571,4 +743,189 @@ fn test_schema_security_has_no_legacy_groups_or_allowed_commands() {
         !props.contains_key("allowed_commands"),
         "SecurityConfig.allowed_commands still present; canonical location is top-level /properties/commands"
     );
+}
+
+#[test]
+fn test_schema_security_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "SecurityConfig",
+        &[
+            "signal_mode",
+            "process_info_mode",
+            "ipc_mode",
+            "capability_elevation",
+            "wsl2_proxy_policy",
+        ],
+    );
+}
+
+#[test]
+fn test_schema_linux_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "LinuxConfig",
+        &["af_unix_mediation", "sandbox_policy"],
+    );
+}
+
+#[test]
+fn test_schema_validates_linux_sandbox_policy() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    for policy in ["auto", "landlock", "external"] {
+        let profile = json!({ "linux": { "sandbox_policy": policy } });
+        validator
+            .validate(&profile)
+            .unwrap_or_else(|e| panic!("sandbox_policy {policy} should validate: {e}"));
+    }
+}
+
+#[test]
+fn test_schema_workdir_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(&schema, "WorkdirConfig", &["access"]);
+}
+
+#[test]
+fn test_schema_rollback_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "RollbackConfig",
+        &["exclude_patterns", "exclude_globs"],
+    );
+}
+
+#[test]
+fn test_schema_diagnostics_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(&schema, "DiagnosticsConfig", &["suppress_system_services"]);
+}
+
+#[test]
+fn test_schema_tls_intercept_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "TlsInterceptConfig",
+        &[
+            "ca_lifecycle",
+            "ca_validity",
+            "leaf_validity",
+            "ca_env_vars",
+        ],
+    );
+}
+
+#[test]
+fn test_schema_environment_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "EnvironmentConfig",
+        &["allow_vars", "deny_vars", "set_vars"],
+    );
+}
+
+#[test]
+fn test_schema_profile_meta_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "ProfileMeta",
+        &["name", "version", "description", "author"],
+    );
+}
+
+#[test]
+fn test_schema_credential_capture_entry_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "CredentialCaptureEntry",
+        &[
+            "command",
+            "provider",
+            "timeout_secs",
+            "ttl_secs",
+            "cache_ttl_secs",
+            "cache_path_regex",
+            "stdin",
+            "output",
+            "interaction",
+        ],
+    );
+    assert_schema_properties(&schema, "CredentialCaptureProvider", &["command", "config"]);
+    assert_schema_properties(
+        &schema,
+        "CredentialCaptureOutputConfig",
+        &["format", "allow_headers"],
+    );
+    assert_schema_properties(
+        &schema,
+        "CredentialCaptureInteraction",
+        &["allow_launch_services", "open_urls", "stdin", "stdio"],
+    );
+}
+
+#[test]
+fn test_schema_credential_provider_def_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "CredentialProviderDef",
+        &[
+            "type",
+            "token_endpoints",
+            "api_hosts",
+            "inject_header",
+            "credential_format",
+            "credential_store",
+            "helpers",
+        ],
+    );
+    assert_schema_properties(
+        &schema,
+        "CredentialProviderTokenEndpoint",
+        &[
+            "host",
+            "path",
+            "response_fields",
+            "request_body",
+            "request_nonce_fields",
+        ],
+    );
+    assert_schema_properties(
+        &schema,
+        "CredentialProviderHelpers",
+        &["status", "login", "logout"],
+    );
+}
+
+#[test]
+fn test_schema_validates_credential_provider_inject_header_and_format() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "credential_providers": {
+            "vault": {
+                "type": "oauth_capture",
+                "token_endpoints": [{
+                    "host": "https://vault.example.com",
+                    "path": "/v1/auth/token",
+                    "response_fields": [{ "path": "auth.client_token" }]
+                }],
+                "api_hosts": ["https://vault.example.com"],
+                "inject_header": "X-Vault-Token",
+                "credential_format": "{}"
+            }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("credential provider inject_header/credential_format should validate");
 }
