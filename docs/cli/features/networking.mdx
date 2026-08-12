@@ -420,9 +420,9 @@ Restricted CLI network modes always include a static seccomp baseline:
 
 - Plain `--block-net` denies every non-Unix socket plus `io_uring_setup()`.
 - Policies with port exceptions permit only Internet TCP stream sockets; Landlock V4+ then enforces the TCP connect/bind port allowlist.
-- Proxy-only mode uses the same socket-family/type baseline. On pre-V4 kernels, seccomp user notification supplies the destination decision instead of Landlock.
+- Proxy-only mode adds a seccomp user notification layer on top, checking the real destination address of every `connect()`. This layer is always active for proxy-only mode, on every Landlock ABI, because Landlock's own network rules have no destination-address component.
 
-Landlock rules match TCP ports, not IP addresses. A connect grant for port 3000 permits that port on any destination address, and a bind grant can listen on any local interface. Use the domain proxy when destination-host enforcement is required.
+Landlock rules match TCP ports, not IP addresses: a plain `--allow-connect-port`/`--open-port` grant for port 3000 permits that port on any destination, and a bind grant can listen on any local interface. The domain proxy doesn't share this gap — its destination-host enforcement comes from the seccomp layer above, not from Landlock's port rule alone. Use the domain proxy, not a raw port grant, when destination-host enforcement matters.
 
 **Requirements:** Plain `--block-net` works on every Linux kernel supported by nono. TCP port exceptions require Landlock ABI V4+ (Linux 6.7+) and fail closed on older kernels.
 

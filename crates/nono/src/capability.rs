@@ -926,9 +926,11 @@ pub struct CapabilitySet {
     ///
     /// On macOS (Seatbelt), outbound is scoped to localhost per-port.
     /// On Linux (Landlock), ConnectTcp/BindTcp filter by port only, not by
-    /// destination or bind address. `--block-net` blocks other ports but does
-    /// not narrow this grant to localhost; use proxy mode for destination-host
-    /// enforcement.
+    /// destination or bind address, and `--block-net` doesn't narrow this
+    /// grant to localhost either. `NetworkMode::ProxyOnly` gets real
+    /// destination-host enforcement from nono-cli's seccomp-notify layer
+    /// (`SeccompPolicy::proxy_fallback`); this port grant has no such layer
+    /// and stays port-only on Linux.
     localhost_ports: Vec<u16>,
     /// Inclusive port ranges for bidirectional localhost IPC (connect + bind).
     ///
