@@ -582,6 +582,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
             audit_event_count,
             audit_integrity: audit_integrity.clone(),
             audit_attestation: None,
+            command_policy_summary: None,
         };
         if let Some(signer) = audit_signer {
             meta.audit_attestation = Some(write_audit_attestation(
@@ -634,6 +635,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
             audit_event_count,
             audit_integrity,
             audit_attestation: None,
+            command_policy_summary: None,
         };
         if let Some(signer) = audit_signer {
             meta.audit_attestation = Some(write_audit_attestation(
@@ -939,6 +941,7 @@ mod tests {
                 merkle_root: nono::undo::ContentHash::from_bytes([0x22; 32]),
             }),
             audit_attestation: None,
+            command_policy_summary: None,
         };
 
         let summary = write_audit_attestation(
@@ -999,6 +1002,7 @@ mod tests {
             audit_event_count: 2,
             audit_integrity: None,
             audit_attestation: None,
+            command_policy_summary: None,
         };
         assert!(record_session_in_ledger(&metadata));
 

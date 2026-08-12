@@ -674,6 +674,16 @@ is active:
 }
 ```
 
+## Audit Record
+
+Every command-policy decision is recorded as an audit event by the broker, not by
+the mediated tool. Each event records what the broker decided as a `decision`
+string drawn from a closed vocabulary that mixes lifecycle stages with terminal
+results, such as `invocation_allowed` for clearing an invocation gate and
+`allowed`, `denied`, or `capture` for a terminal result. The vocabulary only ever
+grows, and a decision an older nono does not recognize is summarized as
+unclassified rather than counted as allowed or denied.
+
 ## Direct Exec Bypass
 
 Policy-controlled commands are meant to be reached through shims. A direct path like `/usr/bin/ssh` is denied unless explicitly configured:

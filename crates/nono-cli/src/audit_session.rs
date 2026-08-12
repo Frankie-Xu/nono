@@ -266,6 +266,7 @@ mod tests {
                 audit_event_count: 2,
                 audit_integrity: None,
                 audit_attestation: None,
+                command_policy_summary: None,
             },
         )
         .unwrap();
@@ -290,6 +291,7 @@ mod tests {
                 audit_event_count: 2,
                 audit_integrity: None,
                 audit_attestation: None,
+                command_policy_summary: None,
             },
         )
         .unwrap();
@@ -314,6 +316,7 @@ mod tests {
                 audit_event_count: 2,
                 audit_integrity: None,
                 audit_attestation: None,
+                command_policy_summary: None,
             },
         )
         .unwrap();
@@ -359,6 +362,7 @@ mod tests {
                 audit_event_count: 1,
                 audit_integrity: None,
                 audit_attestation: None,
+                command_policy_summary: None,
             },
         )
         .unwrap();
@@ -411,6 +415,7 @@ mod tests {
                 audit_event_count: 1,
                 audit_integrity: None,
                 audit_attestation: None,
+                command_policy_summary: None,
             },
         )
         .unwrap();

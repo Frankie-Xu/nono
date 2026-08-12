@@ -803,6 +803,7 @@ mod tests {
                     .unwrap(),
             }),
             audit_attestation: None,
+            command_policy_summary: None,
         };
         let fixture =
             include_str!("../../../tests/fixtures/audit-session-metadata-v1.json").trim_end();
@@ -831,6 +832,7 @@ mod tests {
             audit_event_count: integrity.event_count,
             audit_integrity: Some(integrity),
             audit_attestation: None,
+            command_policy_summary: None,
         }
     }
 

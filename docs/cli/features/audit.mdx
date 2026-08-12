@@ -99,6 +99,8 @@ Every audited session writes an append-only `audit-events.ndjson` file. In plain
 | **Session** | One audited `nono run` |
 | **Audit event** | One recorded fact within that session, such as `session_started`, `session_ended`, a capability decision, or a supervisor-observed URL-open event |
 | **Filesystem-state hashing** | Walking the tracked writable paths and hashing the files under them to commit their state before and after the run |
+| **Command policy event** | One mediated tool decision recorded by the Capability Broker, carrying the `decision` string that names the lifecycle stage or terminal result |
+| **Invocation** | One mediated tool decision that reached a terminal outcome. An invocation that clears an invocation gate and then runs records two events but counts once |
 
 ## Integrity Flow
 

@@ -843,6 +843,7 @@ mod list_tests {
         AuditRecorder, CommandPolicyAuditEvent, CommandPolicyEnvAuditEntry,
         CommandPolicyStdioAudit, CommandPolicyStdioStreamAudit,
     };
+    use crate::tool_sandbox::command_policy_decision::CommandPolicyDecision;
     use nono::undo::SessionMetadata;
 
     #[test]
@@ -861,6 +862,7 @@ mod list_tests {
             audit_event_count: 4,
             audit_integrity: None,
             audit_attestation: None,
+            command_policy_summary: None,
         };
 
         let session = SessionInfo {
@@ -897,41 +899,44 @@ mod list_tests {
     fn command_policy_events_json_includes_caller_context() -> nono::Result<()> {
         let dir = tempfile::tempdir().map_err(|e| nono::NonoError::Snapshot(e.to_string()))?;
         let mut recorder = AuditRecorder::new(dir.path().to_path_buf())?;
-        recorder.record_command_policy_event(CommandPolicyAuditEvent {
-            timestamp: "2026-05-03T16:30:30Z".to_string(),
-            session_id: Some("sess-tool_sandbox".to_string()),
-            command: "ssh".to_string(),
-            caller: "git".to_string(),
-            caller_kind: Some("command".to_string()),
-            caller_command: Some("git".to_string()),
-            caller_pid: Some(100),
-            shim_pid: Some(101),
-            session_root_pid: Some(99),
-            decision: "denied".to_string(),
-            reason: Some("missing from.git".to_string()),
-            stdio_mode: "direct_fds".to_string(),
-            argv_hash: "argv-hash".to_string(),
-            env_name_hash: "env-hash".to_string(),
-            cwd_hash: "cwd-hash".to_string(),
-            argv_display: vec!["ssh".to_string(), "-V".to_string()],
-            env_names_display: vec!["PATH".to_string()],
-            env_display: vec![CommandPolicyEnvAuditEntry {
-                name: "PATH".to_string(),
-                value_display: "/bin".to_string(),
-            }],
-            cwd_display: "/work".to_string(),
-            exit_code: None,
-            stdio: Some(CommandPolicyStdioAudit {
-                stdout: Some(CommandPolicyStdioStreamAudit {
-                    total_bytes: 1024,
-                    forwarded_bytes: 512,
-                    max_bytes: Some(512),
-                    limit_exceeded: true,
-                    on_limit: Some("truncate".to_string()),
+        recorder.record_command_policy_event(
+            CommandPolicyAuditEvent {
+                timestamp: "2026-05-03T16:30:30Z".to_string(),
+                session_id: Some("sess-tool_sandbox".to_string()),
+                command: "ssh".to_string(),
+                caller: "git".to_string(),
+                caller_kind: Some("command".to_string()),
+                caller_command: Some("git".to_string()),
+                caller_pid: Some(100),
+                shim_pid: Some(101),
+                session_root_pid: Some(99),
+                decision: CommandPolicyDecision::Denied.as_str().to_string(),
+                reason: Some("missing from.git".to_string()),
+                stdio_mode: "direct_fds".to_string(),
+                argv_hash: "argv-hash".to_string(),
+                env_name_hash: "env-hash".to_string(),
+                cwd_hash: "cwd-hash".to_string(),
+                argv_display: vec!["ssh".to_string(), "-V".to_string()],
+                env_names_display: vec!["PATH".to_string()],
+                env_display: vec![CommandPolicyEnvAuditEntry {
+                    name: "PATH".to_string(),
+                    value_display: "/bin".to_string(),
+                }],
+                cwd_display: "/work".to_string(),
+                exit_code: None,
+                stdio: Some(CommandPolicyStdioAudit {
+                    stdout: Some(CommandPolicyStdioStreamAudit {
+                        total_bytes: 1024,
+                        forwarded_bytes: 512,
+                        max_bytes: Some(512),
+                        limit_exceeded: true,
+                        on_limit: Some("truncate".to_string()),
+                    }),
+                    stderr: None,
                 }),
-                stderr: None,
-            }),
-        })?;
+            },
+            CommandPolicyDecision::Denied.outcome(),
+        )?;
 
         let events = command_policy_events_json(dir.path())?;
         assert_eq!(events.len(), 1);
