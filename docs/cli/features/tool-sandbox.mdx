@@ -684,6 +684,12 @@ results, such as `invocation_allowed` for clearing an invocation gate and
 grows, and a decision an older nono does not recognize is summarized as
 unclassified rather than counted as allowed or denied.
 
+The broker also folds these events into a per-command rollup stored in the
+session's `session.json`, so listing sessions never has to parse event logs. The
+rollup classifies each `decision` as allowed, denied, or unclassifiable, and
+counts only terminal ones, so a command that clears an invocation gate and then
+runs records two events but counts as one allowed invocation.
+
 ## Direct Exec Bypass
 
 Policy-controlled commands are meant to be reached through shims. A direct path like `/usr/bin/ssh` is denied unless explicitly configured:
