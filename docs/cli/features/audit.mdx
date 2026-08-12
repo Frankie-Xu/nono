@@ -214,6 +214,9 @@ nono audit list --path ~/dev/my-project
 # Show only the 10 most recent
 nono audit list --recent 10
 
+# Hide the per-session mediated tool summary
+nono audit list --no-tools
+
 # Machine-readable output
 nono audit list --json
 ```
@@ -225,6 +228,7 @@ nono 14 command(s)
 
   ~/dev/sprockets (11 commands)
     20260219-092017-8117  just now  completed  claude
+      tools: gh (3 allowed, 1 denied), git (12 allowed)
     20260219-091403-90291  5m ago  completed  claude
     20260218-134433-28210  1d ago  completed  claude
     ...
@@ -241,6 +245,21 @@ Filters can be combined:
 # Claude sessions from last week that touched the project directory
 nono audit list --command claude --path ~/project --since 2026-02-10
 ```
+
+#### Mediated Tool Summary
+
+Sessions that ran under a profile with [Sandboxed Tool Execution](/cli/features/tool-sandbox) get a second `tools:` line naming each mediated command with its allowed and denied counts. Sessions that mediated no command print nothing extra, and `--no-tools` suppresses the line entirely.
+
+The line is read from the rollup stored in `session.json`, never from the event log, so listing stays fast no matter how many events a session recorded. A few renderings are worth recognizing:
+
+| Rendering | Meaning |
+|---|---|
+| `N event(s), no completed invocations` | Command policy events were recorded but none reached a terminal decision, which is what a session killed mid-invocation looks like |
+| `N unclassified` | A terminal decision nono could not classify as allowed or denied. Read the event itself with `nono audit show` |
+| `+N more` | More distinct commands were mediated than the list line names. The full per-command rollup is still in `nono audit list --json` |
+| `rollup truncated` | The stored rollup itself dropped commands past its bound, so per-command counts for them are not recoverable from session metadata. The session totals still include them |
+
+`--no-tools` only affects the human-readable listing. `--json` always carries the same data per session as `tool_sandbox_active` and the full `command_policy_summary` object, and `nono audit show --json` reports the underlying `command_policy_events`, one entry per mediated decision.
 
 ### `nono audit show`
 
@@ -284,6 +303,8 @@ When an attestation is present, verification checks:
 - the attested Merkle root against the session's stored audit integrity summary
 - the session id bound into the attestation predicate
 - the provided public key, if `--public-key-file` is supplied
+
+The command policy rollup shown by `nono audit list` is covered by the session digest committed to the ledger, so editing `session.json` to hide a denial changes the digest and fails verification. The rollup is a view over events that remain individually recorded and hash-chained; `nono audit show` is where an operator confirms what the rollup summarizes.
 
 ## Use Cases
 

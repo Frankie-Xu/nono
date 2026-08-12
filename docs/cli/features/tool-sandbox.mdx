@@ -690,6 +690,27 @@ rollup classifies each `decision` as allowed, denied, or unclassifiable, and
 counts only terminal ones, so a command that clears an invocation gate and then
 runs records two events but counts as one allowed invocation.
 
+`nono audit list` names the mediated commands per session, and `nono audit show`
+still carries every individual decision:
+
+```bash
+# Which tools did recent sessions mediate, and what was denied?
+nono audit list --recent 10
+
+# Every mediated decision for one session, with reasons and stdio counts
+nono audit show <session-id> --json
+```
+
+```
+20260219-092017-8117  just now  completed  claude
+  tools: gh (3 allowed, 1 denied), git (12 allowed)
+```
+
+The rollup is covered by the session digest committed to the ledger, so a denial
+edited out of `session.json` fails `nono audit verify`. See
+[Audit Trail](/cli/features/audit#mediated-tool-summary) for the rollup's bounds
+and how it renders.
+
 ## Direct Exec Bypass
 
 Policy-controlled commands are meant to be reached through shims. A direct path like `/usr/bin/ssh` is denied unless explicitly configured:

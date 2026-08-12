@@ -85,11 +85,85 @@ fn cmd_list(args: AuditListArgs) -> Result<()> {
                 status,
                 theme::fg(&cmd, theme::current().subtext),
             );
+            if !args.no_tools
+                && let Some(line) = format_tool_summary_line(s)
+            {
+                eprintln!("      {line}");
+            }
         }
         eprintln!();
     }
 
     Ok(())
+}
+
+/// Distinct mediated commands named on a session's list line before eliding.
+const TOOL_SUMMARY_MAX_COMMANDS: usize = 4;
+
+/// Render the mediated-tool rollup for one session, or `None` when it mediated
+/// nothing. Reads the denormalized summary in session metadata, never the event
+/// log, so listing stays independent of how many events a session recorded.
+fn format_tool_summary_line(session: &SessionInfo) -> Option<String> {
+    let summary = session.metadata.command_policy_summary.as_ref()?;
+    let theme = theme::current();
+
+    // Mediation ran but nothing reached a terminal decision, which is what a
+    // session killed mid-invocation looks like. Say so rather than rendering
+    // the session as if no tool was ever mediated.
+    if summary.commands.is_empty() {
+        return Some(format!(
+            "{} {} event(s), no completed invocations",
+            theme::fg("tools:", theme.subtext),
+            summary.event_count
+        ));
+    }
+
+    let mut parts = Vec::new();
+    for command in summary.commands.iter().take(TOOL_SUMMARY_MAX_COMMANDS) {
+        let mut counts = Vec::new();
+        if command.allowed > 0 {
+            counts
+                .push(theme::fg(&format!("{} allowed", command.allowed), theme.green).to_string());
+        }
+        if command.denied > 0 {
+            counts.push(
+                theme::fg(&format!("{} denied", command.denied), theme.red)
+                    .bold()
+                    .to_string(),
+            );
+        }
+        if command.other > 0 {
+            counts.push(
+                theme::fg(&format!("{} unclassified", command.other), theme.yellow).to_string(),
+            );
+        }
+        // Profile-supplied, so it reaches the terminal without ever having
+        // passed through the event log's sanitization on the `audit show` path.
+        parts.push(format!(
+            "{} ({})",
+            sanitize_for_terminal(&command.command),
+            counts.join(", ")
+        ));
+    }
+
+    let elided = summary
+        .commands
+        .len()
+        .saturating_sub(TOOL_SUMMARY_MAX_COMMANDS);
+    if elided > 0 {
+        parts.push(format!("+{elided} more"));
+    }
+    // The rollup itself dropped commands, so not even `audit show` can recover
+    // their per-command counts from metadata.
+    if summary.truncated {
+        parts.push(theme::fg("rollup truncated", theme.yellow).to_string());
+    }
+
+    Some(format!(
+        "{} {}",
+        theme::fg("tools:", theme.subtext),
+        parts.join(", ")
+    ))
 }
 
 fn filter_sessions(
@@ -242,6 +316,8 @@ fn print_list_json(sessions: &[SessionInfo]) -> Result<()> {
                 "disk_size": s.disk_size,
                 "is_alive": s.is_alive,
                 "is_stale": s.is_stale,
+                "tool_sandbox_active": s.metadata.command_policy_summary.is_some(),
+                "command_policy_summary": s.metadata.command_policy_summary,
             })
         })
         .collect();
@@ -1007,6 +1083,154 @@ fn sanitize_reason_for_terminal(input: &str) -> String {
 
     let sanitized = sanitize_for_terminal(input);
     crate::command_display::truncate_chars(&sanitized, MAX_REASON_CHARS)
+}
+
+#[cfg(test)]
+mod tool_summary_tests {
+    use super::{TOOL_SUMMARY_MAX_COMMANDS, format_tool_summary_line};
+    use crate::audit_session::SessionInfo;
+    use nono::undo::{CommandPolicyCommandSummary, CommandPolicySummary, SessionMetadata};
+    use std::path::PathBuf;
+
+    fn session(summary: Option<CommandPolicySummary>) -> SessionInfo {
+        SessionInfo {
+            metadata: SessionMetadata {
+                session_id: "20260806-120000-11111".to_string(),
+                started: "2026-08-06T12:00:00Z".to_string(),
+                ended: Some("2026-08-06T12:05:00Z".to_string()),
+                command: vec!["claude".to_string()],
+                executable_identity: None,
+                tracked_paths: vec![PathBuf::from("/work")],
+                snapshot_count: 0,
+                exit_code: Some(0),
+                merkle_roots: Vec::new(),
+                network_events: Vec::new(),
+                audit_event_count: 0,
+                audit_integrity: None,
+                audit_attestation: None,
+                command_policy_summary: summary,
+            },
+            dir: PathBuf::from("/work"),
+            disk_size: 0,
+            is_alive: false,
+            is_stale: false,
+        }
+    }
+
+    fn command(name: &str, allowed: u64, denied: u64) -> CommandPolicyCommandSummary {
+        CommandPolicyCommandSummary {
+            command: name.to_string(),
+            allowed,
+            denied,
+            other: 0,
+        }
+    }
+
+    #[test]
+    fn sessions_without_tool_activity_stay_concise() {
+        assert!(format_tool_summary_line(&session(None)).is_none());
+    }
+
+    #[test]
+    fn summary_names_the_command_and_its_decisions() {
+        let line = format_tool_summary_line(&session(Some(CommandPolicySummary {
+            event_count: 3,
+            invocation_count: 2,
+            commands: vec![command("gh", 1, 1)],
+            truncated: false,
+        })))
+        .expect("a summary with commands always renders a line");
+
+        assert!(line.contains("gh"));
+        assert!(line.contains("1 allowed"));
+        assert!(line.contains("1 denied"));
+    }
+
+    #[test]
+    fn mediation_without_a_completed_invocation_is_still_reported() {
+        let line = format_tool_summary_line(&session(Some(CommandPolicySummary {
+            event_count: 1,
+            invocation_count: 0,
+            commands: Vec::new(),
+            truncated: false,
+        })))
+        .expect("a summary with events always renders a line");
+
+        assert!(line.contains("1 event(s)"));
+        assert!(line.contains("no completed invocations"));
+    }
+
+    #[test]
+    fn elided_and_truncated_commands_are_both_disclosed() {
+        let commands: Vec<_> = (0..TOOL_SUMMARY_MAX_COMMANDS.saturating_add(3))
+            .map(|index| command(&format!("cmd-{index}"), 1, 0))
+            .collect();
+        let line = format_tool_summary_line(&session(Some(CommandPolicySummary {
+            event_count: commands.len() as u64,
+            invocation_count: commands.len() as u64,
+            commands,
+            truncated: true,
+        })))
+        .expect("a summary with commands always renders a line");
+
+        assert!(line.contains("+3 more"));
+        assert!(line.contains("rollup truncated"));
+    }
+
+    /// Drop the theme's own color sequences, which are present or absent
+    /// depending on whether the test binary's stdout is a terminal. Only
+    /// `m`-terminated CSI is removed, so any other escape the summary emitted
+    /// still reaches the caller's assertions.
+    fn strip_theme_color(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut rest = line;
+
+        while let Some(start) = rest.find("\x1b[") {
+            let body = &rest[start.saturating_add(2)..];
+            let Some(end) = body.find(|c: char| ('\x40'..='\x7e').contains(&c)) else {
+                break;
+            };
+            if !body[end..].starts_with('m') {
+                break;
+            }
+            out.push_str(&rest[..start]);
+            rest = &body[end.saturating_add(1)..];
+        }
+
+        out.push_str(rest);
+        out
+    }
+
+    /// A shared profile is the one place a hostile command name can enter the
+    /// rollup, and unlike the `audit show` path it never passes through the
+    /// event log's sanitization on the way to the terminal.
+    #[test]
+    fn a_command_name_cannot_carry_escapes_into_the_listing() {
+        let line = format_tool_summary_line(&session(Some(CommandPolicySummary {
+            mediation_active: true,
+            event_count: 1,
+            invocation_count: 1,
+            commands: vec![command("gh\x1b]0;pwned\x07\r", 0, 1)],
+            truncated: false,
+        })))
+        .expect("a summary with commands always renders a line");
+        let line = strip_theme_color(&line);
+
+        assert!(!line.contains('\x1b'), "{line:?}");
+        assert!(!line.contains('\x07'), "{line:?}");
+        assert!(!line.contains('\r'), "{line:?}");
+        assert!(!line.contains("pwned"), "{line:?}");
+        assert!(line.contains("1 denied"), "{line:?}");
+    }
+
+    #[test]
+    fn stripping_theme_color_leaves_other_escapes_for_inspection() {
+        assert_eq!(strip_theme_color("\x1b[1;38;2;1;2;3mgh\x1b[0m"), "gh");
+        assert_eq!(
+            strip_theme_color("gh\x1b[2J\x1b]0;x\x07"),
+            "gh\x1b[2J\x1b]0;x\x07"
+        );
+    }
 }
 
 #[cfg(test)]
