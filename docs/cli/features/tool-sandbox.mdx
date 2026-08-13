@@ -699,6 +699,9 @@ nono audit list --recent 10
 
 # Every mediated decision for one session, with reasons and stdio counts
 nono audit show <session-id> --json
+
+# What has a session mediated so far, while it is still running
+nono inspect <session-id>
 ```
 
 ```
@@ -710,6 +713,11 @@ The rollup is covered by the session digest committed to the ledger, so a denial
 edited out of `session.json` fails `nono audit verify`. See
 [Audit Trail](/cli/features/audit#mediated-tool-summary) for the rollup's bounds
 and how it renders.
+
+A session writes `session.json` only when it finalizes. While it is still
+running, `nono inspect` reports the same rollup recomputed from the event log,
+marked `[live]` because the session can still mediate more commands. See
+[Session Lifecycle](/cli/features/session-lifecycle#mediated-tools-while-the-session-runs).
 
 ## Direct Exec Bypass
 

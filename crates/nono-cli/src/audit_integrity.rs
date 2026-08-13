@@ -1,7 +1,7 @@
 pub(crate) use nono::audit::{
     AUDIT_EVENTS_FILENAME, AuditEventPayload, AuditEventRecord, AuditRecorder,
     CommandPolicyAuditEvent, CommandPolicyEnvAuditEntry, CommandPolicyStdioAudit,
-    CommandPolicyStdioStreamAudit, verify_audit_log,
+    CommandPolicyStdioStreamAudit, CommandPolicySummaryBuilder, verify_audit_log,
 };
 
 #[cfg(test)]

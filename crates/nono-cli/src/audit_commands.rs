@@ -16,7 +16,7 @@ use crate::cli::{
 use crate::command_display::{format_command_line, truncate_command};
 use crate::theme;
 use colored::Colorize;
-use nono::undo::SnapshotManager;
+use nono::undo::{CommandPolicySummary, SnapshotManager};
 use nono::{NonoError, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -100,22 +100,35 @@ fn cmd_list(args: AuditListArgs) -> Result<()> {
 /// Distinct mediated commands named on a session's list line before eliding.
 const TOOL_SUMMARY_MAX_COMMANDS: usize = 4;
 
-/// Render the mediated-tool rollup for one session, or `None` when it mediated
-/// nothing. Reads the denormalized summary in session metadata, never the event
-/// log, so listing stays independent of how many events a session recorded.
+/// Render the mediated-tool rollup for one session, or `None` when the session
+/// neither configured mediation nor mediated anything.
+///
+/// Reads the denormalized summary in session metadata, never the event log, so
+/// listing stays independent of how many events a session recorded.
 fn format_tool_summary_line(session: &SessionInfo) -> Option<String> {
     let summary = session.metadata.command_policy_summary.as_ref()?;
+    Some(format!(
+        "{} {}",
+        theme::fg("tools:", theme::current().subtext),
+        format_tool_summary_detail(summary)
+    ))
+}
+
+/// Render a mediated-tool rollup without the `tools:` label, for callers with a
+/// label of their own.
+pub(crate) fn format_tool_summary_detail(summary: &CommandPolicySummary) -> String {
     let theme = theme::current();
 
-    // Mediation ran but nothing reached a terminal decision, which is what a
-    // session killed mid-invocation looks like. Say so rather than rendering
-    // the session as if no tool was ever mediated.
     if summary.commands.is_empty() {
-        return Some(format!(
-            "{} {} event(s), no completed invocations",
-            theme::fg("tools:", theme.subtext),
-            summary.event_count
-        ));
+        // Mediation was configured and no command ever reached it. A session
+        // that had none configured carries no summary and prints no line.
+        return if summary.event_count == 0 {
+            "active, no invocations".to_string()
+        } else {
+            // Events but no terminal decision, which is what a session killed
+            // mid-invocation looks like.
+            format!("{} event(s), no completed invocations", summary.event_count)
+        };
     }
 
     let mut parts = Vec::new();
@@ -159,11 +172,7 @@ fn format_tool_summary_line(session: &SessionInfo) -> Option<String> {
         parts.push(theme::fg("rollup truncated", theme.yellow).to_string());
     }
 
-    Some(format!(
-        "{} {}",
-        theme::fg("tools:", theme.subtext),
-        parts.join(", ")
-    ))
+    parts.join(", ")
 }
 
 fn filter_sessions(
@@ -316,6 +325,10 @@ fn print_list_json(sessions: &[SessionInfo]) -> Result<()> {
                 "disk_size": s.disk_size,
                 "is_alive": s.is_alive,
                 "is_stale": s.is_stale,
+                // Whether the session had a Tool Sandbox at all: mediation was
+                // configured, or a command reached mediation. Deliberately not
+                // the summary's own `mediation_active`, which reports only the
+                // first of those.
                 "tool_sandbox_active": s.metadata.command_policy_summary.is_some(),
                 "command_policy_summary": s.metadata.command_policy_summary,
             })
@@ -1134,6 +1147,7 @@ mod tool_summary_tests {
     #[test]
     fn summary_names_the_command_and_its_decisions() {
         let line = format_tool_summary_line(&session(Some(CommandPolicySummary {
+            mediation_active: true,
             event_count: 3,
             invocation_count: 2,
             commands: vec![command("gh", 1, 1)],
@@ -1147,8 +1161,24 @@ mod tool_summary_tests {
     }
 
     #[test]
+    fn configured_mediation_is_reported_before_any_command_is_invoked() {
+        let line = format_tool_summary_line(&session(Some(CommandPolicySummary {
+            mediation_active: true,
+            event_count: 0,
+            invocation_count: 0,
+            commands: Vec::new(),
+            truncated: false,
+        })))
+        .expect("an active-mediation summary always renders a line");
+
+        assert!(line.contains("active"));
+        assert!(line.contains("no invocations"));
+    }
+
+    #[test]
     fn mediation_without_a_completed_invocation_is_still_reported() {
         let line = format_tool_summary_line(&session(Some(CommandPolicySummary {
+            mediation_active: true,
             event_count: 1,
             invocation_count: 0,
             commands: Vec::new(),
@@ -1166,6 +1196,7 @@ mod tool_summary_tests {
             .map(|index| command(&format!("cmd-{index}"), 1, 0))
             .collect();
         let line = format_tool_summary_line(&session(Some(CommandPolicySummary {
+            mediation_active: true,
             event_count: commands.len() as u64,
             invocation_count: commands.len() as u64,
             commands,

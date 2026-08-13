@@ -454,6 +454,12 @@ pub struct CommandPolicyCommandSummary {
 /// invocation gate and then runs contributes exactly one `allowed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandPolicySummary {
+    /// Whether command mediation was configured for the session.
+    ///
+    /// Derived from the sandbox runtime audit event. Sessions recorded before
+    /// macOS emitted that event can report `false` despite having mediated.
+    #[serde(default)]
+    pub mediation_active: bool,
     /// Every command policy event, including non-terminal lifecycle stages.
     pub event_count: u64,
     /// Terminal decisions across all commands.
