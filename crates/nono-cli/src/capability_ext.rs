@@ -465,13 +465,19 @@ fn add_atomic_write_rule(_caps: &mut CapabilitySet, _cap: &FsCapability) -> Resu
 }
 
 /// Escape a filesystem path for use in a Seatbelt regex.
-/// Only metacharacters that could appear in typical paths need escaping.
+///
+/// Escapes both regex metacharacters and the `"` that terminates the
+/// surrounding Seatbelt string literal (`regex #"...")`). An unescaped `"`
+/// in a path would otherwise close that string literal early, letting the
+/// remainder of the path be parsed as new S-expression tokens and injected
+/// into the generated sandbox profile.
 #[cfg(target_os = "macos")]
 fn regex_escape_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 8);
     for c in path.chars() {
         match c {
-            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' => {
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\'
+            | '"' => {
                 out.push('\\');
                 out.push(c);
             }
@@ -603,6 +609,7 @@ impl CapabilitySetExt for CapabilitySet {
             if let Some(cap) =
                 try_new_file(path, AccessMode::ReadWrite, "Skipping non-existent file")?
             {
+                add_atomic_write_rule(&mut caps, &cap)?;
                 caps.add_fs(cap);
             }
         }
@@ -618,6 +625,7 @@ impl CapabilitySetExt for CapabilitySet {
             validate_requested_file(path, "CLI", &protected_roots, false)?;
             if let Some(cap) = try_new_file(path, AccessMode::Write, "Skipping non-existent file")?
             {
+                add_atomic_write_rule(&mut caps, &cap)?;
                 caps.add_fs(cap);
             }
         }
@@ -1204,6 +1212,7 @@ fn add_cli_overrides(
         validate_requested_file(path, "CLI", &protected_roots, allow_parent_of_protected)?;
         if let Some(cap) = try_new_file(path, AccessMode::ReadWrite, "Skipping non-existent file")?
         {
+            add_atomic_write_rule(caps, &cap)?;
             caps.add_fs(cap);
         }
     }
@@ -1218,6 +1227,7 @@ fn add_cli_overrides(
     for path in &args.write_file {
         validate_requested_file(path, "CLI", &protected_roots, allow_parent_of_protected)?;
         if let Some(cap) = try_new_file(path, AccessMode::Write, "Skipping non-existent file")? {
+            add_atomic_write_rule(caps, &cap)?;
             caps.add_fs(cap);
         }
     }
@@ -2897,6 +2907,17 @@ mod tests {
     #[test]
     fn test_regex_escape_path_no_metacharacters() {
         assert_eq!(regex_escape_path("/usr/local/bin"), "/usr/local/bin");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_regex_escape_path_escapes_double_quote() {
+        // A literal `"` in a path must not be able to terminate the
+        // surrounding `regex #"..."` string literal early.
+        assert_eq!(
+            regex_escape_path(r#"/tmp/evil" (allow file-read* (subpath "/"))"#),
+            r#"/tmp/evil\" \(allow file-read\* \(subpath \"/\"\)\)"#
+        );
     }
 
     #[cfg(target_os = "macos")]
