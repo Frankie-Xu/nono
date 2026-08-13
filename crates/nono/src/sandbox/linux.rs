@@ -1663,6 +1663,21 @@ mod arch_guard {
         }
     }
 
+    /// Read-only access to the assembled program, so callers and tests can use
+    /// `len()`, indexing, and slicing directly.
+    ///
+    /// This does not weaken the guarantee: the invariant is that an
+    /// `ArchGuarded` cannot be *constructed* without the prologue, and `Deref`
+    /// only hands out a shared slice. There is deliberately no `DerefMut` and
+    /// no way to recover an owned instruction list.
+    impl<T: AsRef<[SockFilterInsn]>> std::ops::Deref for ArchGuarded<T> {
+        type Target = [SockFilterInsn];
+
+        fn deref(&self) -> &Self::Target {
+            self.0.as_ref()
+        }
+    }
+
     /// Build the six-instruction native-architecture prologue.
     ///
     /// The architecture check closes the compat-ABI path (for example, i386
@@ -5061,26 +5076,130 @@ mod tests {
     #[test]
     fn test_build_seccomp_af_unix_filter_notifies_all_syscalls() {
         let filter = build_seccomp_af_unix_filter();
-        // 8 instructions: 0 ld-nr, 1-5 jeq dispatch, 6 ALLOW, 7 USER_NOTIF
+        // 14 instructions: 0-5 arch guard, then the 8-instruction tail
+        // (6 ld-nr, 7-11 jeq dispatch, 12 ALLOW, 13 USER_NOTIF).
         // No check_fd block — the IPC handshake completes before the filter
         // is installed, so no fd-based exemption is needed.
-        assert_eq!(filter.len(), 8);
+        assert_eq!(filter.len(), 14);
+
+        // Architecture guard: compat ABIs are denied before any dispatch, since
+        // i386 multiplexes these calls through socketcall(2) and BPF cannot
+        // reach its arguments.
         assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
-        assert_eq!(filter[0].k, SECCOMP_DATA_NR_OFFSET);
+        assert_eq!(filter[0].k, SECCOMP_DATA_ARCH_OFFSET);
+        assert_eq!(filter[1].k, NATIVE_AUDIT_ARCH);
+        assert_eq!(filter[2].k, SECCOMP_RET_ERRNO | (libc::EACCES as u32));
+        assert_eq!(filter[4].k, X32_SYSCALL_BIT);
+        assert_eq!(filter[5].k, SECCOMP_RET_ERRNO | (libc::EACCES as u32));
 
-        assert_eq!(filter[1].k, SYS_CONNECT as u32);
-        assert_eq!(filter[1].jt, 5); // -> insn 7 (USER_NOTIF)
-        assert_eq!(filter[2].k, SYS_BIND as u32);
-        assert_eq!(filter[2].jt, 4); // -> insn 7
-        assert_eq!(filter[3].k, SYS_SENDTO as u32);
-        assert_eq!(filter[3].jt, 3); // -> insn 7
-        assert_eq!(filter[4].k, SYS_SENDMSG as u32);
-        assert_eq!(filter[4].jt, 2); // -> insn 7 (no special exemption)
-        assert_eq!(filter[5].k, SYS_SENDMMSG as u32);
-        assert_eq!(filter[5].jt, 1); // -> insn 7
+        // Tail: relative jumps are unchanged by the prologue.
+        assert_eq!(filter[6].code, BPF_LD | BPF_W | BPF_ABS);
+        assert_eq!(filter[6].k, SECCOMP_DATA_NR_OFFSET);
 
-        assert_eq!(filter[6].k, SECCOMP_RET_ALLOW);
-        assert_eq!(filter[7].k, SECCOMP_RET_USER_NOTIF);
+        assert_eq!(filter[7].k, SYS_CONNECT as u32);
+        assert_eq!(filter[7].jt, 5); // -> insn 13 (USER_NOTIF)
+        assert_eq!(filter[8].k, SYS_BIND as u32);
+        assert_eq!(filter[8].jt, 4); // -> insn 13
+        assert_eq!(filter[9].k, SYS_SENDTO as u32);
+        assert_eq!(filter[9].jt, 3); // -> insn 13
+        assert_eq!(filter[10].k, SYS_SENDMSG as u32);
+        assert_eq!(filter[10].jt, 2); // -> insn 13 (no special exemption)
+        assert_eq!(filter[11].k, SYS_SENDMMSG as u32);
+        assert_eq!(filter[11].jt, 1); // -> insn 13
+
+        assert_eq!(filter[12].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[13].k, SECCOMP_RET_USER_NOTIF);
+
+        // Regression: an i386-ABI caller must not slip past mediation. Before
+        // the guard, these syscall numbers matched nothing in the dispatch and
+        // fell through to ALLOW, bypassing the supervisor entirely.
+        const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+        const I386_SOCKETCALL: u32 = 102;
+        const I386_SOCKET: u32 = 359;
+        const I386_CONNECT: u32 = 362;
+        let denied = SECCOMP_RET_ERRNO | (libc::EACCES as u32);
+
+        for nr in [I386_SOCKETCALL, I386_SOCKET, I386_CONNECT] {
+            assert_eq!(
+                evaluate_static_bpf_with_arch(&filter, AUDIT_ARCH_I386, nr, [0; 6]),
+                denied,
+                "i386 syscall {nr} bypassed AF_UNIX mediation"
+            );
+        }
+
+        // x32 reports the native audit arch, so only the syscall-bit test
+        // catches it.
+        assert_eq!(
+            evaluate_static_bpf_with_arch(
+                &filter,
+                NATIVE_AUDIT_ARCH,
+                (SYS_CONNECT as u32) | X32_SYSCALL_BIT,
+                [0; 6],
+            ),
+            denied
+        );
+
+        // Native ABI still reaches the supervisor.
+        assert_eq!(
+            evaluate_static_bpf(&filter, SYS_CONNECT, [0; 6]),
+            SECCOMP_RET_USER_NOTIF
+        );
+    }
+
+    #[test]
+    fn test_build_seccomp_openat_notify_filter_allows_compat_abi() {
+        let filter = build_seccomp_openat_notify_filter();
+        // 11 instructions: 0-5 arch guard, then the 5-instruction tail
+        // (6 ld-nr, 7-8 jeq dispatch, 9 ALLOW, 10 USER_NOTIF).
+        assert_eq!(filter.len(), 11);
+
+        // Unlike the denying filters, a non-native ABI is ALLOWed here: this
+        // filter only expands access, so evading it gains nothing, and denying
+        // would break every 32-bit process under capability elevation.
+        assert_eq!(filter[0].k, SECCOMP_DATA_ARCH_OFFSET);
+        assert_eq!(filter[1].k, NATIVE_AUDIT_ARCH);
+        assert_eq!(filter[2].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[4].k, X32_SYSCALL_BIT);
+        assert_eq!(filter[5].k, SECCOMP_RET_ALLOW);
+
+        assert_eq!(filter[6].k, SECCOMP_DATA_NR_OFFSET);
+        assert_eq!(filter[7].k, SYS_OPENAT as u32);
+        assert_eq!(filter[7].jt, 2); // -> insn 10 (USER_NOTIF)
+        assert_eq!(filter[8].k, SYS_OPENAT2 as u32);
+        assert_eq!(filter[8].jt, 1); // -> insn 10
+        assert_eq!(filter[9].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[10].k, SECCOMP_RET_USER_NOTIF);
+
+        // A compat-ABI openat is allowed straight through rather than being
+        // routed to the supervisor, so the supervisor is never handed a
+        // notification whose arguments follow a different ABI's layout. The
+        // Landlock floor still applies, so this grants no extra access.
+        const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+        const I386_OPENAT: u32 = 295;
+
+        assert_eq!(
+            evaluate_static_bpf_with_arch(&filter, AUDIT_ARCH_I386, I386_OPENAT, [0; 6]),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            evaluate_static_bpf_with_arch(
+                &filter,
+                NATIVE_AUDIT_ARCH,
+                (SYS_OPENAT as u32) | X32_SYSCALL_BIT,
+                [0; 6],
+            ),
+            SECCOMP_RET_ALLOW
+        );
+
+        // Native openat/openat2 still reach the supervisor.
+        assert_eq!(
+            evaluate_static_bpf(&filter, SYS_OPENAT, [0; 6]),
+            SECCOMP_RET_USER_NOTIF
+        );
+        assert_eq!(
+            evaluate_static_bpf(&filter, SYS_OPENAT2, [0; 6]),
+            SECCOMP_RET_USER_NOTIF
+        );
     }
 
     #[test]
