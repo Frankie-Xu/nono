@@ -93,6 +93,8 @@ impl SupervisorSocket {
             NonoError::SandboxInit(format!("Failed to accept supervisor connection: {e}"))
         })?;
 
+        check_peer_uid(&stream, "supervisor")?;
+
         Ok(SupervisorSocket {
             stream,
             socket_path: Some(path.to_path_buf()),
@@ -472,6 +474,23 @@ pub fn peer_credentials(sock_fd: RawFd) -> Result<PeerCredentials> {
     }
 }
 
+/// Reject a connection whose peer UID does not match the current process's UID.
+///
+/// `label` identifies the connection kind (e.g. "supervisor", "URL open") in the
+/// error message.
+fn check_peer_uid(stream: &UnixStream, label: &str) -> Result<()> {
+    let peer = peer_credentials(stream.as_raw_fd())?;
+    // SAFETY: getuid() is always safe to call.
+    let our_uid = unsafe { libc::getuid() };
+    if peer.uid != our_uid {
+        return Err(NonoError::SandboxInit(format!(
+            "Rejected {label} connection from uid {} (expected {})",
+            peer.uid, our_uid
+        )));
+    }
+    Ok(())
+}
+
 #[doc(hidden)]
 #[cfg(target_os = "linux")]
 pub fn peer_in_same_user_namespace(peer_pid: u32) -> Result<bool> {
@@ -608,15 +627,7 @@ impl SupervisorListener {
             ))
         })?;
 
-        let peer = peer_credentials(stream.as_raw_fd())?;
-        // SAFETY: getuid() is always safe to call.
-        let our_uid = unsafe { libc::getuid() };
-        if peer.uid != our_uid {
-            return Err(NonoError::SandboxInit(format!(
-                "Rejected URL open connection from uid {} (expected {})",
-                peer.uid, our_uid
-            )));
-        }
+        check_peer_uid(&stream, "URL open")?;
 
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
