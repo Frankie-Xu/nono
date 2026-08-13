@@ -445,11 +445,11 @@ fn add_atomic_write_rule(caps: &mut CapabilitySet, cap: &FsCapability) -> Result
             ))
         })?;
         let escaped = regex_escape_path(path_str);
-        let rule = format!(
-            "(allow file-write* (regex #\"^{}\\.tmp\\.[0-9]+\\.[0-9]+$\"))",
-            escaped
-        );
-        caps.add_platform_rule(&rule)
+        let regex = format!("^{}\\.tmp\\.[0-9]+\\.[0-9a-f]+$", escaped);
+        caps.add_platform_rule(format!(
+            "(allow file-write* file-read-metadata (regex #\"{}\"))",
+            regex
+        ))
     }
 
     add_rule_for_path(caps, &cap.resolved)?;
@@ -2923,7 +2923,13 @@ mod tests {
             "should contain file-write rule"
         );
         assert!(
-            rules.contains(r"\.tmp\.[0-9]+\.[0-9]+"),
+            rules.contains("file-read-metadata"),
+            "should contain file-read-metadata rule so `mv`'s stat() on the temp file \
+             succeeds during atomic rename, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(r"\.tmp\.[0-9]+\.[0-9a-f]+"),
             "should contain temp file pattern, got: {}",
             rules
         );
