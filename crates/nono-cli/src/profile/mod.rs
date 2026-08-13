@@ -2003,6 +2003,11 @@ pub enum LinuxSandboxPolicy {
     Auto,
     /// Landlock only. Returns an error at startup if the kernel cannot
     /// satisfy network restrictions via Landlock alone.
+    ///
+    /// Never installs a seccomp-notify listener. Since Landlock's TCP rules
+    /// filter by port only, `NetworkMode::ProxyOnly` under this policy cannot
+    /// restrict the child to 127.0.0.1:<port> — any host on that port is
+    /// reachable. Use `Auto` for real destination-host enforcement.
     Landlock,
     /// TCP network egress enforcement is managed externally (iptables,
     /// cgroups, systemd, etc.). nono still installs filesystem/process
