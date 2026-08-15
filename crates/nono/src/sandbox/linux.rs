@@ -4987,7 +4987,7 @@ mod tests {
         let proxy = prepare_seccomp_proxy_filter(true);
         assert_eq!(proxy.filter.len(), 37);
         let unix = prepare_seccomp_af_unix_filter();
-        assert_eq!(unix.filter.len(), 8);
+        assert_eq!(unix.filter.len(), 14);
     }
 
     #[test]
