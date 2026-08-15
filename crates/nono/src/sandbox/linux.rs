@@ -592,6 +592,46 @@ fn access_to_landlock(access: AccessMode, abi: ABI) -> LandlockAccess {
     }
 }
 
+/// Normalize a prepared path rule against the inode opened for enforcement.
+///
+/// `landlock::PathBeneath` performs this compatibility step internally, but
+/// the allocation-free prepared path emits raw Landlock rules and must mirror
+/// it explicitly.  In particular, Linux rejects directory-only access rights
+/// such as `ReadDir`, `MakeReg`, and `Refer` when `parent_fd` identifies a
+/// non-directory inode.
+fn normalize_prepared_path_access(
+    cap: &crate::capability::FsCapability,
+    metadata: &std::fs::Metadata,
+    abi: ABI,
+) -> Result<BitFlags<AccessFs>> {
+    let is_directory = metadata.is_dir();
+    if cap.is_file == is_directory {
+        return Err(if cap.is_file {
+            NonoError::ExpectedFile(cap.resolved.clone())
+        } else {
+            NonoError::ExpectedDirectory(cap.resolved.clone())
+        });
+    }
+
+    let mut access = access_to_landlock(cap.access, abi).effective;
+    if !is_directory {
+        access &= AccessFs::from_file(abi);
+    }
+
+    use std::os::unix::fs::FileTypeExt;
+    let file_type = metadata.file_type();
+    let is_device = file_type.is_char_device() || file_type.is_block_device();
+    let is_device_directory = is_directory && cap.resolved.starts_with("/dev");
+    if AccessFs::from_all(abi).contains(AccessFs::IoctlDev)
+        && matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite)
+        && (is_device || is_device_directory)
+    {
+        access |= AccessFs::IoctlDev;
+    }
+
+    Ok(access)
+}
+
 /// Legacy check: whether the simple block-all seccomp filter can be used.
 ///
 /// Only true for plain `NetworkMode::Blocked` with no port exceptions.
@@ -872,18 +912,8 @@ fn prepare_with_abi_inner(
         }
     }
 
-    let ioctl_dev_available = AccessFs::from_all(target_abi).contains(AccessFs::IoctlDev);
     let mut path_rules = Vec::with_capacity(caps.fs_capabilities().len());
     for cap in caps.fs_capabilities() {
-        let result = access_to_landlock(cap.access, target_abi);
-        let mut access = result.effective;
-        if ioctl_dev_available
-            && matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite)
-            && (is_device_path(&cap.resolved) || is_device_directory(&cap.resolved))
-        {
-            access |= AccessFs::IoctlDev;
-        }
-
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
@@ -895,6 +925,14 @@ fn prepare_with_abi_inner(
                     e
                 ))
             })?;
+        let metadata = file.metadata().map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "Cannot inspect pre-opened Landlock rule path {}: {}",
+                cap.resolved.display(),
+                e
+            ))
+        })?;
+        let access = normalize_prepared_path_access(cap, &metadata, target_abi)?;
         let path_fd = move_fd_above_stdio(file.into()).map_err(|e| {
             NonoError::SandboxInit(format!(
                 "Cannot reserve Landlock rule descriptor for {}: {}",
@@ -4884,6 +4922,127 @@ mod tests {
                 .iter()
                 .all(|rule| rule.path_fd.as_raw_fd() >= 3)
         );
+    }
+
+    #[test]
+    fn prepared_path_rules_mask_directory_rights_for_non_directories() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let regular = temp.path().join("regular.txt");
+        std::fs::write(&regular, b"data").expect("create regular file");
+        let fifo = temp.path().join("events.fifo");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).expect("create fifo");
+        let socket = temp.path().join("service.sock");
+        let _listener = UnixListener::bind(&socket).expect("bind unix socket");
+
+        let caps = CapabilitySet::new()
+            .allow_path(temp.path(), AccessMode::ReadWrite)
+            .expect("directory capability")
+            .allow_file(&regular, AccessMode::ReadWrite)
+            .expect("regular file capability")
+            .allow_file(&fifo, AccessMode::ReadWrite)
+            .expect("fifo capability")
+            .allow_file(&socket, AccessMode::ReadWrite)
+            .expect("socket node capability")
+            .allow_file("/dev/null", AccessMode::ReadWrite)
+            .expect("device capability");
+        let abi = DetectedAbi::new(ABI::V5);
+
+        let prepared =
+            prepare_seccomp_with_abi(&caps, &abi, SeccompOpts::preinstalled_tcp_filter())
+                .expect("prepare policy");
+        assert_eq!(prepared.path_rules.len(), 5);
+
+        let directory_access = prepared.path_rules[0].allowed_access;
+        assert_ne!(
+            directory_access & BitFlags::from(AccessFs::ReadDir).bits(),
+            0
+        );
+        assert_ne!(
+            directory_access & BitFlags::from(AccessFs::MakeReg).bits(),
+            0
+        );
+
+        let valid_file_access = AccessFs::from_file(ABI::V5).bits();
+        for rule in &prepared.path_rules[1..] {
+            assert_eq!(rule.allowed_access & !valid_file_access, 0);
+        }
+
+        for rule in &prepared.path_rules[1..4] {
+            assert_eq!(
+                rule.allowed_access & BitFlags::from(AccessFs::IoctlDev).bits(),
+                0
+            );
+        }
+        assert_ne!(
+            prepared.path_rules[4].allowed_access & BitFlags::from(AccessFs::IoctlDev).bits(),
+            0
+        );
+    }
+
+    #[test]
+    fn prepared_v2_file_rule_matches_landlock_file_compatibility() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let regular = temp.path().join("regular.txt");
+        std::fs::write(&regular, b"data").expect("create regular file");
+        let caps = CapabilitySet::new()
+            .allow_file(&regular, AccessMode::ReadWrite)
+            .expect("regular file capability")
+            .allow_file("/dev/null", AccessMode::ReadWrite)
+            .expect("device capability");
+        let abi = DetectedAbi::new(ABI::V2);
+
+        let prepared =
+            prepare_seccomp_with_abi(&caps, &abi, SeccompOpts::preinstalled_tcp_filter())
+                .expect("prepare policy");
+        let requested = access_to_landlock(AccessMode::ReadWrite, ABI::V2).effective;
+        let expected = (requested & AccessFs::from_file(ABI::V2)).bits();
+        assert_eq!(prepared.path_rules.len(), 2);
+        for rule in &prepared.path_rules {
+            assert_eq!(rule.allowed_access, expected);
+        }
+    }
+
+    #[test]
+    fn prepared_path_type_changes_fail_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let file_path = temp.path().join("file-to-dir");
+        std::fs::write(&file_path, b"data").expect("create file");
+        let file_cap = crate::capability::FsCapability::new_file(&file_path, AccessMode::ReadWrite)
+            .expect("file capability");
+        std::fs::remove_file(&file_path).expect("remove file");
+        std::fs::create_dir(&file_path).expect("replace file with directory");
+        let mut file_caps = CapabilitySet::new();
+        file_caps.add_fs(file_cap);
+        let Err(error) = prepare_seccomp_with_abi(
+            &file_caps,
+            &DetectedAbi::new(ABI::V2),
+            SeccompOpts::preinstalled_tcp_filter(),
+        ) else {
+            panic!("file capability must reject a replacement directory");
+        };
+        assert!(matches!(error, NonoError::ExpectedFile(_)));
+
+        let dir_path = temp.path().join("dir-to-file");
+        std::fs::create_dir(&dir_path).expect("create directory");
+        let dir_cap = crate::capability::FsCapability::new_dir(&dir_path, AccessMode::ReadWrite)
+            .expect("directory capability");
+        std::fs::remove_dir(&dir_path).expect("remove directory");
+        std::fs::write(&dir_path, b"data").expect("replace directory with file");
+        let mut dir_caps = CapabilitySet::new();
+        dir_caps.add_fs(dir_cap);
+        let Err(error) = prepare_seccomp_with_abi(
+            &dir_caps,
+            &DetectedAbi::new(ABI::V2),
+            SeccompOpts::preinstalled_tcp_filter(),
+        ) else {
+            panic!("directory capability must reject a replacement file");
+        };
+        assert!(matches!(error, NonoError::ExpectedDirectory(_)));
     }
 
     #[test]
