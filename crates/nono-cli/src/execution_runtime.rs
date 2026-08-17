@@ -9,7 +9,7 @@ use crate::{
     output, sandbox_state, session,
 };
 use nono::undo::{ContentHash, ExecutableIdentity};
-use nono::{CapabilitySet, NonoError, Result, Sandbox};
+use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
@@ -347,6 +347,9 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         flags.silent,
     );
     let cap_file_path = cap_file.unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
+    if cap_file_path != Path::new("/dev/null") {
+        caps.add_fs(FsCapability::new_file(&cap_file_path, AccessMode::Read)?);
+    }
 
     for secret in &loaded_secrets {
         if exec_strategy::is_dangerous_env_var(&secret.env_var) {
@@ -600,11 +603,14 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     #[cfg(target_os = "linux")]
     let seccomp_proxy_fallback = {
         let needs_proxy = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { .. });
-        let external_network = matches!(
+        // Landlock policy opts out of seccomp-notify entirely (see its docs);
+        // honor that even though it leaves ProxyOnly's destination check unenforced.
+        let no_seccomp_fallback = matches!(
             flags.sandbox_policy,
             crate::profile::LinuxSandboxPolicy::External
+                | crate::profile::LinuxSandboxPolicy::Landlock
         );
-        if external_network {
+        if no_seccomp_fallback {
             false
         } else if needs_proxy && nono::is_wsl2() {
             let needs_seccomp_fallback = !Sandbox::detect_abi()
@@ -636,9 +642,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             }
             false
         } else if needs_proxy {
-            !Sandbox::detect_abi()
-                .ok()
-                .is_some_and(|abi| abi.has_network())
+            // Landlock's AccessNet filters by port only, never by destination
+            // address, on any ABI version — so this must always run, not just
+            // as a pre-V4 fallback, or the proxy's host allowlist is bypassable.
+            true
         } else {
             false
         }
