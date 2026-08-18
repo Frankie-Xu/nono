@@ -17,7 +17,9 @@ use crate::launch_runtime::{
     TlsInterceptIntent, UpstreamProxyIntent,
 };
 use crate::profile;
-use crate::proxy_runtime::{apply_tls_intercept_config, build_proxy_config_from_flags};
+use crate::proxy_runtime::{
+    apply_tls_intercept_config, build_proxy_config_from_flags, resolve_tls_intercept_options,
+};
 use colored::Colorize;
 use nono::{NonoError, Result};
 use tracing::info;
@@ -317,25 +319,38 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         bypass: upstream_bypass,
     });
 
-    let ca_validity = args
-        .proxy_ca_validity
-        .map(|days| std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60));
+    // Merge the profile's `network.tls_intercept` with the CLI flags, mirroring
+    // the sandboxed `run`/`shell`/`wrap` path (`resolve_tls_intercept_options`)
+    // so `nono proxy` honors the same settings.
+    #[cfg(target_os = "macos")]
+    let trust_proxy_ca = args.trust_proxy_ca;
+    #[cfg(not(target_os = "macos"))]
+    let trust_proxy_ca = false;
+    let tls_options = resolve_tls_intercept_options(
+        trust_proxy_ca,
+        args.proxy_ca_validity,
+        network.and_then(|n| n.tls_intercept.as_ref()),
+    )?;
 
     #[cfg(target_os = "macos")]
-    let tls_intercept = if args.trust_proxy_ca || ca_validity.is_some() {
+    let tls_intercept = if tls_options.trust_proxy_ca
+        || tls_options.ca_validity.is_some()
+        || !tls_options.ca_env_vars.is_empty()
+    {
         Some(TlsInterceptIntent {
-            trust_proxy_ca: args.trust_proxy_ca,
-            ca_validity,
-            ca_env_vars: Vec::new(),
+            trust_proxy_ca: tls_options.trust_proxy_ca,
+            ca_validity: tls_options.ca_validity,
+            ca_env_vars: tls_options.ca_env_vars,
         })
     } else {
         None
     };
     #[cfg(not(target_os = "macos"))]
-    let tls_intercept = if ca_validity.is_some() {
+    let tls_intercept = if tls_options.ca_validity.is_some() || !tls_options.ca_env_vars.is_empty()
+    {
         Some(TlsInterceptIntent {
-            ca_validity,
-            ca_env_vars: Vec::new(),
+            ca_validity: tls_options.ca_validity,
+            ca_env_vars: tls_options.ca_env_vars,
         })
     } else {
         None
@@ -351,6 +366,7 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         credentials: credentials_intent,
         upstream_proxy,
         tls_intercept,
+        proxy_leaf_validity: tls_options.leaf_validity,
         command_policies,
         credential_capture,
         session_id: crate::session::generate_session_id(),
@@ -635,6 +651,188 @@ mod tests {
         let args = parse_args(&["--allow-endpoint", "github:GET"]);
         let err = build_launch_options(&args).expect_err("missing path must fail");
         assert!(matches!(err, NonoError::ConfigParse(_)), "got {err:?}");
+    }
+
+    /// A profile requesting `ca_lifecycle: "trusted"` must set `trust_proxy_ca`
+    /// on the standalone `nono proxy` path exactly as it does for `nono run`.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn profile_tls_intercept_trusted_sets_trust_proxy_ca() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("trusted.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "trusted-test" },
+                "network": { "tls_intercept": { "ca_lifecycle": "trusted" } }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("trusted profile is valid");
+        let tls = opts
+            .tls_intercept
+            .expect("trusted lifecycle must produce a tls_intercept intent");
+        assert!(
+            tls.trust_proxy_ca,
+            "profile's trusted lifecycle was ignored"
+        );
+    }
+
+    #[test]
+    fn profile_tls_intercept_session_default_leaves_trust_off() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("session.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "session-test" },
+                "network": { "tls_intercept": { "ca_lifecycle": "session" } }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("session profile is valid");
+        assert!(opts.tls_intercept.is_none());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn profile_tls_intercept_trusted_rejected_off_macos() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("trusted.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "trusted-test" },
+                "network": { "tls_intercept": { "ca_lifecycle": "trusted" } }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let err = build_launch_options(&args).expect_err("trusted is macOS-only");
+        assert!(matches!(err, NonoError::ConfigParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn profile_ca_validity_carries_through() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("validity.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "validity-test" },
+                "network": { "tls_intercept": { "ca_validity": "365d" } }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("ca_validity profile is valid");
+        let tls = opts
+            .tls_intercept
+            .expect("ca_validity must produce a tls_intercept intent");
+        assert_eq!(
+            tls.ca_validity,
+            Some(std::time::Duration::from_secs(365 * 24 * 60 * 60))
+        );
+    }
+
+    #[test]
+    fn cli_ca_validity_flag_overrides_profile() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("validity.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "validity-test" },
+                "network": { "tls_intercept": { "ca_validity": "365d" } }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&[
+            "--profile",
+            profile_path.to_str().expect("valid utf8"),
+            "--proxy-ca-validity",
+            "10",
+        ]);
+        let opts = build_launch_options(&args).expect("flag + profile is valid");
+        let tls = opts.tls_intercept.expect("tls_intercept intent present");
+        assert_eq!(
+            tls.ca_validity,
+            Some(std::time::Duration::from_secs(10 * 24 * 60 * 60)),
+            "explicit --proxy-ca-validity must win over the profile value"
+        );
+    }
+
+    #[test]
+    fn profile_leaf_validity_carries_through() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("leaf.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "leaf-test" },
+                "network": { "tls_intercept": { "leaf_validity": "15m" } }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("leaf_validity profile is valid");
+        assert_eq!(
+            opts.proxy_leaf_validity,
+            Some(std::time::Duration::from_secs(15 * 60))
+        );
+    }
+
+    #[test]
+    fn profile_ca_env_vars_carries_through() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("env.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "env-test" },
+                "network": { "tls_intercept": { "ca_env_vars": ["NODE_EXTRA_CA_CERTS"] } }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("ca_env_vars profile is valid");
+        let tls = opts
+            .tls_intercept
+            .expect("ca_env_vars must produce a tls_intercept intent");
+        assert_eq!(tls.ca_env_vars, vec!["NODE_EXTRA_CA_CERTS".to_string()]);
+    }
+
+    #[test]
+    fn no_profile_yields_no_tls_intercept() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let args = parse_args(&[]);
+        let opts = build_launch_options(&args).expect("empty args are valid");
+        assert!(opts.tls_intercept.is_none());
+        assert!(opts.proxy_leaf_validity.is_none());
     }
 
     /// Write a fresh, self-consistent CA key+cert pair to two temp files and
