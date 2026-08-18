@@ -62,6 +62,29 @@ pub(crate) fn official_claude_pack_namespaces() -> impl Iterator<Item = &'static
     CLAUDE_PACK.namespaces()
 }
 
+/// If `pack_ref` (`<namespace>/<name>` or `<namespace>/<name>@version`)
+/// addresses an official pack through a retired namespace, return the same
+/// reference rewritten to the pack's current namespace.
+///
+/// Used to point remediation commands (`nono pull ...`) at a namespace that
+/// still resolves, instead of echoing back one the registry no longer serves
+/// packs under.
+pub(crate) fn canonicalize_legacy_pack_ref(pack_ref: &str) -> Option<String> {
+    let (head, version) = match pack_ref.split_once('@') {
+        Some((h, v)) => (h, Some(v)),
+        None => (pack_ref, None),
+    };
+    let (namespace, name) = head.split_once('/')?;
+    let target = OFFICIAL_PACK_STATUS_TARGETS
+        .iter()
+        .find(|t| t.name == name && t.legacy_namespaces.contains(&namespace))?;
+    let canonical = format!("{}/{}", target.namespace, target.name);
+    Some(match version {
+        Some(v) => format!("{canonical}@{v}"),
+        None => canonical,
+    })
+}
+
 /// Enforce official-pack status for the profile this run selected.
 ///
 /// `cli_extends` carries `--extends`, which behaves as if those bases were
