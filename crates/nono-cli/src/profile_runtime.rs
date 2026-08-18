@@ -128,8 +128,11 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
         if pull_ref != *pack_ref {
             tracing::warn!(
                 "Pack '{}' is installed under a namespace that has been retired. \
-                 Migrate with: nono remove {} && nono pull {}",
+                 Migrate with: nono remove {} && nono pull {}, then update any \
+                 'extends'/'packs' entries in your profile from '{}' to '{}'.",
                 pack_ref,
+                pack_ref,
+                pull_ref,
                 pack_ref,
                 pull_ref
             );

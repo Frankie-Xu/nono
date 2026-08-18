@@ -30,10 +30,6 @@ const CODEX_PACK: OfficialPackStatusTarget = OfficialPackStatusTarget {
 const OFFICIAL_PACK_STATUS_TARGETS: &[OfficialPackStatusTarget] = &[CLAUDE_PACK, CODEX_PACK];
 
 impl OfficialPackStatusTarget {
-    fn key(self) -> String {
-        format!("{}/{}", self.namespace, self.name)
-    }
-
     /// Every namespace this pack has been published under, current one first.
     fn namespaces(self) -> impl Iterator<Item = &'static str> {
         std::iter::once(self.namespace).chain(self.legacy_namespaces.iter().copied())
@@ -109,8 +105,10 @@ pub(crate) fn enforce_for_active_profile(
 
 fn enforce_official_pack_status(target: OfficialPackStatusTarget, silent: bool) -> Result<()> {
     let lockfile = package::read_lockfile()?;
-    let key = target.key();
-    let Some(locked) = lockfile.packages.get(&key) else {
+    let Some((key, locked)) = target
+        .keys()
+        .find_map(|k| lockfile.packages.get(&k).map(|locked| (k, locked)))
+    else {
         return Ok(());
     };
 
