@@ -182,7 +182,7 @@ Runs after the sandboxed process exits. Receives `NONO_SESSION_ID`, `NONO_WORKDI
 rm -rf "/tmp/$NONO_SESSION_ID"
 ```
 
-### AF_UNIX Socket Grants
+## AF_UNIX Socket Grants
 
 The `unix_socket*` filesystem fields grant `connect(2)` (and optionally
 `bind(2)`) on pathname AF_UNIX sockets. Abstract-namespace and unnamed
@@ -213,7 +213,7 @@ Under restricted network modes (`--block-net` or `--network-profile`),
 `connect(2)` to a Unix socket requires an explicit `unix_socket*` grant
 — a plain `allow_file`/`allow` grant no longer implicitly permits it.
 
-### Working Directory
+## Working Directory
 
 The `workdir` section controls whether and how the current working directory is automatically shared with the sandboxed process.
 
@@ -467,23 +467,11 @@ The `custom_credentials` field lets you define credential services for any API:
 
 See [Credential Injection](/cli/features/credential-injection#custom-credential-definitions) for complete documentation.
 
-### Hooks
+### Hooks (pack-declared, legacy profile field)
 
-The `hooks` section defines hooks that nono will automatically install for specific applications.
+The `hooks` field is a legacy declaration surface: since v0.44.0, setting it in a profile no longer installs anything itself — nono just prints a one-line note. Actual agent-hook wiring (e.g. installing a script into `~/.claude/hooks/` and patching `settings.json`) is now done by a pack's `package.json` `wiring` directives, executed on `nono pull`/`nono resolve`. See [Package Publishing](/cli/features/package-publishing) if you're authoring a pack that needs this.
 
-```json
-{
-  "hooks": {
-    "claude-code": {
-      "event": "PostToolUseFailure",
-      "matcher": "Read|Write|Edit|Bash",
-      "script": "nono-hook.sh"
-    }
-  }
-}
-```
-
-Hook installation is idempotent - nono only installs or updates when needed.
+This is unrelated to **Session Hooks** above, which is a currently-active profile feature for running host-privileged setup/cleanup scripts around the sandboxed process itself.
 
 ### Interactive Mode (deprecated)
 

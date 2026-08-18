@@ -23,7 +23,9 @@ A Tool Sandbox profile answers three questions:
 
 Each child command starts from a minimal runtime baseline. It does not inherit outer `--allow`, CWD access, broad profile groups, raw credential paths, or outer network access.
 
-When Tool Sandbox is active, the outer process can execute the initial program and the Tool Sandbox shims. Further tool launches should be modeled as command-policy hops. This keeps direct executable-path bypasses blocked without building a host-wide allow-list of every executable on `PATH`.
+When Tool Sandbox is active, the outer session's execute grant is built from every trusted directory on `PATH`: nono scans each non-writable `PATH` directory and allow-lists every executable file found there, plus its shared-library dependency closure — not just the initial program and the Tool Sandbox shims. A binary that lives outside `PATH` (for example a JVM's `jspawnhelper` under `/usr/lib/jvm/.../lib/`) is not covered by this scan and is denied unless it's reachable through `PATH`, added to `command_policies.executable_dirs`, or modeled as a command-policy hop with its own `sandbox.exec_paths` entry.
+
+Tool Sandbox's real security boundary is at policy-controlled *commands*, not at execute-vs-no-execute for the outer session: once a command becomes a Tool Sandbox entry, everything it invokes is governed by `can_use`/`from` edges regardless of `PATH` membership.
 
 ## Available Fields
 
