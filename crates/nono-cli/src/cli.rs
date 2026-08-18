@@ -426,6 +426,9 @@ IN-BAND DETACH:
 
     # Escape hatch: use a complete WebSocket attach URL
     nono connect wss://console.example.com/api/v1/sessions/local:host:abc123/terminal
+
+SESSION PICKER:
+    Use Up/Down or j/k to move, Enter to connect, and q or Esc to cancel.
 "
     )]
     Connect(ConnectArgs),

@@ -6,10 +6,11 @@
 //! device runs browser-approved human authorization, caches a device-bound
 //! opaque credential, and exchanges it for a short-lived console bearer token.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use colored::Colorize;
 use futures_util::{SinkExt, StreamExt};
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,9 @@ const DEVICE_AUTH_VERIFICATION_PATH: &str = "/platform/device";
 const DEVICE_AUTH_CACHE_FILENAME: &str = "platform-console-auth.json";
 const DEFAULT_DETACH_SEQUENCE: &[u8] = &[0x1d, b'd'];
 const WEBSOCKET_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const TERMINAL_PROTOCOL_V1: &str = "nono.terminal.v1";
+const SELECTOR_HEADER_ROWS: u16 = 7;
+const SELECTOR_ROWS_PER_SESSION: u16 = 3;
 static REMOTE_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Debug, Deserialize)]
@@ -210,7 +214,8 @@ pub(crate) fn run_remote_ps(args: &PsArgs) -> Result<()> {
         return Ok(());
     }
 
-    print_remote_sessions(&sessions, args.all)
+    print_remote_sessions(&sessions, args.all, &console);
+    Ok(())
 }
 
 /// Return the non-zero hosted process status recorded by `run_connect`.
@@ -240,6 +245,7 @@ fn resolve_attach_url(target: Option<&str>, console: Option<&str>, token: &str) 
         Some(value) => select_named_session(&list_live_sessions(&console_url, token)?, value)?,
         None => select_interactively(&list_live_sessions(&console_url, token)?)?,
     };
+    print_connect_target(&session, &console_url);
     terminal_url(&console_url, &session.global_session_id)
 }
 
@@ -731,10 +737,10 @@ fn fetch_sessions(console: &Url, token: &str) -> Result<Vec<RemoteSession>> {
 }
 
 fn list_live_sessions(console: &Url, token: &str) -> Result<Vec<RemoteSession>> {
-    Ok(fetch_sessions(console, token)?
-        .into_iter()
-        .filter(is_live_session)
-        .collect())
+    Ok(filter_remote_sessions(
+        fetch_sessions(console, token)?,
+        false,
+    ))
 }
 
 fn is_live_session(session: &RemoteSession) -> bool {
@@ -757,77 +763,234 @@ fn filter_remote_sessions(mut sessions: Vec<RemoteSession>, all: bool) -> Vec<Re
     sessions
 }
 
-fn print_remote_sessions(sessions: &[RemoteSession], all: bool) -> Result<()> {
+struct RemoteDisplayRow {
+    session: String,
+    name: String,
+    status: String,
+    agent: String,
+    repo: String,
+    live: bool,
+}
+
+impl RemoteDisplayRow {
+    fn from_session(session: &RemoteSession) -> Self {
+        Self {
+            session: terminal_text(&session.global_session_id),
+            name: terminal_text(remote_name(session)),
+            status: terminal_text(remote_status(session)),
+            agent: terminal_text(remote_agent(session)),
+            repo: terminal_text(&remote_repo(session)),
+            live: is_live_session(session),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RemoteTableLayout {
+    widths: [usize; 5],
+    compact: bool,
+}
+
+fn print_remote_sessions(sessions: &[RemoteSession], all: bool, console: &Url) {
     if sessions.is_empty() {
         if all {
             eprintln!("No remote sessions found.");
         } else {
             eprintln!("No live remote sessions. Use --all to include inactive sessions.");
         }
-        return Ok(());
-    }
-
-    struct Row {
-        session: String,
-        name: String,
-        status: String,
-        agent: String,
-        repo: String,
+        return;
     }
 
     let rows = sessions
         .iter()
-        .map(|session| Row {
-            session: session.global_session_id.clone(),
-            name: remote_name(session).to_string(),
-            status: remote_status(session).to_string(),
-            agent: remote_agent(session).to_string(),
-            repo: remote_repo(session),
-        })
+        .map(RemoteDisplayRow::from_session)
         .collect::<Vec<_>>();
-    let session_width = rows
-        .iter()
-        .map(|row| row.session.len())
-        .max()
-        .unwrap_or("SESSION".len())
-        .max("SESSION".len());
-    let name_width = rows
-        .iter()
-        .map(|row| row.name.len())
-        .max()
-        .unwrap_or("NAME".len())
-        .max("NAME".len())
-        .min(28);
-    let status_width = rows
-        .iter()
-        .map(|row| row.status.len())
-        .max()
-        .unwrap_or("STATUS".len())
-        .max("STATUS".len())
-        .min(16);
-    let agent_width = rows
-        .iter()
-        .map(|row| row.agent.len())
-        .max()
-        .unwrap_or("AGENT".len())
-        .max("AGENT".len())
-        .min(20);
-
+    let live_count = rows.iter().filter(|row| row.live).count();
+    let summary = if all {
+        format!("{live_count} live · {} total", rows.len())
+    } else {
+        format!("{} live", rows.len())
+    };
+    println!();
     println!(
-        "{:<session_width$} {:<name_width$} {:<status_width$} {:<agent_width$} REPOSITORY",
-        "SESSION", "NAME", "STATUS", "AGENT"
+        "  {}  {}  {}",
+        "REMOTE SESSIONS".bold(),
+        summary.dimmed(),
+        console_label(console).dimmed(),
+    );
+    println!();
+
+    let columns = remote_terminal_columns();
+    let layout = remote_table_layout(&rows, columns);
+    if layout.compact {
+        print_remote_session_cards(&rows, columns);
+    } else {
+        print_remote_session_table(&rows, &layout);
+    }
+}
+
+fn remote_table_layout(rows: &[RemoteDisplayRow], columns: usize) -> RemoteTableLayout {
+    const HEADERS: [&str; 5] = ["NAME", "STATUS", "AGENT", "REPOSITORY", "SESSION"];
+    const CAPS: [usize; 5] = [28, 14, 20, 36, 32];
+    const MINIMUMS: [usize; 5] = [8, 8, 8, 10, 10];
+    const SHRINK_ORDER: [usize; 5] = [3, 4, 2, 0, 1];
+    const DECORATION_WIDTH: usize = 2;
+    const SEPARATOR_WIDTH: usize = 4;
+
+    if columns < 52 {
+        return RemoteTableLayout {
+            widths: MINIMUMS,
+            compact: true,
+        };
+    }
+
+    let mut widths = std::array::from_fn(|index| {
+        rows.iter()
+            .map(|row| remote_row_field(row, index).chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(HEADERS[index].len())
+            .min(CAPS[index])
+    });
+    let mut total = DECORATION_WIDTH + SEPARATOR_WIDTH + widths.iter().sum::<usize>();
+    while total > columns {
+        let mut shrunk = false;
+        for index in SHRINK_ORDER {
+            if widths[index] > MINIMUMS[index] {
+                widths[index] -= 1;
+                total -= 1;
+                shrunk = true;
+                if total <= columns {
+                    break;
+                }
+            }
+        }
+        if !shrunk {
+            return RemoteTableLayout {
+                widths,
+                compact: true,
+            };
+        }
+    }
+    RemoteTableLayout {
+        widths,
+        compact: false,
+    }
+}
+
+fn print_remote_session_table(rows: &[RemoteDisplayRow], layout: &RemoteTableLayout) {
+    let [
+        name_width,
+        status_width,
+        agent_width,
+        repo_width,
+        session_width,
+    ] = layout.widths;
+    println!(
+        "  {} {} {} {} {}",
+        pad_cell("NAME", name_width).dimmed(),
+        pad_cell("STATUS", status_width).dimmed(),
+        pad_cell("AGENT", agent_width).dimmed(),
+        pad_cell("REPOSITORY", repo_width).dimmed(),
+        pad_cell("SESSION", session_width).dimmed(),
     );
     for row in rows {
+        let status = pad_cell(&row.status, status_width);
         println!(
-            "{:<session_width$} {:<name_width$} {:<status_width$} {:<agent_width$} {}",
-            row.session,
-            crate::command_display::truncate_chars(&row.name, name_width),
-            crate::command_display::truncate_chars(&row.status, status_width),
-            crate::command_display::truncate_chars(&row.agent, agent_width),
-            row.repo,
+            "{} {} {} {} {} {}",
+            remote_status_dot(row),
+            pad_cell(&row.name, name_width).bold(),
+            color_remote_status(&status, row),
+            pad_cell(&row.agent, agent_width),
+            pad_cell(&row.repo, repo_width),
+            pad_cell(&row.session, session_width).dimmed(),
         );
     }
-    Ok(())
+}
+
+fn print_remote_session_cards(rows: &[RemoteDisplayRow], columns: usize) {
+    let content_width = columns.saturating_sub(4).max(12);
+    for row in rows {
+        let title = format!("{}  {}", row.name, row.status);
+        let metadata = format!("{} · {}", row.agent, row.repo);
+        println!(
+            "{} {}",
+            remote_status_dot(row),
+            crate::command_display::truncate_chars(&title, content_width).bold(),
+        );
+        println!(
+            "    {}",
+            crate::command_display::truncate_chars(&metadata, content_width).dimmed(),
+        );
+        println!(
+            "    {}",
+            crate::command_display::truncate_chars(&row.session, content_width).dimmed(),
+        );
+    }
+}
+
+fn remote_row_field(row: &RemoteDisplayRow, index: usize) -> &str {
+    match index {
+        0 => &row.name,
+        1 => &row.status,
+        2 => &row.agent,
+        3 => &row.repo,
+        _ => &row.session,
+    }
+}
+
+fn pad_cell(value: &str, width: usize) -> String {
+    let value = crate::command_display::truncate_chars(value, width);
+    format!("{value:<width$}")
+}
+
+fn remote_status_dot(row: &RemoteDisplayRow) -> String {
+    let theme = crate::theme::current();
+    if row.live {
+        crate::theme::fg("●", theme.green).to_string()
+    } else if row.status == "exited" || row.status == "failed" {
+        crate::theme::fg("●", theme.red).to_string()
+    } else {
+        crate::theme::fg("●", theme.yellow).to_string()
+    }
+}
+
+fn color_remote_status(status: &str, row: &RemoteDisplayRow) -> String {
+    let theme = crate::theme::current();
+    if row.live {
+        crate::theme::fg(status, theme.green).to_string()
+    } else if row.status == "exited" || row.status == "failed" {
+        crate::theme::fg(status, theme.red).to_string()
+    } else {
+        crate::theme::fg(status, theme.yellow).to_string()
+    }
+}
+
+fn remote_terminal_columns() -> usize {
+    if let Ok(columns) = std::env::var("COLUMNS")
+        && let Ok(columns) = columns.parse::<usize>()
+        && columns > 0
+    {
+        return columns;
+    }
+    if io::stdout().is_terminal() {
+        usize::from(terminal_size().0)
+    } else {
+        120
+    }
+}
+
+fn console_label(console: &Url) -> String {
+    let host = console.host_str().unwrap_or("remote console");
+    let label = match console.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    terminal_text(&label)
+}
+
+fn terminal_text(value: &str) -> String {
+    crate::terminal_approval::sanitize_for_terminal(value)
 }
 
 fn remote_name(session: &RemoteSession) -> &str {
@@ -839,11 +1002,15 @@ fn remote_name(session: &RemoteSession) -> &str {
 }
 
 fn remote_status(session: &RemoteSession) -> &str {
-    session
-        .record
-        .as_ref()
-        .map(|record| record.status.as_str())
-        .unwrap_or(&session.backend_status)
+    if session.backend_status == "ready" {
+        session
+            .record
+            .as_ref()
+            .map(|record| record.status.as_str())
+            .unwrap_or(&session.backend_status)
+    } else {
+        &session.backend_status
+    }
 }
 
 fn remote_agent(session: &RemoteSession) -> &str {
@@ -896,38 +1063,228 @@ fn select_interactively(sessions: &[RemoteSession]) -> Result<RemoteSession> {
             "the console has no live sessions visible to this user".to_string(),
         ));
     }
-    for (index, session) in sessions.iter().enumerate() {
-        let record = session.record.as_ref();
-        let name = record
-            .and_then(|value| value.name.as_deref())
-            .unwrap_or(&session.global_session_id);
-        let agent = session
-            .agent
-            .as_ref()
-            .map(|value| value.name.as_str())
-            .or_else(|| record.and_then(|value| value.command.first().map(String::as_str)))
-            .unwrap_or("unknown");
-        let repo = session
-            .repo
-            .as_ref()
-            .map(|value| format!("{}#{}", value.full_name, value.base_branch))
-            .unwrap_or_else(|| "(no repo)".to_string());
-        println!("  {}.  {:<28} {:<14} {repo}", index + 1, name, agent);
+    let terminal = SelectionTerminal::enter()?;
+    let mut selected = 0;
+    loop {
+        draw_session_selector(sessions, selected)?;
+        match read_selector_key()? {
+            SelectorKey::Up => selected = selected.checked_sub(1).unwrap_or(sessions.len() - 1),
+            SelectorKey::Down => selected = (selected + 1) % sessions.len(),
+            SelectorKey::Home => selected = 0,
+            SelectorKey::End => selected = sessions.len() - 1,
+            SelectorKey::Select => {
+                drop(terminal);
+                return sessions.get(selected).map(clone_session).ok_or_else(|| {
+                    NonoError::ConfigParse("session selection is out of range".to_string())
+                });
+            }
+            SelectorKey::Cancel => {
+                return Err(NonoError::ActionRequired(
+                    "remote session selection cancelled".to_string(),
+                ));
+            }
+            SelectorKey::Ignore => {}
+        }
     }
-    print!("> ");
-    io::stdout().flush().map_err(NonoError::Io)?;
-    let mut choice = String::new();
-    io::stdin().read_line(&mut choice).map_err(NonoError::Io)?;
-    let index = choice
-        .trim()
-        .parse::<usize>()
-        .ok()
-        .and_then(|value| value.checked_sub(1))
-        .ok_or_else(|| NonoError::ConfigParse("invalid session selection".to_string()))?;
-    sessions
-        .get(index)
-        .map(clone_session)
-        .ok_or_else(|| NonoError::ConfigParse("session selection is out of range".to_string()))
+}
+
+struct SelectionTerminal {
+    _raw_terminal: RawTerminal,
+}
+
+impl SelectionTerminal {
+    fn enter() -> Result<Self> {
+        let raw_terminal = RawTerminal::enter()?;
+        let mut stdout = io::stdout().lock();
+        stdout
+            .write_all(b"\x1b[?1049h\x1b[?25l")
+            .map_err(NonoError::Io)?;
+        stdout.flush().map_err(NonoError::Io)?;
+        Ok(Self {
+            _raw_terminal: raw_terminal,
+        })
+    }
+}
+
+impl Drop for SelectionTerminal {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(b"\x1b[?25h\x1b[?1049l");
+        let _ = stdout.flush();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectorKey {
+    Up,
+    Down,
+    Home,
+    End,
+    Select,
+    Cancel,
+    Ignore,
+}
+
+fn draw_session_selector(sessions: &[RemoteSession], selected: usize) -> Result<()> {
+    let (columns, rows) = terminal_size();
+    let columns = usize::from(columns);
+    let visible = usize::from(
+        rows.saturating_sub(SELECTOR_HEADER_ROWS)
+            .checked_div(SELECTOR_ROWS_PER_SESSION)
+            .unwrap_or(1)
+            .max(1),
+    )
+    .min(sessions.len());
+    let mut first = selected.saturating_sub(visible / 2);
+    first = first.min(sessions.len().saturating_sub(visible));
+    let last = first + visible;
+    let theme = crate::theme::current();
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(b"\x1b[2J\x1b[H").map_err(NonoError::Io)?;
+    write_terminal_line(
+        &mut stdout,
+        &format!(
+            "  {}  {}",
+            "NONO CONNECT".bold(),
+            format!("{} live remote sessions", sessions.len()).dimmed(),
+        ),
+    )?;
+    write_terminal_line(&mut stdout, "")?;
+    write_terminal_line(
+        &mut stdout,
+        &format!("  {}", "Choose a session to connect to".bold()),
+    )?;
+    write_terminal_line(
+        &mut stdout,
+        &format!(
+            "  {}",
+            "↑/↓ or j/k move  ·  enter connect  ·  q cancel".dimmed()
+        ),
+    )?;
+    write_terminal_line(&mut stdout, "")?;
+
+    for (index, session) in sessions.iter().enumerate().take(last).skip(first) {
+        let row = RemoteDisplayRow::from_session(session);
+        let active = index == selected;
+        let pointer = if active {
+            crate::theme::fg("❯", theme.brand).bold().to_string()
+        } else {
+            " ".to_string()
+        };
+        let display_name = if row.name == "-" {
+            &row.session
+        } else {
+            &row.name
+        };
+        let title_width = columns.saturating_sub(8).max(12);
+        let title = crate::command_display::truncate_chars(
+            &format!("{display_name}  {}", row.status),
+            title_width,
+        );
+        let title = if active {
+            title.bold().to_string()
+        } else {
+            title
+        };
+        write_terminal_line(
+            &mut stdout,
+            &format!("  {pointer} {} {title}", remote_status_dot(&row)),
+        )?;
+        let metadata = crate::command_display::truncate_chars(
+            &format!("{} · {}", row.agent, row.repo),
+            columns.saturating_sub(7).max(12),
+        );
+        write_terminal_line(&mut stdout, &format!("      {}", metadata.dimmed()))?;
+        let session_id =
+            crate::command_display::truncate_chars(&row.session, columns.saturating_sub(7).max(12));
+        write_terminal_line(&mut stdout, &format!("      {}", session_id.dimmed()))?;
+    }
+
+    if visible < sessions.len() {
+        write_terminal_line(
+            &mut stdout,
+            &format!(
+                "  {}",
+                format!("showing {}–{} of {}", first + 1, last, sessions.len()).dimmed()
+            ),
+        )?;
+    }
+    stdout.flush().map_err(NonoError::Io)
+}
+
+fn write_terminal_line(output: &mut impl Write, line: &str) -> Result<()> {
+    output.write_all(line.as_bytes()).map_err(NonoError::Io)?;
+    output.write_all(b"\r\n").map_err(NonoError::Io)
+}
+
+fn read_selector_key() -> Result<SelectorKey> {
+    let mut byte = [0_u8; 1];
+    io::stdin().read_exact(&mut byte).map_err(NonoError::Io)?;
+    match byte[0] {
+        b'k' | b'K' => Ok(SelectorKey::Up),
+        b'j' | b'J' => Ok(SelectorKey::Down),
+        b'g' => Ok(SelectorKey::Home),
+        b'G' => Ok(SelectorKey::End),
+        b'\r' | b'\n' => Ok(SelectorKey::Select),
+        b'q' | b'Q' | 0x03 => Ok(SelectorKey::Cancel),
+        0x1b => read_escape_key(),
+        _ => Ok(SelectorKey::Ignore),
+    }
+}
+
+fn read_escape_key() -> Result<SelectorKey> {
+    if !selector_input_pending(40)? {
+        return Ok(SelectorKey::Cancel);
+    }
+    let mut prefix = [0_u8; 1];
+    io::stdin().read_exact(&mut prefix).map_err(NonoError::Io)?;
+    if !matches!(prefix[0], b'[' | b'O') {
+        return Ok(SelectorKey::Ignore);
+    }
+    let mut key = [0_u8; 1];
+    io::stdin().read_exact(&mut key).map_err(NonoError::Io)?;
+    match key[0] {
+        b'A' => Ok(SelectorKey::Up),
+        b'B' => Ok(SelectorKey::Down),
+        b'H' => Ok(SelectorKey::Home),
+        b'F' => Ok(SelectorKey::End),
+        _ => Ok(SelectorKey::Ignore),
+    }
+}
+
+fn selector_input_pending(timeout_ms: i32) -> Result<bool> {
+    let mut descriptor = nix::libc::pollfd {
+        fd: nix::libc::STDIN_FILENO,
+        events: nix::libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `descriptor` points to one initialized `pollfd`, the count is
+    // exactly one, and `poll` only mutates its `revents` field.
+    let result = unsafe { nix::libc::poll(&mut descriptor, 1, timeout_ms) };
+    if result < 0 {
+        return Err(NonoError::Io(io::Error::last_os_error()));
+    }
+    Ok(result > 0 && descriptor.revents & nix::libc::POLLIN != 0)
+}
+
+fn print_connect_target(session: &RemoteSession, console: &Url) {
+    let row = RemoteDisplayRow::from_session(session);
+    let display_name = if row.name == "-" {
+        &row.session
+    } else {
+        &row.name
+    };
+    let theme = crate::theme::current();
+    eprintln!();
+    eprintln!(
+        "  {} {}",
+        crate::theme::fg("◆", theme.brand),
+        display_name.bold(),
+    );
+    eprintln!(
+        "    {}",
+        format!("{} · {} · {}", row.agent, row.repo, console_label(console)).dimmed(),
+    );
 }
 
 fn clone_session(session: &RemoteSession) -> RemoteSession {
@@ -972,11 +1329,149 @@ fn terminal_url(console: &Url, session_id: &str) -> Result<Url> {
     Ok(url)
 }
 
+struct ConnectionProgress {
+    destination: String,
+    secure: bool,
+    interactive: bool,
+    frame: usize,
+    active: bool,
+}
+
+impl ConnectionProgress {
+    fn start(url: &Url) -> Self {
+        let destination = console_label(url);
+        let secure = url.scheme() == "wss";
+        let progress = Self {
+            destination,
+            secure,
+            interactive: io::stderr().is_terminal(),
+            frame: 0,
+            active: true,
+        };
+        progress.draw();
+        progress
+    }
+
+    fn tick(&mut self) {
+        if !self.interactive {
+            return;
+        }
+        self.frame = (self.frame + 1) % 8;
+        self.draw();
+    }
+
+    fn connected(&mut self, detach_sequence: &[u8]) {
+        self.active = false;
+        let theme = crate::theme::current();
+        let mut stderr = io::stderr().lock();
+        if self.interactive {
+            let _ = stderr.write_all(b"\r\x1b[2K");
+        }
+        let title = if self.secure {
+            "Secure remote connection established"
+        } else {
+            "Local development connection established"
+        };
+        let transport = if self.secure {
+            "WSS · TLS encrypted"
+        } else {
+            "WS · loopback only"
+        };
+        let _ = writeln!(
+            stderr,
+            "  {} {}",
+            crate::theme::fg("✓", theme.green).bold(),
+            title.bold(),
+        );
+        let _ = writeln!(
+            stderr,
+            "    {}",
+            format!(
+                "{} · {} · {TERMINAL_PROTOCOL_V1}",
+                self.destination, transport
+            )
+            .dimmed(),
+        );
+        let _ = writeln!(
+            stderr,
+            "    {} {}\n",
+            "detach".dimmed(),
+            format_detach_sequence(detach_sequence).bold(),
+        );
+        let _ = stderr.flush();
+    }
+
+    fn draw(&self) {
+        const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        let theme = crate::theme::current();
+        let action = if self.secure {
+            "Establishing encrypted connection to"
+        } else {
+            "Connecting to local development console at"
+        };
+        let mut stderr = io::stderr().lock();
+        if self.interactive {
+            let _ = write!(
+                stderr,
+                "\r\x1b[2K  {} {} {}",
+                crate::theme::fg(FRAMES[self.frame], theme.brand),
+                action,
+                self.destination.bold(),
+            );
+            let _ = stderr.flush();
+        } else if self.frame == 0 {
+            let _ = writeln!(stderr, "  · {action} {}", self.destination);
+        }
+    }
+}
+
+impl Drop for ConnectionProgress {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let theme = crate::theme::current();
+        let mut stderr = io::stderr().lock();
+        if self.interactive {
+            let _ = stderr.write_all(b"\r\x1b[2K");
+        }
+        let _ = writeln!(
+            stderr,
+            "  {} Connection to {} failed",
+            crate::theme::fg("×", theme.red).bold(),
+            self.destination.bold(),
+        );
+        let _ = stderr.flush();
+    }
+}
+
+fn format_detach_sequence(sequence: &[u8]) -> String {
+    sequence
+        .iter()
+        .map(|byte| match byte {
+            0x00 => "Ctrl-@".to_string(),
+            0x01..=0x1a => format!("Ctrl-{}", char::from(byte + b'@')),
+            0x1b => "Esc".to_string(),
+            0x1c => "Ctrl-\\".to_string(),
+            0x1d => "Ctrl-]".to_string(),
+            0x1e => "Ctrl-^".to_string(),
+            0x1f => "Ctrl-_".to_string(),
+            b' ' => "Space".to_string(),
+            0x7f => "Backspace".to_string(),
+            byte if byte.is_ascii_graphic() => char::from(*byte).to_string(),
+            byte => format!("0x{byte:02x}"),
+        })
+        .collect::<Vec<_>>()
+        .join(" then ")
+}
+
 async fn attach(
-    url: Url,
+    mut url: Url,
     token: Zeroizing<String>,
     detach_sequence: Vec<u8>,
 ) -> Result<AttachOutcome> {
+    let (initial_cols, initial_rows) = terminal_size();
+    set_initial_terminal_size(&mut url, initial_cols, initial_rows);
     let mut request = url
         .as_str()
         .into_client_request()
@@ -986,35 +1481,44 @@ async fn attach(
     request.headers_mut().insert(AUTHORIZATION, authorization);
     request.headers_mut().insert(
         "Sec-WebSocket-Protocol",
-        HeaderValue::from_static("nono.terminal.v1"),
+        HeaderValue::from_static(TERMINAL_PROTOCOL_V1),
     );
 
-    let (socket, response) = tokio::time::timeout(
+    let mut progress = ConnectionProgress::start(&url);
+    let connection = tokio::time::timeout(
         WEBSOCKET_CONNECT_TIMEOUT,
         tokio_tungstenite::connect_async(request),
-    )
-    .await
-    .map_err(|_| {
-        NonoError::ConfigParse("terminal connection timed out after 15 seconds".to_string())
-    })?
-    .map_err(|error| NonoError::ConfigParse(format!("terminal connection failed: {error}")))?;
+    );
+    tokio::pin!(connection);
+    let mut animation = tokio::time::interval(std::time::Duration::from_millis(90));
+    let connection_result = loop {
+        tokio::select! {
+            result = &mut connection => break result,
+            _ = animation.tick() => progress.tick(),
+        }
+    };
+    let (socket, response) = connection_result
+        .map_err(|_| {
+            NonoError::ConfigParse("terminal connection timed out after 15 seconds".to_string())
+        })?
+        .map_err(|error| NonoError::ConfigParse(format!("terminal connection failed: {error}")))?;
     let selected_protocol = response
         .headers()
         .get(SEC_WEBSOCKET_PROTOCOL)
         .and_then(|value| value.to_str().ok());
-    if selected_protocol != Some("nono.terminal.v1") {
+    if selected_protocol != Some(TERMINAL_PROTOCOL_V1) {
         return Err(NonoError::ConfigParse(
             "console did not negotiate the required nono.terminal.v1 protocol".to_string(),
         ));
     }
+    progress.connected(&detach_sequence);
     let (mut ws_tx, mut ws_rx) = socket.split();
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut input = vec![0_u8; 8192];
     let mut matcher = DetachMatcher::new(detach_sequence);
     let _terminal = RawTerminal::enter()?;
-    let (cols, rows) = terminal_size();
-    send_resize(&mut ws_tx, cols, rows).await?;
+    send_resize(&mut ws_tx, initial_cols, initial_rows).await?;
     let mut resize = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
         .map_err(NonoError::Io)?;
 
@@ -1098,6 +1602,12 @@ async fn attach(
             }
         }
     }
+}
+
+fn set_initial_terminal_size(url: &mut Url, cols: u16, rows: u16) {
+    url.query_pairs_mut()
+        .append_pair("cols", &cols.to_string())
+        .append_pair("rows", &rows.to_string());
 }
 
 fn ws_error(error: tokio_tungstenite::tungstenite::Error) -> NonoError {
@@ -1325,6 +1835,13 @@ mod tests {
     }
 
     #[test]
+    fn terminal_upgrade_carries_initial_dimensions() {
+        let mut url = Url::parse("wss://console.example/terminal").unwrap();
+        set_initial_terminal_size(&mut url, 144, 48);
+        assert_eq!(url.query(), Some("cols=144&rows=48"));
+    }
+
+    #[test]
     fn discovery_fixture_matches_enrollment_and_rejects_tenant_mismatch() {
         let state = crate::platform_client::PlatformState {
             protocol_version: "1".to_string(),
@@ -1382,6 +1899,71 @@ mod tests {
         );
         assert_eq!(all.len(), 2);
         assert_eq!(remote_status(&all[1]), "exited");
+    }
+
+    #[test]
+    fn remote_status_surfaces_backend_transition() {
+        let session = remote_session("session-starting", Some("cedar"), "starting", "running");
+
+        assert_eq!(remote_status(&session), "starting");
+        assert!(!is_live_session(&session));
+    }
+
+    #[test]
+    fn remote_display_rows_sanitize_console_fields() {
+        let mut session = remote_session(
+            "session\x1b[2J-hostile",
+            Some("cedar\r\nspoofed"),
+            "ready",
+            "running",
+        );
+        session.agent = Some(RemoteAgent {
+            name: "agent\x1b]0;title\x07".to_string(),
+        });
+        session.repo = Some(RemoteRepo {
+            full_name: "org/repo\x1b[1m".to_string(),
+            base_branch: "main".to_string(),
+        });
+
+        let row = RemoteDisplayRow::from_session(&session);
+
+        assert!(!row.session.contains('\x1b'));
+        assert!(!row.name.contains('\r'));
+        assert!(!row.name.contains('\n'));
+        assert!(!row.agent.contains('\x1b'));
+        assert!(!row.repo.contains('\x1b'));
+    }
+
+    #[test]
+    fn remote_table_layout_fits_terminal_width() {
+        let sessions = [
+            remote_session(
+                "local:very-long-host-name:019f0000-0000-7000-8000-000000000001",
+                Some("a-very-long-session-name-that-needs-truncation"),
+                "ready",
+                "running",
+            ),
+            remote_session("local:host:short", Some("birch"), "ready", "running"),
+        ];
+        let rows = sessions
+            .iter()
+            .map(RemoteDisplayRow::from_session)
+            .collect::<Vec<_>>();
+
+        let layout = remote_table_layout(&rows, 80);
+
+        assert!(!layout.compact);
+        assert!(layout.widths.iter().sum::<usize>() + 6 <= 80);
+        assert!(remote_table_layout(&rows, 44).compact);
+    }
+
+    #[test]
+    fn detach_sequence_has_readable_key_names() {
+        assert_eq!(
+            format_detach_sequence(DEFAULT_DETACH_SEQUENCE),
+            "Ctrl-] then d"
+        );
+        assert_eq!(format_detach_sequence(&[0x03, b' ']), "Ctrl-C then Space");
     }
 
     fn remote_session(
