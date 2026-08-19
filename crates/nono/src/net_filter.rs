@@ -15,8 +15,43 @@
 //!   attacks targeting cloud metadata services.
 //! - **Wildcard subdomain matching**: `*.googleapis.com` matches
 //!   `storage.googleapis.com` but not `googleapis.com` itself.
+//! - **Normalized comparison**: hostnames are IDNA-normalized before
+//!   matching, so a trailing dot, mixed case, or Unicode/punycode spelling
+//!   can't slip past a deny entry. Unparseable hosts are denied.
 
 use std::net::IpAddr;
+
+/// Normalize a hostname for deny/allow-list comparison: strips a trailing
+/// FQDN dot, rejects control characters, and applies IDNA/punycode
+/// normalization (which also lowercases). Fails on malformed input rather
+/// than falling back to a raw string compare.
+fn normalize_host(host: &str) -> Result<String, idna::Errors> {
+    let trimmed = host.trim().trim_end_matches('.');
+    if trimmed.chars().any(char::is_control) {
+        return Err(idna::Errors::default());
+    }
+    let ascii = idna::domain_to_ascii(trimmed)?;
+    // domain_to_ascii folds Unicode label separators (e.g. U+3002) to ASCII
+    // '.', so a trailing one only shows up as a dot after this call.
+    Ok(ascii.trim_end_matches('.').to_string())
+}
+
+/// Normalize a stored filter entry, falling back to a plain trim/lowercase
+/// on malformed input. Unlike `normalize_host`, this never fails: an inert
+/// (non-matching) entry is safe on both the allow and deny side, since
+/// `check_host` denies any incoming host that fails normalization anyway.
+fn normalize_entry(entry: &str) -> String {
+    normalize_host(entry).unwrap_or_else(|_| entry.trim().trim_end_matches('.').to_lowercase())
+}
+
+/// Normalize a wildcard suffix (e.g. `.example.com`, taken from `*.example.com`),
+/// preserving the leading dot that anchors the subdomain match.
+fn normalize_suffix(suffix: &str) -> String {
+    match suffix.strip_prefix('.') {
+        Some(domain) => format!(".{}", normalize_entry(domain)),
+        None => normalize_entry(suffix),
+    }
+}
 
 /// Result of a host filter check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,12 +83,18 @@ impl FilterResult {
     }
 
     /// A human-readable reason for the decision
+    ///
+    /// The host is untrusted, attacker-controlled input (it may not even have
+    /// passed [`normalize_host`]), and this string is printed directly to
+    /// terminals/logs by callers. Control characters (including the ESC that
+    /// begins an ANSI escape sequence) are stripped so a malicious hostname
+    /// can't spoof or hijack terminal output.
     #[must_use]
     pub fn reason(&self) -> String {
         match self {
             FilterResult::Allow => "allowed by host filter".to_string(),
             FilterResult::DenyHost { host } => {
-                format!("host {} is in the deny list", host)
+                format!("host {} is in the deny list", sanitize_for_display(host))
             }
             FilterResult::DenyLinkLocal { ip } => {
                 format!(
@@ -62,10 +103,20 @@ impl FilterResult {
                 )
             }
             FilterResult::DenyNotAllowed { host } => {
-                format!("host {} is not in the allowlist", host)
+                format!(
+                    "host {} is not in the allowlist",
+                    sanitize_for_display(host)
+                )
             }
         }
     }
+}
+
+/// Strip control characters (including ESC, which begins ANSI/CSI escape
+/// sequences) from untrusted text before it is embedded in a
+/// terminal-displayed or logged string.
+fn sanitize_for_display(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Check if an IP address is in the link-local range.
@@ -135,19 +186,18 @@ impl HostFilter {
         let mut suffixes = Vec::new();
 
         for host in allowed_hosts {
-            let lower = host.to_lowercase();
-            if let Some(suffix) = lower.strip_prefix('*') {
+            if let Some(suffix) = host.strip_prefix('*') {
                 // *.example.com -> .example.com
-                suffixes.push(suffix.to_string());
+                suffixes.push(normalize_suffix(suffix));
             } else {
-                exact.push(lower);
+                exact.push(normalize_entry(host));
             }
         }
 
         Self {
             allowed_hosts: exact,
             allowed_suffixes: suffixes,
-            deny_hosts: DENY_HOSTS.iter().map(|s| s.to_lowercase()).collect(),
+            deny_hosts: DENY_HOSTS.iter().map(|s| normalize_entry(s)).collect(),
             deny_suffixes: Vec::new(),
             strict: false,
         }
@@ -169,7 +219,7 @@ impl HostFilter {
         Self {
             allowed_hosts: Vec::new(),
             allowed_suffixes: Vec::new(),
-            deny_hosts: DENY_HOSTS.iter().map(|s| s.to_lowercase()).collect(),
+            deny_hosts: DENY_HOSTS.iter().map(|s| normalize_entry(s)).collect(),
             deny_suffixes: Vec::new(),
             strict: false,
         }
@@ -182,11 +232,10 @@ impl HostFilter {
     #[must_use]
     pub fn with_denied_hosts(mut self, denied: &[String]) -> Self {
         for entry in denied {
-            let lower = entry.to_lowercase();
-            if let Some(suffix) = lower.strip_prefix('*') {
-                self.deny_suffixes.push(suffix.to_string());
+            if let Some(suffix) = entry.strip_prefix('*') {
+                self.deny_suffixes.push(normalize_suffix(suffix));
             } else {
-                self.deny_hosts.push(lower);
+                self.deny_hosts.push(normalize_entry(entry));
             }
         }
         self
@@ -207,7 +256,13 @@ impl HostFilter {
     /// 4. Default deny (if not in allowlist and allowlist is non-empty)
     #[must_use]
     pub fn check_host(&self, host: &str, resolved_ips: &[IpAddr]) -> FilterResult {
-        let lower_host = host.to_lowercase();
+        // 0. Normalize the incoming host (trailing-dot FQDN, case, Unicode/punycode).
+        // Malformed input is denied rather than compared raw.
+        let Ok(lower_host) = normalize_host(host) else {
+            return FilterResult::DenyNotAllowed {
+                host: host.to_string(),
+            };
+        };
 
         // 1. Check deny hosts (exact match)
         if self.deny_hosts.contains(&lower_host) {
@@ -527,6 +582,24 @@ mod tests {
             host: "evil.com".to_string(),
         };
         assert!(deny.reason().contains("evil.com"));
+    }
+
+    #[test]
+    fn test_filter_result_reason_strips_terminal_escape_sequences() {
+        // A malicious hostname could smuggle ANSI escapes to spoof/hijack
+        // terminal output when the reason is printed by callers.
+        let deny = FilterResult::DenyNotAllowed {
+            host: "evil\x1b[31mFAKE ADMIN PROMPT\x1b[0m.com".to_string(),
+        };
+        let reason = deny.reason();
+        assert!(!reason.contains('\x1b'));
+        assert!(reason.contains("evil"));
+        assert!(reason.contains("FAKE ADMIN PROMPT"));
+
+        let deny_host = FilterResult::DenyHost {
+            host: "\x07evil.com".to_string(),
+        };
+        assert!(!deny_host.reason().contains('\x07'));
 
         let link_local = FilterResult::DenyLinkLocal {
             ip: IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
@@ -556,5 +629,97 @@ mod tests {
         let filter = HostFilter::new(&[]);
         let result = filter.check_host("example.com", &public_ip());
         assert!(matches!(result, FilterResult::Allow));
+    }
+
+    #[test]
+    fn test_trailing_dot_bypass_on_hardcoded_metadata_deny() {
+        let filter = HostFilter::allow_all();
+        let result = filter.check_host("metadata.google.internal.", &public_ip());
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+
+        let result = filter.check_host("metadata.azure.internal.", &public_ip());
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+    }
+
+    #[test]
+    fn test_trailing_dot_bypass_on_user_deny_entry() {
+        let filter = HostFilter::allow_all().with_denied_hosts(&["evil.com".to_string()]);
+        let result = filter.check_host("evil.com.", &public_ip());
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+    }
+
+    #[test]
+    fn test_trailing_dot_on_deny_entry_itself_still_matches() {
+        // A trailing dot on the *configured* deny entry should normalize the
+        // same way as a trailing dot on the incoming host.
+        let filter = HostFilter::allow_all().with_denied_hosts(&["evil.com.".to_string()]);
+        let result = filter.check_host("evil.com", &public_ip());
+        assert!(!result.is_allowed());
+    }
+
+    #[test]
+    fn test_unicode_and_punycode_deny_entries_are_equivalent() {
+        // Denying the Unicode form must also deny requests spelled in punycode.
+        let filter = HostFilter::allow_all().with_denied_hosts(&["münchen.de".to_string()]);
+        let result = filter.check_host("xn--mnchen-3ya.de", &public_ip());
+        assert!(!result.is_allowed());
+
+        // And denying the punycode form must also deny the Unicode spelling.
+        let filter = HostFilter::allow_all().with_denied_hosts(&["xn--mnchen-3ya.de".to_string()]);
+        let result = filter.check_host("münchen.de", &public_ip());
+        assert!(!result.is_allowed());
+    }
+
+    #[test]
+    fn test_unicode_dns_label_separators_normalize_like_dot() {
+        // U+3002 IDEOGRAPHIC FULL STOP is DNS-equivalent to '.'.
+        let filter = HostFilter::allow_all().with_denied_hosts(&["evil.com".to_string()]);
+        let result = filter.check_host("evil\u{3002}com", &public_ip());
+        assert!(!result.is_allowed());
+    }
+
+    #[test]
+    fn test_trailing_unicode_label_separator_bypass_on_metadata_deny() {
+        // Trailing U+3002 only becomes a dot after domain_to_ascii runs.
+        let filter = HostFilter::allow_all();
+        let result = filter.check_host("metadata.google.internal\u{3002}", &public_ip());
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+    }
+
+    #[test]
+    fn test_embedded_nul_byte_fails_closed() {
+        // A NUL byte could desync a resolver that truncates C strings at it.
+        let filter = HostFilter::allow_all();
+        let result = filter.check_host("metadata.google.internal\0", &public_ip());
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyNotAllowed { .. }));
+    }
+
+    #[test]
+    fn test_control_characters_fail_closed() {
+        let filter = HostFilter::allow_all();
+        for host in ["a\tb.com", "a\nb.com", "a\u{7f}b.com", "a\u{1}b.com"] {
+            let result = filter.check_host(host, &public_ip());
+            assert!(!result.is_allowed(), "host {host:?} should fail closed");
+        }
+    }
+
+    #[test]
+    fn test_malformed_punycode_host_fails_closed() {
+        let filter = HostFilter::allow_all();
+        let result = filter.check_host("xn--zz", &public_ip());
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyNotAllowed { .. }));
+    }
+
+    #[test]
+    fn test_trailing_dot_does_not_break_wildcard_allow() {
+        let filter = HostFilter::new(&["*.googleapis.com".to_string()]);
+        let result = filter.check_host("storage.googleapis.com.", &public_ip());
+        assert!(result.is_allowed());
     }
 }
