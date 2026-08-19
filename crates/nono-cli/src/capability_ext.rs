@@ -645,6 +645,9 @@ impl CapabilitySetExt for CapabilitySet {
         for port in &args.allow_port {
             caps.add_localhost_port(*port);
         }
+        for &(start, end) in &args.allow_port_range {
+            caps.add_localhost_port_range(start, end)?;
+        }
 
         // Outbound TCP connect port allowlist (Linux Landlock V4+ only)
         #[cfg(target_os = "macos")]
@@ -1263,6 +1266,9 @@ fn add_cli_overrides(
     // Localhost IPC ports from CLI
     for port in &args.allow_port {
         caps.add_localhost_port(*port);
+    }
+    for &(start, end) in &args.allow_port_range {
+        caps.add_localhost_port_range(start, end)?;
     }
 
     // Outbound TCP connect port allowlist from CLI (Linux Landlock V4+ only)
