@@ -83,12 +83,18 @@ impl FilterResult {
     }
 
     /// A human-readable reason for the decision
+    ///
+    /// The host is untrusted, attacker-controlled input (it may not even have
+    /// passed [`normalize_host`]), and this string is printed directly to
+    /// terminals/logs by callers. Control characters (including the ESC that
+    /// begins an ANSI escape sequence) are stripped so a malicious hostname
+    /// can't spoof or hijack terminal output.
     #[must_use]
     pub fn reason(&self) -> String {
         match self {
             FilterResult::Allow => "allowed by host filter".to_string(),
             FilterResult::DenyHost { host } => {
-                format!("host {} is in the deny list", host)
+                format!("host {} is in the deny list", sanitize_for_display(host))
             }
             FilterResult::DenyLinkLocal { ip } => {
                 format!(
@@ -97,10 +103,20 @@ impl FilterResult {
                 )
             }
             FilterResult::DenyNotAllowed { host } => {
-                format!("host {} is not in the allowlist", host)
+                format!(
+                    "host {} is not in the allowlist",
+                    sanitize_for_display(host)
+                )
             }
         }
     }
+}
+
+/// Strip control characters (including ESC, which begins ANSI/CSI escape
+/// sequences) from untrusted text before it is embedded in a
+/// terminal-displayed or logged string.
+fn sanitize_for_display(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Check if an IP address is in the link-local range.
@@ -566,6 +582,24 @@ mod tests {
             host: "evil.com".to_string(),
         };
         assert!(deny.reason().contains("evil.com"));
+    }
+
+    #[test]
+    fn test_filter_result_reason_strips_terminal_escape_sequences() {
+        // A malicious hostname could smuggle ANSI escapes to spoof/hijack
+        // terminal output when the reason is printed by callers.
+        let deny = FilterResult::DenyNotAllowed {
+            host: "evil\x1b[31mFAKE ADMIN PROMPT\x1b[0m.com".to_string(),
+        };
+        let reason = deny.reason();
+        assert!(!reason.contains('\x1b'));
+        assert!(reason.contains("evil"));
+        assert!(reason.contains("FAKE ADMIN PROMPT"));
+
+        let deny_host = FilterResult::DenyHost {
+            host: "\x07evil.com".to_string(),
+        };
+        assert!(!deny_host.reason().contains('\x07'));
 
         let link_local = FilterResult::DenyLinkLocal {
             ip: IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
