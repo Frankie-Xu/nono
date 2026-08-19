@@ -672,7 +672,7 @@ mod tests {
         mark_network_audit_disabled(&mut blocked);
         assert!(matches!(blocked, NetworkIntent::BlockAll));
 
-        let mut proxy = NetworkIntent::ProxyFiltered(Box::new(ProxyLaunchOptions::default()));
+        let mut proxy = NetworkIntent::ProxyFiltered(Box::default());
         mark_network_audit_disabled(&mut proxy);
         assert!(
             proxy
