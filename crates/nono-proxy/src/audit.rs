@@ -571,4 +571,116 @@ mod tests {
         assert_eq!(event.path.as_deref(), Some("/v1/tasks/123/comments"));
         assert_eq!(event.reason.as_deref(), Some("approval required"));
     }
+
+    #[test]
+    fn enabled_buffer_keeps_cap_and_warns_on_overflow() {
+        let log = new_audit_log();
+        let warns = capture_warns(|| {
+            for _ in 0..=MAX_AUDIT_EVENTS {
+                log_allowed(
+                    Some(&log),
+                    ProxyMode::Connect,
+                    &EventContext::default(),
+                    "api.example.com",
+                    443,
+                    "CONNECT",
+                );
+            }
+        });
+
+        let events = drain_audit_events(&log);
+        assert_eq!(events.len(), MAX_AUDIT_EVENTS);
+        assert!(
+            warns
+                .iter()
+                .any(|message| message.contains("Network audit buffer full")),
+            "overflow must emit the buffer-full warning, got {warns:?}"
+        );
+    }
+
+    #[test]
+    fn disabled_sink_does_not_buffer_or_warn() {
+        let warns = capture_warns(|| {
+            for _ in 0..=MAX_AUDIT_EVENTS {
+                log_allowed(
+                    None,
+                    ProxyMode::Connect,
+                    &EventContext::default(),
+                    "api.example.com",
+                    443,
+                    "CONNECT",
+                );
+            }
+        });
+
+        assert!(
+            warns
+                .iter()
+                .all(|message| !message.contains("Network audit buffer full")),
+            "disabled sink must not emit buffer-full warnings, got {warns:?}"
+        );
+    }
+
+    fn capture_warns(f: impl FnOnce()) -> Vec<String> {
+        let subscriber = WarnRecorder::default();
+        let messages = subscriber.messages.clone();
+        tracing::subscriber::with_default(subscriber, f);
+        messages
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    #[derive(Clone, Default)]
+    struct WarnRecorder {
+        messages: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for WarnRecorder {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = MessageVisitor::default();
+            event.record(&mut visitor);
+            if visitor.message.is_empty() {
+                return;
+            }
+            if let Ok(mut messages) = self.messages.lock() {
+                messages.push(visitor.message);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[derive(Default)]
+    struct MessageVisitor {
+        message: String,
+    }
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            }
+        }
+    }
 }

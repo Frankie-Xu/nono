@@ -3757,6 +3757,18 @@ mod tests {
     }
 
     #[test]
+    fn test_no_audit_flag_parses() {
+        let cli = Cli::parse_from(["nono", "run", "--allow", ".", "--no-audit", "echo", "hello"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.no_audit);
+                assert!(!args.no_audit_integrity);
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
     fn test_no_audit_integrity_flag_parses() {
         let cli = Cli::parse_from([
             "nono",

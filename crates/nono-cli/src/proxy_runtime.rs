@@ -1600,6 +1600,7 @@ pub(crate) fn prepare_proxy_launch_options(
         credential_routes: prepared.credential_routes.clone(),
         enable_h2: prepared.allow_http2_requested,
         no_proxy,
+        audit_disabled: false,
     };
 
     // Infra-only flags make no sense without an activating proxy feature.
@@ -2461,6 +2462,7 @@ pub(crate) fn build_proxy_config_from_flags(
     proxy_config.leaf_validity = proxy.proxy_leaf_validity;
     proxy_config.enable_h2 = proxy.enable_h2;
     proxy_config.no_proxy = proxy.no_proxy.clone();
+    proxy_config.enable_network_audit = !proxy.audit_disabled;
     synthesize_credential_provider_proxy_config(proxy, &mut proxy_config)?;
     if !proxy_config.oauth_capture.is_empty() {
         proxy_config.oauth_capture_store_path = Some(
@@ -3338,6 +3340,42 @@ mod tests {
         assert!(
             !config.strict_filter,
             "strict_filter must default off when not set"
+        );
+    }
+
+    #[test]
+    fn test_build_proxy_config_network_audit_on_by_default() {
+        let proxy = ProxyLaunchOptions::default();
+        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+        assert!(
+            config.enable_network_audit,
+            "network audit must stay enabled unless --no-audit is set"
+        );
+        assert!(
+            config.require_auth,
+            "disabling audit must not be coupled to proxy auth"
+        );
+    }
+
+    #[test]
+    fn test_build_proxy_config_no_audit_disables_buffer_not_policy() {
+        let proxy = ProxyLaunchOptions {
+            audit_disabled: true,
+            strict_filter: true,
+            ..ProxyLaunchOptions::default()
+        };
+        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+        assert!(
+            !config.enable_network_audit,
+            "--no-audit must disable the network audit buffer"
+        );
+        assert!(
+            config.strict_filter,
+            "disabling audit must not relax strict host filtering"
+        );
+        assert!(
+            config.require_auth,
+            "disabling audit must not disable proxy token auth"
         );
     }
 

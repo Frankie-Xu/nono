@@ -240,8 +240,8 @@ pub struct ProxyHandle {
     pub port: u16,
     /// Session token for client authentication
     pub token: Zeroizing<String>,
-    /// Shared in-memory network audit log
-    audit_log: audit::SharedAuditLog,
+    /// Shared in-memory network audit log. `None` when network audit is disabled.
+    audit_log: Option<audit::SharedAuditLog>,
     /// Send `true` to trigger graceful shutdown
     shutdown_tx: watch::Sender<bool>,
     /// Route prefixes that have credentials actually loaded.
@@ -278,9 +278,20 @@ impl ProxyHandle {
     }
 
     /// Drain and return collected network audit events.
+    ///
+    /// Returns an empty vec when network audit was disabled at start.
     #[must_use]
     pub fn drain_audit_events(&self) -> Vec<nono::undo::NetworkAuditEvent> {
-        audit::drain_audit_events(&self.audit_log)
+        match self.audit_log.as_ref() {
+            Some(audit_log) => audit::drain_audit_events(audit_log),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether this proxy allocated the in-memory network audit buffer.
+    #[must_use]
+    pub fn network_audit_enabled(&self) -> bool {
+        self.audit_log.is_some()
     }
 
     /// Path to the TLS-intercept trust bundle, when interception is active.
@@ -872,7 +883,8 @@ struct ProxyState {
     /// Active connection count for connection limiting.
     active_connections: AtomicUsize,
     /// Shared network audit log for this proxy session.
-    audit_log: audit::SharedAuditLog,
+    /// `None` when `ProxyConfig.enable_network_audit` is false.
+    audit_log: Option<audit::SharedAuditLog>,
     /// Optional approval backend registry for L7 endpoint-policy approve routes.
     approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
     /// Optional supervisor-backed capture backend for command-backed credentials.
@@ -1097,7 +1109,11 @@ pub async fn start_with_nonce_resolver(
 
     // Shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let audit_log = audit::new_audit_log();
+    let audit_log = if config.enable_network_audit {
+        Some(audit::new_audit_log())
+    } else {
+        None
+    };
 
     // Compute NO_PROXY hosts: allowed_hosts that can be reached via
     // direct TCP connections (i.e. their port is in direct_connect_ports).
@@ -1246,7 +1262,7 @@ pub async fn start_with_nonce_resolver(
         upstream_pool,
         tls_connector_h2,
         active_connections: AtomicUsize::new(0),
-        audit_log: Arc::clone(&audit_log),
+        audit_log: audit_log.clone(),
         approval_backends,
         credential_capture_backend,
         nonce_resolver: effective_nonce_resolver,
@@ -1499,7 +1515,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                         host, port, e
                                     );
                                     audit::log_denied(
-                                        Some(&state.audit_log),
+                                        state.audit_log.as_ref(),
                                         audit::ProxyMode::ConnectIntercept,
                                         &audit::EventContext {
                                             route_id,
@@ -1595,7 +1611,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                          section from the external proxy config or \
                                          wait for a future release";
                                     audit::log_denied(
-                                        Some(&state.audit_log),
+                                        state.audit_log.as_ref(),
                                         audit::ProxyMode::ConnectIntercept,
                                         &audit::EventContext {
                                             route_id,
@@ -1677,7 +1693,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                             tls_connector: &state.tls_connector,
                             tls_connector_h2: &tls_connector_h2,
                             filter: &state.filter,
-                            audit_log: Some(&state.audit_log),
+                            audit_log: state.audit_log.as_ref(),
                             upstream_proxy,
                             approval_backends: state.approval_backends.clone(),
                             credential_capture_backend: state.credential_capture_backend.clone(),
@@ -1695,7 +1711,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                             authority
                         );
                         audit::log_denied(
-                            Some(&state.audit_log),
+                            state.audit_log.as_ref(),
                             audit::ProxyMode::Connect,
                             &audit::EventContext {
                                 route_id,
@@ -1752,7 +1768,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &state.session_token,
                 state.config.require_auth,
                 ext_config,
-                Some(&state.audit_log),
+                state.audit_log.as_ref(),
             )
             .await
         } else if state.config.external_proxy.is_some() {
@@ -1772,7 +1788,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &state.session_token,
                 &header_bytes,
                 connect_auth_mode,
-                Some(&state.audit_log),
+                state.audit_log.as_ref(),
             )
             .await
         } else {
@@ -1783,7 +1799,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &state.session_token,
                 &header_bytes,
                 connect_auth_mode,
-                Some(&state.audit_log),
+                state.audit_log.as_ref(),
             )
             .await
         }
@@ -1814,7 +1830,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             tls_connector: &state.tls_connector,
             default_tls_config: &state.default_tls_config,
             upstream_pool: &state.upstream_pool,
-            audit_log: Some(&state.audit_log),
+            audit_log: state.audit_log.as_ref(),
             approval_backends: state.approval_backends.clone(),
             credential_capture_backend: state.credential_capture_backend.clone(),
         };
@@ -1826,7 +1842,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
         if !check.result.is_allowed() {
             let reason = check.result.reason();
             audit::log_denied(
-                Some(&state.audit_log),
+                state.audit_log.as_ref(),
                 audit::ProxyMode::Connect,
                 &audit::EventContext {
                     denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
@@ -1905,7 +1921,7 @@ async fn handle_forward_http(
         let (host, port) =
             parse_non_connect_target(first_line).unwrap_or_else(|_| ("unknown".to_string(), 0));
         audit::log_denied(
-            Some(&state.audit_log),
+            state.audit_log.as_ref(),
             audit::ProxyMode::Reverse,
             &audit::EventContext {
                 auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
@@ -1950,7 +1966,7 @@ async fn handle_forward_http(
             tls_connector: &state.tls_connector,
             default_tls_config: &state.default_tls_config,
             upstream_pool: &state.upstream_pool,
-            audit_log: Some(&state.audit_log),
+            audit_log: state.audit_log.as_ref(),
             approval_backends: state.approval_backends.clone(),
             credential_capture_backend: state.credential_capture_backend.clone(),
         };
@@ -1962,7 +1978,7 @@ async fn handle_forward_http(
     if !check.result.is_allowed() {
         let reason = check.result.reason();
         audit::log_denied(
-            Some(&state.audit_log),
+            state.audit_log.as_ref(),
             audit::ProxyMode::Reverse,
             &audit::EventContext {
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
@@ -2038,7 +2054,7 @@ async fn handle_forward_http(
                      implemented; remove the auth section from the external proxy \
                      config or wait for a future release";
                 audit::log_denied(
-                    Some(&state.audit_log),
+                    state.audit_log.as_ref(),
                     audit::ProxyMode::Reverse,
                     &audit::EventContext {
                         denial_category: Some(
@@ -2080,7 +2096,7 @@ async fn handle_forward_http(
     };
 
     let audit_ctx = AuditCtx {
-        log: Some(&state.audit_log),
+        log: state.audit_log.as_ref(),
         mode: audit::ProxyMode::Reverse,
         event_ctx: audit::EventContext {
             route_id: matched_route.as_deref(),
@@ -2099,7 +2115,7 @@ async fn handle_forward_http(
         Err(e) => {
             warn!("forward-http upstream connection failed: {}", e);
             audit::log_denied(
-                Some(&state.audit_log),
+                state.audit_log.as_ref(),
                 audit::ProxyMode::Reverse,
                 &audit::EventContext {
                     denial_category: Some(
@@ -2551,6 +2567,7 @@ mod tests {
             "501 upgrade response must close the connection, got: {response:?}"
         );
 
+        assert!(handle.network_audit_enabled());
         let events = handle.drain_audit_events();
         assert!(
             events.iter().any(|e| {
@@ -2558,6 +2575,44 @@ mod tests {
                     == Some(nono::undo::NetworkAuditDenialCategory::UnsupportedUpgrade)
             }),
             "expected an UnsupportedUpgrade audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_disabled_network_audit_does_not_buffer_events() {
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            enable_network_audit: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        assert!(
+            !handle.network_audit_enabled(),
+            "disabled network audit must not allocate the in-memory buffer"
+        );
+
+        let response = send_raw_request(
+            handle.port,
+            b"GET /svc/ HTTP/1.1\r\n\
+              Host: 127.0.0.1\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 501"),
+            "disabling audit must not change upgrade rejection, got: {response:?}"
+        );
+        assert!(
+            handle.drain_audit_events().is_empty(),
+            "disabled network audit must not accumulate events"
         );
 
         handle.shutdown();
@@ -2699,7 +2754,7 @@ mod tests {
             let _handle = ProxyHandle {
                 port: 12345,
                 token: Zeroizing::new("test_token".to_string()),
-                audit_log: audit::new_audit_log(),
+                audit_log: Some(audit::new_audit_log()),
                 shutdown_tx,
                 loaded_routes: std::collections::HashSet::new(),
                 no_proxy_hosts: Vec::new(),
@@ -3326,7 +3381,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("a".repeat(64)),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: vec![
@@ -3405,7 +3460,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
@@ -3469,7 +3524,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
@@ -3537,7 +3592,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             // Only "openai" was loaded; "github" credential was unavailable
             loaded_routes: ["openai".to_string()].into_iter().collect(),
@@ -3628,7 +3683,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("session_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: ["myapi".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
@@ -3690,7 +3745,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 58406,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
@@ -3792,7 +3847,7 @@ mod tests {
         let handle_no_env_var = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("phantom".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx: shutdown_tx.clone(),
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
@@ -3842,7 +3897,7 @@ mod tests {
         let handle_fixed = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("phantom".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx: shutdown_tx2,
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
@@ -3893,7 +3948,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: vec![
@@ -3932,7 +3987,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
@@ -3957,7 +4012,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
