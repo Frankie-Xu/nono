@@ -1,5 +1,87 @@
 # Changelog
 
+## [0.74.0] - 2026-08-19
+
+### Bug Fixes
+
+- *(fs)* Validate unix socket nodes and normalize landlock (#1654) ([#1654](https://github.com/nolabs-ai/nono/pull/1654))
+
+- *(net_filter)* Normalize hostnames before deny/allow-list matching (#1676) ([#1676](https://github.com/nolabs-ai/nono/pull/1676))
+
+- *(cli)* Stop leaking orphaned proxy CA Keychain items (#1674) ([#1674](https://github.com/nolabs-ai/nono/pull/1674))
+
+- *(proxy)* Check hostname allowlist before DNS resolution (#1675) ([#1675](https://github.com/nolabs-ai/nono/pull/1675))
+
+- *(proxy)* Bound per-line reads of the WebSocket upgrade response (#1617) ([#1617](https://github.com/nolabs-ai/nono/pull/1617))
+
+- *(proxy)* Honour require_auth on the plain-HTTP forward path (#1673) ([#1673](https://github.com/nolabs-ai/nono/pull/1673))
+
+- *(proxy)* Honor profiles network.tls_intercept in `nono proxy` (#1672) ([#1672](https://github.com/nolabs-ai/nono/pull/1672))
+
+- *(cli)* Preserve terminal output during capability approval (#1527) ([#1527](https://github.com/nolabs-ai/nono/pull/1527))
+
+- *(supervisor)* Enforce peer-UID check in SupervisorSocket::bind() (#1639) ([#1639](https://github.com/nolabs-ai/nono/pull/1639))
+
+- *(cli)* Union separate read and write grants for `nono why --op readwrite` (#1638) ([#1638](https://github.com/nolabs-ai/nono/pull/1638))
+
+- *(sandbox)* Allow hex-suffixed atomic-write temp files on macOS (#1637) ([#1637](https://github.com/nolabs-ai/nono/pull/1637))
+
+- *(sandbox)* Enforce proxy-only destination check on Landlock V4+ kernels (#1631) ([#1631](https://github.com/nolabs-ai/nono/pull/1631))
+
+- *(audit)* Propogate errors after unparseable ledger (#1596) ([#1596](https://github.com/nolabs-ai/nono/pull/1596))
+
+
+### Dependencies
+
+- *(deps)* Bump h2 to 0.4.16 (#1670) ([#1670](https://github.com/nolabs-ai/nono/pull/1670))
+
+- *(deps)* Bump webpki-roots from 1.0.8 to 1.0.9 (#1660) ([#1660](https://github.com/nolabs-ai/nono/pull/1660))
+
+- *(deps)* Bump libc from 0.2.186 to 0.2.189 (#1662) ([#1662](https://github.com/nolabs-ai/nono/pull/1662))
+
+- *(deps)* Bump http-body-util from 0.1.4 to 0.1.5 (#1661) ([#1661](https://github.com/nolabs-ai/nono/pull/1661))
+
+- *(deps)* Bump clap_complete from 4.6.7 to 4.6.9 (#1659) ([#1659](https://github.com/nolabs-ai/nono/pull/1659))
+
+- *(deps)* Bump jsonc-parser from 0.32.4 to 0.33.1 (#1658) ([#1658](https://github.com/nolabs-ai/nono/pull/1658))
+
+- *(deps)* Bump regex from 1.13.0 to 1.13.1 (#1615) ([#1615](https://github.com/nolabs-ai/nono/pull/1615))
+
+- *(deps)* Bump time from 0.3.53 to 0.3.55 (#1614) ([#1614](https://github.com/nolabs-ai/nono/pull/1614))
+
+- *(deps)* Bump rustls from 0.23.42 to 0.23.43 (#1612) ([#1612](https://github.com/nolabs-ai/nono/pull/1612))
+
+- *(deps)* Bump http from 1.4.2 to 1.5.0 (#1611) ([#1611](https://github.com/nolabs-ai/nono/pull/1611))
+
+- *(deps)* Bump base64 from 0.22.1 to 0.23.0 (#1609) ([#1609](https://github.com/nolabs-ai/nono/pull/1609))
+
+- *(deps)* Bump actions/attest from 4.2.1 to 4.2.2 (#1613) ([#1613](https://github.com/nolabs-ai/nono/pull/1613))
+
+
+### Documentation
+
+- Correct outdated/inaccurate sections across 4 doc pages (#1668) ([#1668](https://github.com/nolabs-ai/nono/pull/1668))
+
+
+### Features
+
+- *(profile)* Configurable approval backend for supervised-mode prompts (#1677) ([#1677](https://github.com/nolabs-ai/nono/pull/1677))
+
+- *(audit)* Surface subtool audit (#1641) ([#1641](https://github.com/nolabs-ai/nono/pull/1641))
+
+- *(remote)* Add remote session connect and ps (#1656) ([#1656](https://github.com/nolabs-ai/nono/pull/1656))
+
+- *(policy)* Allow unlink for atomic write temp files (#1657) ([#1657](https://github.com/nolabs-ai/nono/pull/1657))
+
+- *(tool-sandbox)* Caller-declared env pass-through via export_env (#1440) ([#1440](https://github.com/nolabs-ai/nono/pull/1440))
+
+
+### Refactoring
+
+- *(seccomp)* Ensure all filters include arch guard (#1636) ([#1636](https://github.com/nolabs-ai/nono/pull/1636))
+
+- *(test)* Share integration harness (#1597) ([#1597](https://github.com/nolabs-ai/nono/pull/1597))
+
 ## [0.73.0] - 2026-08-10
 
 ### Bug Fixes
