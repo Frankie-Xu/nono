@@ -1,8 +1,8 @@
 //! Async host filtering wrapping the library's [`HostFilter`](nono::HostFilter).
 //!
-//! Performs DNS resolution via `tokio::net::lookup_host()`, checks resolved
-//! IPs against the link-local range (cloud metadata SSRF protection), and
-//! validates the hostname against the cloud metadata deny list and allowlist.
+//! Checks the hostname against the allowlist/deny list before resolving DNS,
+//! then resolves and checks the resulting IPs against the link-local range
+//! (cloud metadata SSRF protection).
 
 use crate::config::{is_proxy_denied_metadata_ip, parse_host_ip_literal};
 use crate::error::Result;
@@ -68,30 +68,33 @@ impl ProxyFilter {
 
     /// Check a host against the filter with async DNS resolution.
     ///
-    /// Resolves the hostname to IP addresses, then checks all resolved IPs
-    /// against the link-local deny range (cloud metadata SSRF protection).
-    /// If any resolved IP is link-local, the request is blocked.
+    /// The allowlist/deny check runs on the hostname alone before any DNS
+    /// lookup, since resolution itself sends a query to the domain's
+    /// nameserver and would leak the hostname even for a denied host.
+    ///
+    /// Once resolved, all resolved IPs are checked against the link-local
+    /// deny range (cloud metadata SSRF / DNS rebinding protection).
     ///
     /// On success, returns both the filter result and the resolved socket
     /// addresses. Callers MUST use `resolved_addrs` to connect to the upstream
     /// instead of re-resolving the hostname, eliminating the DNS rebinding
     /// TOCTOU window.
     pub async fn check_host(&self, host: &str, port: u16) -> Result<CheckResult> {
-        if let Some(result) = proxy_metadata_filter_result(host, &[]) {
+        let pre_check = proxy_metadata_filter_result(host, &[])
+            .unwrap_or_else(|| self.check_host_result(host, port, &[]));
+
+        if !pre_check.is_allowed() {
             return Ok(CheckResult {
-                result,
+                result: pre_check,
                 resolved_addrs: Vec::new(),
             });
         }
 
-        // Resolve DNS
         let addr_str = format!("{}:{}", host, port);
         let resolved: Vec<SocketAddr> = match tokio::net::lookup_host(&addr_str).await {
             Ok(addrs) => addrs.collect(),
             Err(e) => {
                 debug!("DNS resolution failed for {}: {}", host, e);
-                // If DNS fails, we still check the hostname against deny list
-                // (cloud metadata hostnames don't need DNS resolution to be blocked)
                 Vec::new()
             }
         };
@@ -252,6 +255,45 @@ mod tests {
                 "AWS IPv6 metadata literal {host:?} must be denied"
             );
         }
+    }
+
+    #[test]
+    fn test_pre_resolution_check_denies_disallowed_host_without_ips() {
+        let filter = ProxyFilter::new(&["api.openai.com".to_string()]);
+        let result = filter.check_host_result("evil.com", 443, &[]);
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyNotAllowed { .. }));
+    }
+
+    #[test]
+    fn test_pre_resolution_check_allows_allowed_host_without_ips() {
+        let filter = ProxyFilter::new(&["api.openai.com".to_string()]);
+        let result = filter.check_host_result("api.openai.com", 443, &[]);
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_pre_resolution_check_host_port_fallback_without_ips() {
+        let filter = ProxyFilter::new(&["platform.claude.com:443".to_string()]);
+        let result = filter.check_host_result("platform.claude.com", 443, &[]);
+        assert!(result.is_allowed());
+
+        let result = filter.check_host_result("platform.claude.com", 8443, &[]);
+        assert!(!result.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_check_host_denies_disallowed_host_without_dns_resolution() {
+        // .invalid (RFC 2606) never resolves, so a hang/error here would mean
+        // DNS was attempted before the allowlist check.
+        let filter = ProxyFilter::new(&["api.openai.com".to_string()]);
+        let result = filter
+            .check_host("data-exfiltration-secret.example.invalid", 443)
+            .await
+            .unwrap();
+        assert!(!result.result.is_allowed());
+        assert!(matches!(result.result, FilterResult::DenyNotAllowed { .. }));
+        assert!(result.resolved_addrs.is_empty());
     }
 
     #[test]
