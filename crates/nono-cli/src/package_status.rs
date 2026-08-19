@@ -62,6 +62,31 @@ pub(crate) fn official_claude_pack_namespaces() -> impl Iterator<Item = &'static
     CLAUDE_PACK.namespaces()
 }
 
+/// Canonical `<namespace>/<name>` for `nono pull` reinstall hints.
+///
+/// Legacy installs under a retired namespace (e.g. `always-further/claude`)
+/// are rewritten to the current published ref (`nolabs-ai/claude`), preserving
+/// an optional `@version` suffix. Other refs pass through unchanged.
+pub(crate) fn canonical_pull_ref(pack_ref: &str) -> String {
+    for target in OFFICIAL_PACK_STATUS_TARGETS {
+        if is_official_package_ref(*target, pack_ref) {
+            let version_suffix = pack_ref
+                .split_once('@')
+                .map(|(_, version)| format!("@{version}"))
+                .unwrap_or_default();
+            return format!("{}{version_suffix}", target.key());
+        }
+    }
+
+    const LEGACY_NAMESPACE: &str = "always-further/";
+    const CURRENT_NAMESPACE: &str = "nolabs-ai/";
+    if let Some(tail) = pack_ref.strip_prefix(LEGACY_NAMESPACE) {
+        format!("{CURRENT_NAMESPACE}{tail}")
+    } else {
+        pack_ref.to_string()
+    }
+}
+
 /// Enforce official-pack status for the profile this run selected.
 ///
 /// `cli_extends` carries `--extends`, which behaves as if those bases were
@@ -366,6 +391,32 @@ mod tests {
         assert!(is_official_profile_name(CODEX_PACK, "codex"));
         assert!(!is_official_profile_name(CLAUDE_PACK, "codex"));
         assert!(!is_official_profile_name(CODEX_PACK, "claude"));
+    }
+
+    #[test]
+    fn canonical_pull_ref_rewrites_legacy_claude_namespace() {
+        assert_eq!(
+            canonical_pull_ref("always-further/claude"),
+            "nolabs-ai/claude"
+        );
+        assert_eq!(
+            canonical_pull_ref("always-further/claude@1.2.3"),
+            "nolabs-ai/claude@1.2.3"
+        );
+        assert_eq!(canonical_pull_ref("nolabs-ai/claude"), "nolabs-ai/claude");
+        assert_eq!(canonical_pull_ref("acme/widget"), "acme/widget");
+    }
+
+    #[test]
+    fn canonical_pull_ref_rewrites_other_legacy_org_packs() {
+        assert_eq!(
+            canonical_pull_ref("always-further/codex"),
+            "nolabs-ai/codex"
+        );
+        assert_eq!(
+            canonical_pull_ref("always-further/opencode"),
+            "nolabs-ai/opencode"
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::cli::SandboxArgs;
+use crate::package_status;
 use crate::{package, profile};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -124,6 +125,7 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
             )));
         }
         let (namespace, name) = (parts[0], parts[1]);
+        let pull_ref = package_status::canonical_pull_ref(pack_ref);
 
         let install_dir = package::package_install_dir(namespace, name)?;
         if !install_dir.exists() {
@@ -131,7 +133,7 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
                 "Pack '{}' declared by profile but not installed. \
                  Install it with: nono pull {}",
                 pack_ref,
-                pack_ref
+                pull_ref
             );
             continue;
         }
@@ -141,7 +143,7 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
                 package: pack_ref.clone(),
                 reason: format!(
                     "pack '{}' has no lockfile entry - reinstall with: nono pull {} --force",
-                    pack_ref, pack_ref
+                    pack_ref, pull_ref
                 ),
             }
         })?;
@@ -151,7 +153,7 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
             if !artifact_path.exists() {
                 return Err(nono::NonoError::PackageInstall(format!(
                     "pack '{}' is missing artifact '{}'. Reinstall with: nono pull {} --force",
-                    pack_ref, artifact_name, pack_ref
+                    pack_ref, artifact_name, pull_ref
                 )));
             }
 
@@ -172,7 +174,7 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
                      Expected: {}\n\
                      Found:    {}\n\
                      Reinstall with: nono pull {} --force",
-                    pack_ref, artifact_name, locked_artifact.sha256, hash, pack_ref
+                    pack_ref, artifact_name, locked_artifact.sha256, hash, pull_ref
                 )));
             }
         }
@@ -213,7 +215,7 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
                 package: pack_ref.clone(),
                 reason: format!(
                     "pack '{}' is missing .nono-trust.bundle - reinstall with: nono pull {} --force",
-                    pack_ref, pack_ref
+                    pack_ref, pull_ref
                 ),
             });
         }
@@ -226,7 +228,7 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
                 package: pack_ref.clone(),
                 reason: format!(
                     "pack '{}' has no signer identity in the lockfile - reinstall with: nono pull {} --force",
-                    pack_ref, pack_ref
+                    pack_ref, pull_ref
                 ),
             })?;
         verify_stored_bundles(&install_dir, &bundle_path, pack_ref, Some(pinned_signer))?;
@@ -246,6 +248,7 @@ fn verify_stored_bundles(
     pack_ref: &str,
     pinned_signer: Option<&str>,
 ) -> crate::Result<()> {
+    let pull_ref = package_status::canonical_pull_ref(pack_ref);
     let bundle_content = std::fs::read_to_string(bundle_path).map_err(|e| {
         nono::NonoError::PackageInstall(format!(
             "failed to read trust bundle for pack '{}': {}",
@@ -346,7 +349,7 @@ fn verify_stored_bundles(
             nono::NonoError::PackageInstall(format!(
                 "Sigstore verification failed for '{}' in pack '{}': {}\n\
                  Reinstall with: nono pull {} --force",
-                artifact_name, pack_ref, e, pack_ref
+                artifact_name, pack_ref, e, pull_ref
             ))
         })?;
 
@@ -374,7 +377,7 @@ fn verify_stored_bundles(
                     reason: format!(
                         "signer identity mismatch for '{}': bundle was signed by '{}' \
                          but lockfile pins '{}'. Reinstall with: nono pull {} --force",
-                        artifact_name, verified_uri, pinned, pack_ref
+                        artifact_name, verified_uri, pinned, pull_ref
                     ),
                 });
             }
