@@ -36,6 +36,10 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
     pub(crate) audit_signer: Option<&'a AuditSigner>,
     pub(crate) redaction_policy: &'a nono::ScrubPolicy,
+    /// Approval backend for supervised-mode filesystem/capability traps,
+    /// resolved from the profile `security.approval_backends`. `None` falls
+    /// back to the interactive terminal prompt (no behavior change).
+    pub(crate) approval_backend: Option<Arc<dyn nono::ApprovalBackend>>,
     pub(crate) silent: bool,
 }
 
@@ -216,6 +220,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         executable_identity,
         audit_signer,
         redaction_policy,
+        approval_backend: configured_approval_backend,
         silent,
     } = ctx;
 
@@ -308,11 +313,18 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     }
 
     let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
-    let approval_backend = terminal_approval::TerminalApproval;
+    // Pick who answers the file/capability approval prompts in supervised mode.
+    // If the profile set up a backend (e.g. a webhook), it answers; otherwise we
+    // ask at the terminal, exactly as before. Both live in locals that outlast
+    // `supervisor_cfg`, which only borrows the backend it uses.
+    let terminal_approval_fallback = terminal_approval::TerminalApproval;
+    let approval_backend: &dyn nono::ApprovalBackend = configured_approval_backend
+        .as_deref()
+        .unwrap_or(&terminal_approval_fallback);
     let supervisor_session_id = build_supervisor_session_id(audit_state.as_ref());
     let supervisor_cfg = exec_strategy::SupervisorConfig {
         protected_roots: protected_roots.as_paths(),
-        approval_backend: &approval_backend,
+        approval_backend,
         session_id: &supervisor_session_id,
         attach_initial_client: !session.detached_start,
         detach_sequence: session.detach_sequence.as_deref(),
