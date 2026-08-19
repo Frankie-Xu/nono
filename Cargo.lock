@@ -2740,6 +2740,7 @@ dependencies = [
  "der 0.8.1",
  "getrandom 0.4.3",
  "globset",
+ "idna",
  "ignore",
  "jsonschema",
  "keyring",
