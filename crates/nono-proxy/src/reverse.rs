@@ -1795,6 +1795,49 @@ fn validate_phantom_token(
     Err(ProxyError::InvalidToken)
 }
 
+/// Validate the phantom token from a Basic auth header (`Basic base64(user:token)`).
+///
+/// Used for credential routes with `inject_mode: "basic_auth"`. The username is
+/// ignored; only the password field is compared against the session token.
+fn validate_phantom_token_basic(
+    header_bytes: &[u8],
+    header_name: &str,
+    session_token: &Zeroizing<String>,
+) -> Result<()> {
+    let header_str = std::str::from_utf8(header_bytes).map_err(|_| ProxyError::InvalidToken)?;
+    let header_name_lower = header_name.to_lowercase();
+    const BASIC_PREFIX: &str = "basic ";
+
+    for line in header_str.lines() {
+        // RFC 7230: folded headers are obsolete; reject to prevent parser divergence.
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return Err(ProxyError::InvalidToken);
+        }
+        let lower = line.to_lowercase();
+        if lower.starts_with(&format!("{}:", header_name_lower)) {
+            let value = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+
+            let value_lower = value.to_lowercase();
+            if !value_lower.starts_with(BASIC_PREFIX) {
+                warn!(
+                    "Expected Basic auth in {} header for basic_auth route",
+                    header_name
+                );
+                return Err(ProxyError::InvalidToken);
+            }
+
+            let encoded = value[BASIC_PREFIX.len()..].trim();
+            return token::validate_basic_auth(encoded, session_token);
+        }
+    }
+
+    warn!(
+        "Missing {} header for phantom token validation",
+        header_name
+    );
+    Err(ProxyError::InvalidToken)
+}
+
 /// Filter headers, removing hop-by-hop and proxy-internal headers.
 ///
 /// Always strips:
@@ -2185,7 +2228,8 @@ fn log_upgrade_rejection(
 /// Validate phantom token based on injection mode.
 ///
 /// Different modes extract the phantom token from different locations:
-/// - `Header`/`BasicAuth`: From the auth header (Authorization, x-api-key, etc.)
+/// - `Header`: From the auth header (Bearer or bare token)
+/// - `BasicAuth`: From the auth header (`Basic base64(user:token)`)
 /// - `UrlPath`: From the URL path pattern (e.g., `/bot<token>/getMe`)
 /// - `QueryParam`: From the query parameter (e.g., `?api_key=<token>`)
 pub(crate) fn validate_phantom_token_for_mode(
@@ -2198,9 +2242,9 @@ pub(crate) fn validate_phantom_token_for_mode(
     session_token: &Zeroizing<String>,
 ) -> Result<()> {
     match mode {
-        InjectMode::Header | InjectMode::BasicAuth => {
-            // Validate from header (existing behavior)
-            validate_phantom_token(header_bytes, header_name, session_token)
+        InjectMode::Header => validate_phantom_token(header_bytes, header_name, session_token),
+        InjectMode::BasicAuth => {
+            validate_phantom_token_basic(header_bytes, header_name, session_token)
         }
         InjectMode::UrlPath => {
             // Validate from URL path
@@ -2872,6 +2916,85 @@ mod tests {
         let token = Zeroizing::new("secret123".to_string());
         let header = b"AUTHORIZATION: Bearer secret123\r\n\r\n";
         assert!(validate_phantom_token(header, "Authorization", &token).is_ok());
+    }
+
+    #[test]
+    fn test_validate_phantom_token_basic_valid() {
+        use base64::engine::general_purpose::STANDARD;
+        let token = Zeroizing::new("secret123".to_string());
+        let encoded = STANDARD.encode("user:secret123");
+        let header = format!("Authorization: Basic {encoded}\r\n\r\n");
+        assert!(validate_phantom_token_basic(header.as_bytes(), "Authorization", &token).is_ok());
+    }
+
+    #[test]
+    fn test_validate_phantom_token_basic_invalid_password() {
+        use base64::engine::general_purpose::STANDARD;
+        let token = Zeroizing::new("secret123".to_string());
+        let encoded = STANDARD.encode("user:wrong");
+        let header = format!("Authorization: Basic {encoded}\r\n\r\n");
+        assert!(validate_phantom_token_basic(header.as_bytes(), "Authorization", &token).is_err());
+    }
+
+    #[test]
+    fn test_validate_phantom_token_basic_malformed_base64() {
+        let token = Zeroizing::new("secret123".to_string());
+        let header = b"Authorization: Basic not-valid-base64!!!\r\n\r\n";
+        assert!(validate_phantom_token_basic(header, "Authorization", &token).is_err());
+    }
+
+    #[test]
+    fn test_validate_phantom_token_basic_no_colon() {
+        use base64::engine::general_purpose::STANDARD;
+        let token = Zeroizing::new("secret123".to_string());
+        let encoded = STANDARD.encode("nocolon");
+        let header = format!("Authorization: Basic {encoded}\r\n\r\n");
+        assert!(validate_phantom_token_basic(header.as_bytes(), "Authorization", &token).is_err());
+    }
+
+    #[test]
+    fn test_validate_phantom_token_for_mode_basic_auth_valid() {
+        use base64::engine::general_purpose::STANDARD;
+        let token = Zeroizing::new("secret123".to_string());
+        let encoded = STANDARD.encode("u@x:secret123");
+        let header = format!("Authorization: Basic {encoded}\r\n\r\n");
+        assert!(
+            validate_phantom_token_for_mode(
+                &InjectMode::BasicAuth,
+                header.as_bytes(),
+                "/user",
+                "Authorization",
+                None,
+                None,
+                &token,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_phantom_token_for_mode_header_bearer_regression() {
+        let token = Zeroizing::new("secret123".to_string());
+        let header = b"Authorization: Bearer secret123\r\n\r\n";
+        assert!(
+            validate_phantom_token_for_mode(
+                &InjectMode::Header,
+                header,
+                "/user",
+                "Authorization",
+                None,
+                None,
+                &token,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_phantom_token_basic_rejects_bearer() {
+        let token = Zeroizing::new("secret123".to_string());
+        let header = b"Authorization: Bearer secret123\r\n\r\n";
+        assert!(validate_phantom_token_basic(header, "Authorization", &token).is_err());
     }
 
     #[test]
