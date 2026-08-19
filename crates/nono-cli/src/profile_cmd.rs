@@ -1130,6 +1130,24 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         }
     }
 
+    // Command policies (merged tool-sandbox mediation config).
+    if let Some(cp) = &profile.command_policies
+        && !cp.commands.is_empty()
+    {
+        println!();
+        println!("  {}", theme::fg("Command policies:", t.subtext).bold());
+        for name in cp.commands.keys() {
+            println!("    {}", theme::fg(name, t.text));
+        }
+        println!(
+            "    {}",
+            theme::fg(
+                "Use --json for the full command_policies structure.",
+                t.subtext
+            )
+        );
+    }
+
     // Workdir
     if profile.workdir.access != WorkdirAccess::None {
         println!();
@@ -1365,6 +1383,13 @@ fn profile_to_json(
 
     if !profile.unsafe_macos_seatbelt_rules.is_empty() {
         val["unsafe_macos_seatbelt_rules"] = serde_json::json!(profile.unsafe_macos_seatbelt_rules);
+    }
+
+    // Resolved tool-sandbox mediation config (merged through extends).
+    if let Some(ref cp) = profile.command_policies
+        && let Ok(v) = serde_json::to_value(cp)
+    {
+        val["command_policies"] = v;
     }
 
     val
@@ -3913,6 +3938,64 @@ mod tests {
                 "$XDG_RUNTIME_DIR/base/bind-tree",
                 "$XDG_RUNTIME_DIR/child/bind-tree"
             ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_to_json_includes_merged_command_policies()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("base.json"),
+            r#"{
+                "meta": { "name": "base" },
+                "command_policies": {
+                    "commands": {
+                        "git": {
+                            "can_use": ["node"]
+                        }
+                    }
+                }
+            }"#,
+        )?;
+        let child_path = dir.path().join("child.json");
+        std::fs::write(
+            &child_path,
+            r#"{
+                "extends": "base",
+                "meta": { "name": "child" },
+                "command_policies": {
+                    "commands": {
+                        "node": {},
+                        "npm": {}
+                    }
+                }
+            }"#,
+        )?;
+
+        let profile = profile::load_profile_from_path(&child_path)?;
+        let value = profile_to_json("child", &profile, &Some(vec!["base".to_string()]));
+
+        let commands = value["command_policies"]["commands"]
+            .as_object()
+            .expect("command_policies.commands object");
+        assert!(
+            commands.contains_key("git"),
+            "merged profile should inherit git"
+        );
+        assert!(
+            commands.contains_key("node"),
+            "merged profile should include node"
+        );
+        assert!(
+            commands.contains_key("npm"),
+            "merged profile should include npm"
+        );
+        assert_eq!(
+            commands["git"]["can_use"],
+            serde_json::json!(["node"]),
+            "child should inherit base git.can_use"
         );
         Ok(())
     }

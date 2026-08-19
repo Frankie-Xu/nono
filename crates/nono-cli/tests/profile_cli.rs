@@ -494,3 +494,84 @@ fn test_diff_profile_json_no_debug_leaks() {
 
     assert_no_debug_tokens(&stdout, "diff default node-dev");
 }
+
+// ---------------------------------------------------------------------------
+// `profile show` — resolved command_policies (issue #1435)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_show_profile_includes_merged_command_policies() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("base.json"),
+        r#"{
+            "meta": { "name": "base" },
+            "command_policies": {
+                "commands": {
+                    "git": {}
+                }
+            }
+        }"#,
+    )
+    .expect("write base");
+
+    let child_path = dir.path().join("child.json");
+    std::fs::write(
+        &child_path,
+        r#"{
+            "extends": "base",
+            "meta": { "name": "child" },
+            "command_policies": {
+                "commands": {
+                    "npm": {}
+                }
+            }
+        }"#,
+    )
+    .expect("write child");
+
+    let child = child_path.to_str().expect("path");
+
+    let human = nono_bin()
+        .args(["profile", "show", child])
+        .output()
+        .expect("failed to run nono profile show");
+    assert!(
+        human.status.success(),
+        "expected exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human_out = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_out.contains("Command policies:"),
+        "expected Command policies section, got:\n{human_out}"
+    );
+    assert!(
+        human_out.contains("git") && human_out.contains("npm"),
+        "expected merged command names git and npm, got:\n{human_out}"
+    );
+    assert!(
+        human_out.contains("--json"),
+        "expected --json hint, got:\n{human_out}"
+    );
+
+    let json = nono_bin()
+        .args(["profile", "show", child, "--json"])
+        .output()
+        .expect("failed to run nono profile show --json");
+    assert!(
+        json.status.success(),
+        "expected exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let json_out = String::from_utf8_lossy(&json.stdout);
+    let val: serde_json::Value =
+        serde_json::from_str(&json_out).expect("expected valid JSON output");
+    let commands = val["command_policies"]["commands"]
+        .as_object()
+        .expect("command_policies.commands in JSON output");
+    assert!(
+        commands.contains_key("git") && commands.contains_key("npm"),
+        "JSON should include merged command_policies.commands keys, got: {val}"
+    );
+}
