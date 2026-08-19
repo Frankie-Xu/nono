@@ -297,6 +297,23 @@ mod tests {
     }
 
     #[test]
+    fn test_proxy_filter_denies_trailing_dot_metadata_hostname() {
+        // CONNECT-path callers pass the raw wire hostname straight through
+        // with no normalization; the filter itself must catch this.
+        let filter = ProxyFilter::allow_all();
+        let result = filter.check_host_with_ips("metadata.google.internal.", &[]);
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+    }
+
+    #[test]
+    fn test_proxy_filter_denies_unicode_form_of_punycode_deny_entry() {
+        let filter = ProxyFilter::allow_all().with_denied_hosts(&["xn--mnchen-3ya.de".to_string()]);
+        let result = filter.check_host_with_ips("münchen.de", &[]);
+        assert!(!result.is_allowed());
+    }
+
+    #[test]
     fn test_proxy_filter_denies_resolved_aws_ipv6_metadata_ip() {
         let filter = ProxyFilter::allow_all();
         let resolved = vec![IpAddr::V6(Ipv6Addr::new(
