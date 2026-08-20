@@ -1132,7 +1132,7 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
 
     // Command policies (merged tool-sandbox mediation config).
     if let Some(cp) = &profile.command_policies
-        && !cp.commands.is_empty()
+        && (!cp.commands.is_empty() || cp.has_non_command_fields())
     {
         println!();
         println!("  {}", theme::fg("Command policies:", t.subtext).bold());
@@ -3943,6 +3943,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn profile_to_json_includes_merged_command_policies()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;

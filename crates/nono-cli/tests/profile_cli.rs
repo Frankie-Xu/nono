@@ -500,6 +500,7 @@ fn test_diff_profile_json_no_debug_leaks() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::unwrap_used)]
 fn test_show_profile_includes_merged_command_policies() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
