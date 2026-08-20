@@ -197,7 +197,7 @@ fn load_preloaded_ca(
 /// proxy) — matching `proxy_runtime::resolve_effective_proxy_settings`.
 fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
     let loaded = match args.profile {
-        Some(ref name) => Some(profile::load_profile(name)?),
+        Some(ref name) => Some(profile::load_profile_with_extends(name, &args.extends)?),
         None => None,
     };
     let network = loaded.as_ref().map(|p| &p.network);
@@ -582,6 +582,79 @@ mod tests {
         let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
         let opts = build_launch_options(&args).expect("profile with allow_http2 is valid");
         assert!(opts.enable_h2);
+    }
+
+    #[test]
+    fn profile_extends_merges_allow_domain() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("extra-domains.json"),
+            r#"{
+                "meta": { "name": "extra-domains" },
+                "network": { "allow_domain": ["extra.example.com"] }
+            }"#,
+        )
+        .expect("write extra profile");
+        let child_path = dir.path().join("child.json");
+        std::fs::write(
+            &child_path,
+            r#"{
+                "meta": { "name": "child" },
+                "network": { "allow_domain": ["child.example.com"] }
+            }"#,
+        )
+        .expect("write child profile");
+
+        let args = parse_args(&[
+            "--profile",
+            child_path.to_str().expect("valid utf8"),
+            "--extends",
+            "extra-domains",
+        ]);
+        let opts = build_launch_options(&args).expect("profile with --extends is valid");
+        let filter = opts
+            .domain_filter
+            .expect("merged allow_domain produces domain filter");
+        let domains: Vec<&str> = filter
+            .allow_domain
+            .iter()
+            .map(crate::profile::AllowDomainEntry::domain)
+            .collect();
+        assert_eq!(
+            domains,
+            vec!["extra.example.com", "child.example.com"],
+            "CLI --extends base must merge before selected profile overrides"
+        );
+    }
+
+    #[test]
+    fn profile_without_extends_is_unchanged() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("solo.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "solo" },
+                "network": { "allow_domain": ["solo.example.com"] }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("profile without --extends is valid");
+        let filter = opts
+            .domain_filter
+            .expect("allow_domain produces domain filter");
+        let domains: Vec<&str> = filter
+            .allow_domain
+            .iter()
+            .map(crate::profile::AllowDomainEntry::domain)
+            .collect();
+        assert_eq!(domains, vec!["solo.example.com"]);
     }
 
     #[test]
