@@ -287,7 +287,7 @@ impl CommandPoliciesConfig {
         })
     }
 
-    fn has_non_command_fields(&self) -> bool {
+    pub(crate) fn has_non_command_fields(&self) -> bool {
         !self.executable_dirs.is_empty()
             || self.allow_writable_executables
             || self.entrypoint.is_some()
