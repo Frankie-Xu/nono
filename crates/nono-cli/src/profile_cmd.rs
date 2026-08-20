@@ -1139,11 +1139,12 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         for name in cp.commands.keys() {
             println!("    {}", theme::fg(name, t.text));
         }
+        println!();
         println!(
-            "    {}",
+            "  {}",
             theme::fg(
-                "Use --json for the full command_policies structure.",
-                t.subtext
+                "Hint: use --json for the full command_policies structure.",
+                t.yellow
             )
         );
     }

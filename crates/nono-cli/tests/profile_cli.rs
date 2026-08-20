@@ -495,9 +495,7 @@ fn test_diff_profile_json_no_debug_leaks() {
     assert_no_debug_tokens(&stdout, "diff default node-dev");
 }
 
-// ---------------------------------------------------------------------------
-// `profile show` — resolved command_policies (issue #1435)
-// ---------------------------------------------------------------------------
+// Merged command_policies in profile show output
 
 #[test]
 #[allow(clippy::unwrap_used)]
