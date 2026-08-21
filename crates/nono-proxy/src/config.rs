@@ -200,6 +200,15 @@ pub struct ProxyConfig {
     /// keep-alive and the CONNECT intercept only advertises HTTP/1.1 ALPN.
     #[serde(default)]
     pub enable_h2: bool,
+
+    /// Collect in-memory network audit events for later drain.
+    ///
+    /// Defaults to `true`. Set `false` when the CLI user passed `--no-audit`
+    /// so the proxy does not allocate the 4096-event buffer or emit
+    /// buffer-full warnings. Network filtering, credential injection, and
+    /// fail-closed auth are independent of this flag.
+    #[serde(default = "default_enable_network_audit")]
+    pub enable_network_audit: bool,
 }
 
 /// Pre-generated CA key material for cross-session CA reuse.
@@ -261,6 +270,7 @@ impl Default for ProxyConfig {
             ca_validity: None,
             leaf_validity: None,
             enable_h2: false,
+            enable_network_audit: default_enable_network_audit(),
         }
     }
 }
@@ -339,6 +349,10 @@ pub enum OAuthTokenRequestBodyFormat {
 
 fn default_bind_addr() -> IpAddr {
     IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+}
+
+fn default_enable_network_audit() -> bool {
+    true
 }
 
 fn default_require_auth() -> bool {
@@ -1647,6 +1661,13 @@ mod tests {
         let deserialized: ProxyConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.allowed_hosts, vec!["api.openai.com"]);
         assert_eq!(deserialized.no_proxy, vec!["redis"]);
+        assert!(deserialized.enable_network_audit);
+    }
+
+    #[test]
+    fn test_enable_network_audit_defaults_true_when_absent() {
+        let config: ProxyConfig = serde_json::from_str(r#"{"allowed_hosts":[]}"#).unwrap();
+        assert!(config.enable_network_audit);
     }
 
     #[test]
