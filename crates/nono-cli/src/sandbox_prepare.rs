@@ -1537,8 +1537,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .collect();
     print_allow_domain_port_warnings(&profile_allow_domain_strs, "profile allow_domain", silent);
     print_allow_domain_port_warnings(&args.allow_proxy, "--allow-domain", silent);
-    print_allow_domain_port_warnings(&profile_deny_domain, "profile deny_domain", silent);
-    print_allow_domain_port_warnings(&args.deny_proxy, "--deny-domain", silent);
+    // deny_domain entries keep their :port suffix through expand_proxy_deny
+    // (see its doc comment), so no "port is ignored" warning applies here.
 
     #[cfg(unix)]
     if args

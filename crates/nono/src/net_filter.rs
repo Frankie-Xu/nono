@@ -315,6 +315,38 @@ impl HostFilter {
         }
     }
 
+    /// Check only the deny list, skipping the allowlist (which a wildcard
+    /// `*` would otherwise satisfy before a port-scoped deny is checked).
+    pub fn check_deny(&self, host: &str) -> Option<FilterResult> {
+        // Infallible: deny_hosts/deny_suffixes are populated via the same
+        // fallback (normalize_entry), so a fallible lookup here could miss
+        // an entry that IDNA rejects (e.g. a host:port or IPv6 literal).
+        let lower_host = normalize_entry(host);
+
+        if self.deny_hosts.contains(&lower_host) {
+            return Some(FilterResult::DenyHost {
+                host: host.to_string(),
+            });
+        }
+
+        for suffix in &self.deny_suffixes {
+            if lower_host.ends_with(suffix.as_str()) && lower_host.len() > suffix.len() {
+                return Some(FilterResult::DenyHost {
+                    host: host.to_string(),
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Normalize a host before embedding it in a `host:port` string, so a
+    /// trailing dot can't land past where normalization looks for it.
+    #[must_use]
+    pub fn normalize_authority_host(host: &str) -> String {
+        normalize_entry(host)
+    }
+
     /// Number of allowed hosts (exact + wildcard)
     #[must_use]
     pub fn allowed_count(&self) -> usize {
@@ -564,6 +596,30 @@ mod tests {
     }
 
     #[test]
+    fn test_check_deny_matches_host_port_entry() {
+        let filter = HostFilter::allow_all().with_denied_hosts(&["127.0.0.1:8975".to_string()]);
+
+        // The deny-only check must match the exact host:port string...
+        assert!(matches!(
+            filter.check_deny("127.0.0.1:8975"),
+            Some(FilterResult::DenyHost { .. })
+        ));
+        // ...but not the bare host, since the deny entry is port-scoped.
+        assert!(filter.check_deny("127.0.0.1").is_none());
+        // ...and not an unrelated port on the same host.
+        assert!(filter.check_deny("127.0.0.1:8787").is_none());
+    }
+
+    #[test]
+    fn test_check_deny_ignores_allowlist() {
+        // check_deny only ever returns a deny verdict or None; it never
+        // consults the allowlist, unlike check_host.
+        let filter = HostFilter::new(&["good.com".to_string()]);
+        assert!(filter.check_deny("good.com").is_none());
+        assert!(filter.check_deny("anything-else.com").is_none());
+    }
+
+    #[test]
     fn test_allowed_count() {
         let filter = HostFilter::new(&[
             "api.openai.com".to_string(),
@@ -721,5 +777,17 @@ mod tests {
         let filter = HostFilter::new(&["*.googleapis.com".to_string()]);
         let result = filter.check_host("storage.googleapis.com.", &public_ip());
         assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_check_deny_matches_idna_invalid_entry() {
+        // deny_hosts stores entries via the infallible normalize_entry
+        // fallback, so check_deny must use the same fallback rather than
+        // silently treating an IDNA-invalid lookup key as "not denied".
+        let filter = HostFilter::allow_all().with_denied_hosts(&["xn--zz:443".to_string()]);
+        assert!(matches!(
+            filter.check_deny("xn--zz:443"),
+            Some(FilterResult::DenyHost { .. })
+        ));
     }
 }
