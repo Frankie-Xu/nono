@@ -56,10 +56,11 @@ Inherit from another profile by name:
 
 - Inheritance chain max depth: 10.
 - The CLI `--extends <PROFILE>` flag composes a selected `--profile` for one
-  invocation. It is repeatable and prepends its bases to the profile JSON's
-  `extends` list, preserving left-to-right merge order while keeping the
-  selected profile as the final override layer. Inherited grants can widen
-  sandbox permissions.
+  invocation on profile-consuming commands such as `nono run`, `nono wrap`,
+  `nono why`, and `nono proxy`. It is repeatable and prepends its bases to the
+  profile JSON's `extends` list, preserving left-to-right merge order while
+  keeping the selected profile as the final override layer. Inherited grants
+  can widen sandbox permissions.
 - Scalar fields: child overrides base.
 - Array fields (`groups.include`, `groups.exclude`, `commands.allow`, `commands.deny`, `filesystem.*`, `allow_domain`, `deny_domain`, `open_port`, `open_port_range`, `listen_port`, `listen_port_range`, `no_proxy`, `rollback.*`, `upstream_bypass`): child values are appended to base values and deduplicated. To remove inherited entries, use `groups.exclude` for groups; there is no mechanism to remove inherited filesystem paths. For `allow_domain` entries with endpoint rules, rules for the same domain are merged (appended) rather than replaced. `deny_domain` entries are additive — child profiles can only add more denies, never remove inherited ones.
 - Map fields (`env_credentials`, `hooks`, `custom_credentials`): child entries are merged into base; child keys override matching base keys.

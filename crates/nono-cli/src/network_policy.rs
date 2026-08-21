@@ -350,6 +350,9 @@ pub fn build_proxy_config(
 /// Expand `--deny-domain` entries: if an entry matches a group name in the
 /// network policy, expand it to the group's hosts and suffixes. Otherwise
 /// treat it as a literal hostname.
+///
+/// Unlike [`expand_proxy_allow`], `host:port` is kept intact — stripping it
+/// would widen a deny to every port on that host.
 pub fn expand_proxy_deny(policy: &NetworkPolicy, entries: &[String]) -> Vec<String> {
     let mut result = Vec::new();
     for entry in entries {
@@ -364,11 +367,7 @@ pub fn expand_proxy_deny(policy: &NetworkPolicy, entries: &[String]) -> Vec<Stri
                 result.push(wildcard);
             }
         } else {
-            let host = entry
-                .rsplit_once(':')
-                .and_then(|(h, p)| p.parse::<u16>().ok().map(|_| h))
-                .unwrap_or(entry.as_str());
-            result.push(host.to_string());
+            result.push(entry.clone());
         }
     }
     result
@@ -481,6 +480,13 @@ pub fn partition_allow_domain(
     Ok((plain_hosts, endpoint_routes))
 }
 
+/// Warn about `:port` suffixes on **allow**-side entries only.
+///
+/// `expand_proxy_allow` still strips ports (see its doc comment for the
+/// compatibility reason), so a port on an allow entry is genuinely ignored
+/// and worth flagging. Deny entries are not affected: `expand_proxy_deny`
+/// preserves the port and the filter honors it, so callers must not route
+/// `deny_domain`/`--deny-domain` entries through this function.
 pub fn collect_allow_domain_port_warnings(entries: &[String], source: &str) -> Vec<String> {
     entries
         .iter()
@@ -1499,13 +1505,55 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_proxy_deny_strips_port() {
+    fn test_expand_proxy_deny_preserves_port() {
+        // Unlike expand_proxy_allow, deny entries keep their :port suffix so
+        // the filter can deny only that port rather than the whole host.
         let json = embedded_network_policy_json();
         let policy = load_network_policy(json).unwrap();
 
         let entries = vec!["evil.com:443".to_string()];
         let denied = expand_proxy_deny(&policy, &entries);
-        assert_eq!(denied, vec!["evil.com"]);
+        assert_eq!(denied, vec!["evil.com:443"]);
+    }
+
+    #[test]
+    fn test_expand_proxy_deny_host_port_does_not_affect_other_ports() {
+        // A host:port deny must not widen to a bare-host deny that also
+        // blocks unrelated ports (e.g. a credential route on a different port).
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+
+        let entries = vec!["127.0.0.1:8975".to_string()];
+        let denied = expand_proxy_deny(&policy, &entries);
+        assert_eq!(denied, vec!["127.0.0.1:8975"]);
+        assert!(!denied.contains(&"127.0.0.1".to_string()));
+    }
+
+    #[test]
+    fn test_expand_proxy_allow_still_strips_port() {
+        // Deliberately unlike expand_proxy_deny: allow keeps matching every
+        // port on a host, for compatibility.
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+
+        let entries = vec!["evil.com:443".to_string()];
+        let allowed = expand_proxy_allow(&policy, &entries);
+        assert_eq!(allowed, vec!["evil.com"]);
+    }
+
+    #[test]
+    fn test_build_proxy_config_denied_host_port_entry_propagated() {
+        // A host:port deny entry must reach ProxyConfig.denied_hosts intact.
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+        let profile_name = policy.profiles.keys().next().unwrap().clone();
+        let resolved = resolve_network_profile(&policy, &profile_name).unwrap();
+
+        let entries = vec!["127.0.0.1:8975".to_string()];
+        let denied_hosts = expand_proxy_deny(&policy, &entries);
+        let config = build_proxy_config(&resolved, &[], &denied_hosts);
+
+        assert_eq!(config.denied_hosts, vec!["127.0.0.1:8975".to_string()]);
     }
 
     #[test]

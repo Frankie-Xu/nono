@@ -5549,9 +5549,11 @@ mod tests {
                     source,
                 })?;
         let socket_path = temp.path().join("url.sock");
-        std::fs::File::create(&socket_path).map_err(|source| NonoError::ConfigRead {
-            path: socket_path.clone(),
-            source,
+        std::os::unix::net::UnixListener::bind(&socket_path).map_err(|source| {
+            NonoError::ConfigRead {
+                path: socket_path.clone(),
+                source,
+            }
         })?;
         let socket_path =
             socket_path
@@ -5599,9 +5601,11 @@ mod tests {
                     source,
                 })?;
         let socket_path = temp.path().join("url.sock");
-        std::fs::File::create(&socket_path).map_err(|source| NonoError::ConfigRead {
-            path: socket_path.clone(),
-            source,
+        std::os::unix::net::UnixListener::bind(&socket_path).map_err(|source| {
+            NonoError::ConfigRead {
+                path: socket_path.clone(),
+                source,
+            }
         })?;
         let socket_path =
             socket_path

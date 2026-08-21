@@ -1420,7 +1420,7 @@ mod tests {
         // test output. Dry-run-style `verbose=1` path is also exercised.
         let dir = tempdir().expect("tempdir");
         let sock = dir.path().join("a.sock");
-        std::fs::write(&sock, b"").expect("create socket stub");
+        std::os::unix::net::UnixListener::bind(&sock).expect("create socket");
 
         let caps = CapabilitySet::new()
             .allow_unix_socket(&sock, UnixSocketMode::Connect)

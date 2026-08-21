@@ -45,6 +45,7 @@ globset = "0.4"
 nix = "0.31.3"
 landlock = "0.4"
 url = "2"
+idna = "1"
 getrandom = "0.4"
 base64 = "0.23"
 

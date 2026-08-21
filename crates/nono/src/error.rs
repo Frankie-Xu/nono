@@ -16,6 +16,9 @@ pub enum NonoError {
     #[error("Expected a file but got a directory: {0}")]
     ExpectedFile(PathBuf),
 
+    #[error("Expected a pathname Unix socket: {0}")]
+    ExpectedUnixSocket(PathBuf),
+
     #[error("Failed to canonicalize path {path}: {source}")]
     PathCanonicalization {
         path: PathBuf,
@@ -268,6 +271,7 @@ impl NonoError {
             Self::PathNotFound(_)
             | Self::ExpectedDirectory(_)
             | Self::ExpectedFile(_)
+            | Self::ExpectedUnixSocket(_)
             | Self::PathCanonicalization { .. }
             | Self::HashMismatch { .. }
             | Self::SessionNotFound(_)
