@@ -1,13 +1,13 @@
 //! Async host filtering wrapping the library's [`HostFilter`](nono::HostFilter).
 //!
-//! Performs DNS resolution via `tokio::net::lookup_host()`, checks resolved
-//! IPs against the link-local range (cloud metadata SSRF protection), and
-//! validates the hostname against the cloud metadata deny list and allowlist.
+//! Checks the hostname against the allowlist/deny list before resolving DNS,
+//! then resolves and checks the resulting IPs against the link-local range
+//! (cloud metadata SSRF protection).
 
 use crate::config::{is_proxy_denied_metadata_ip, parse_host_ip_literal};
 use crate::error::Result;
 use nono::net_filter::{FilterResult, HostFilter};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use tracing::debug;
 
 /// Result of a filter check including resolved socket addresses.
@@ -68,30 +68,33 @@ impl ProxyFilter {
 
     /// Check a host against the filter with async DNS resolution.
     ///
-    /// Resolves the hostname to IP addresses, then checks all resolved IPs
-    /// against the link-local deny range (cloud metadata SSRF protection).
-    /// If any resolved IP is link-local, the request is blocked.
+    /// The allowlist/deny check runs on the hostname alone before any DNS
+    /// lookup, since resolution itself sends a query to the domain's
+    /// nameserver and would leak the hostname even for a denied host.
+    ///
+    /// Once resolved, all resolved IPs are checked against the link-local
+    /// deny range (cloud metadata SSRF / DNS rebinding protection).
     ///
     /// On success, returns both the filter result and the resolved socket
     /// addresses. Callers MUST use `resolved_addrs` to connect to the upstream
     /// instead of re-resolving the hostname, eliminating the DNS rebinding
     /// TOCTOU window.
     pub async fn check_host(&self, host: &str, port: u16) -> Result<CheckResult> {
-        if let Some(result) = proxy_metadata_filter_result(host, &[]) {
+        let pre_check = proxy_metadata_filter_result(host, &[])
+            .unwrap_or_else(|| self.check_host_result(host, port, &[]));
+
+        if !pre_check.is_allowed() {
             return Ok(CheckResult {
-                result,
+                result: pre_check,
                 resolved_addrs: Vec::new(),
             });
         }
 
-        // Resolve DNS
         let addr_str = format!("{}:{}", host, port);
         let resolved: Vec<SocketAddr> = match tokio::net::lookup_host(&addr_str).await {
             Ok(addrs) => addrs.collect(),
             Err(e) => {
                 debug!("DNS resolution failed for {}: {}", host, e);
-                // If DNS fails, we still check the hostname against deny list
-                // (cloud metadata hostnames don't need DNS resolution to be blocked)
                 Vec::new()
             }
         };
@@ -120,13 +123,32 @@ impl ProxyFilter {
             .unwrap_or_else(|| self.inner.check_host(host, resolved_ips))
     }
 
+    /// Checks deny (incl. `host:port`) before the allowlist, so a wildcard
+    /// `allow_domain: ["*"]` can't shadow a port-scoped deny entry.
     fn check_host_result(&self, host: &str, port: u16, resolved_ips: &[IpAddr]) -> FilterResult {
+        // Normalize before appending the port: a raw trailing dot would land
+        // mid-string (e.g. "evil.com.:443"), past where normalization looks.
+        let normalized_host = HostFilter::normalize_authority_host(host);
+        // Bracket IPv6 literals so their embedded colons can't be mistaken
+        // for the port separator (e.g. "[::1]:8975", not "::1:8975").
+        let host_port = if normalized_host.parse::<Ipv6Addr>().is_ok() {
+            format!("[{normalized_host}]:{port}")
+        } else {
+            format!("{normalized_host}:{port}")
+        };
+
+        if let Some(deny) = self.inner.check_deny(&host_port) {
+            return deny;
+        }
+        if let Some(deny) = self.inner.check_deny(host) {
+            return deny;
+        }
+
         let result = self.inner.check_host(host, resolved_ips);
         if !matches!(result, FilterResult::DenyNotAllowed { .. }) {
             return result;
         }
 
-        let host_port = format!("{host}:{port}");
         self.inner.check_host(&host_port, resolved_ips)
     }
 
@@ -214,6 +236,58 @@ mod tests {
     }
 
     #[test]
+    fn test_proxy_filter_denied_host_port_honored_under_wildcard_allow() {
+        // A port-scoped deny must hold under a wildcard allow, without
+        // affecting other ports on the same host.
+        let filter =
+            ProxyFilter::new(&["*".to_string()]).with_denied_hosts(&["127.0.0.1:8975".to_string()]);
+        let loopback = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
+
+        let result = filter.check_host_result("127.0.0.1", 8975, &loopback);
+        assert!(!result.is_allowed(), "denied port must not be allowed");
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+
+        let result = filter.check_host_result("127.0.0.1", 8787, &loopback);
+        assert!(
+            result.is_allowed(),
+            "unrelated port on the same host must remain allowed"
+        );
+    }
+
+    #[test]
+    fn test_proxy_filter_denied_host_port_honored_for_trailing_dot_fqdn() {
+        // A trailing-dot FQDN must not bypass a port-scoped deny via
+        // unnormalized host:port construction (see check_host_result).
+        let filter =
+            ProxyFilter::new(&["*".to_string()]).with_denied_hosts(&["evil.com:443".to_string()]);
+
+        let result = filter.check_host_result("evil.com.", 443, &[]);
+        assert!(
+            !result.is_allowed(),
+            "trailing-dot form must still be denied"
+        );
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+    }
+
+    #[test]
+    fn test_proxy_filter_denied_host_port_honored_for_ipv6_literal() {
+        // An IPv6 host:port deny must match the bracketed authority form,
+        // not "::1:8975" (ambiguous with the port separator).
+        let filter =
+            ProxyFilter::new(&["*".to_string()]).with_denied_hosts(&["[::1]:8975".to_string()]);
+
+        let result = filter.check_host_result("::1", 8975, &[]);
+        assert!(!result.is_allowed(), "IPv6 host:port form must be denied");
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+
+        let result = filter.check_host_result("::1", 8787, &[]);
+        assert!(
+            result.is_allowed(),
+            "unrelated port on the same IPv6 host must remain allowed"
+        );
+    }
+
+    #[test]
     fn test_proxy_filter_allow_all() {
         let filter = ProxyFilter::allow_all();
         let public_ip = vec![IpAddr::V4(Ipv4Addr::new(104, 18, 7, 96))];
@@ -252,6 +326,62 @@ mod tests {
                 "AWS IPv6 metadata literal {host:?} must be denied"
             );
         }
+    }
+
+    #[test]
+    fn test_pre_resolution_check_denies_disallowed_host_without_ips() {
+        let filter = ProxyFilter::new(&["api.openai.com".to_string()]);
+        let result = filter.check_host_result("evil.com", 443, &[]);
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyNotAllowed { .. }));
+    }
+
+    #[test]
+    fn test_pre_resolution_check_allows_allowed_host_without_ips() {
+        let filter = ProxyFilter::new(&["api.openai.com".to_string()]);
+        let result = filter.check_host_result("api.openai.com", 443, &[]);
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_pre_resolution_check_host_port_fallback_without_ips() {
+        let filter = ProxyFilter::new(&["platform.claude.com:443".to_string()]);
+        let result = filter.check_host_result("platform.claude.com", 443, &[]);
+        assert!(result.is_allowed());
+
+        let result = filter.check_host_result("platform.claude.com", 8443, &[]);
+        assert!(!result.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_check_host_denies_disallowed_host_without_dns_resolution() {
+        // .invalid (RFC 2606) never resolves, so a hang/error here would mean
+        // DNS was attempted before the allowlist check.
+        let filter = ProxyFilter::new(&["api.openai.com".to_string()]);
+        let result = filter
+            .check_host("data-exfiltration-secret.example.invalid", 443)
+            .await
+            .unwrap();
+        assert!(!result.result.is_allowed());
+        assert!(matches!(result.result, FilterResult::DenyNotAllowed { .. }));
+        assert!(result.resolved_addrs.is_empty());
+    }
+
+    #[test]
+    fn test_proxy_filter_denies_trailing_dot_metadata_hostname() {
+        // CONNECT-path callers pass the raw wire hostname straight through
+        // with no normalization; the filter itself must catch this.
+        let filter = ProxyFilter::allow_all();
+        let result = filter.check_host_with_ips("metadata.google.internal.", &[]);
+        assert!(!result.is_allowed());
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+    }
+
+    #[test]
+    fn test_proxy_filter_denies_unicode_form_of_punycode_deny_entry() {
+        let filter = ProxyFilter::allow_all().with_denied_hosts(&["xn--mnchen-3ya.de".to_string()]);
+        let result = filter.check_host_with_ips("münchen.de", &[]);
+        assert!(!result.is_allowed());
     }
 
     #[test]

@@ -227,6 +227,7 @@ pub enum Commands {
   nono proxy --port 8080 --no-auth             # Open loopback proxy (no token required)
   nono proxy --allow-domain github.com         # Allowlist a host
   nono proxy --profile my-profile              # Load network settings from a profile
+  nono proxy -p default --extends extra-domains # Compose profile layers for this run
 ")]
     Proxy(Box<ProxyArgs>),
 
@@ -1539,6 +1540,15 @@ pub struct ProxyArgs {
         help_heading = "PROXY"
     )]
     pub profile: Option<String>,
+
+    /// Extend the selected profile with an additional base profile for this invocation
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        requires = "profile",
+        help_heading = "PROXY"
+    )]
+    pub extends: Vec<String>,
 
     /// Maximum concurrent client connections (0 = unlimited). Raise this when
     /// driving highly parallel clients such as `docker pull`, which opens many
@@ -3223,6 +3233,54 @@ mod tests {
         match cli.command {
             Commands::Why(args) => assert_eq!(args.extends, vec!["base".to_string()]),
             _ => panic!("Expected Why command"),
+        }
+    }
+
+    #[test]
+    fn test_proxy_extends_parse() {
+        let cli = Cli::parse_from([
+            "nono",
+            "proxy",
+            "--profile",
+            "default",
+            "--extends",
+            "extra-domains",
+        ]);
+        match cli.command {
+            Commands::Proxy(args) => {
+                assert_eq!(args.profile.as_deref(), Some("default"));
+                assert_eq!(args.extends, vec!["extra-domains".to_string()]);
+            }
+            _ => panic!("Expected Proxy command"),
+        }
+    }
+
+    #[test]
+    fn test_proxy_extends_requires_profile() {
+        let result = Cli::try_parse_from(["nono", "proxy", "--extends", "base"]);
+        assert!(result.is_err(), "--extends without --profile should fail");
+    }
+
+    #[test]
+    fn test_proxy_extends_repeated_preserves_order() {
+        let cli = Cli::parse_from([
+            "nono",
+            "proxy",
+            "--profile",
+            "agent",
+            "--extends",
+            "linux-host-compat",
+            "--extends",
+            "extra-domains",
+        ]);
+        match cli.command {
+            Commands::Proxy(args) => {
+                assert_eq!(
+                    args.extends,
+                    vec!["linux-host-compat".to_string(), "extra-domains".to_string()]
+                );
+            }
+            _ => panic!("Expected Proxy command"),
         }
     }
 

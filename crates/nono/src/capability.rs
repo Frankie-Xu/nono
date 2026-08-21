@@ -184,7 +184,11 @@ impl FsCapability {
         })
     }
 
-    /// Create a new single file capability, canonicalizing the path
+    /// Create a capability for one non-directory filesystem node.
+    ///
+    /// This includes regular files, device nodes, FIFOs, and pathname socket
+    /// nodes.  The capability grants filesystem access only; use
+    /// [`UnixSocketCapability`] as well to authorize AF_UNIX operations.
     ///
     /// Canonicalizes first, then checks metadata on the resolved path
     /// to avoid TOCTOU races between exists() and canonicalize().
@@ -401,8 +405,8 @@ impl<'de> Deserialize<'de> for UnixSocketCapability {
 impl UnixSocketCapability {
     /// Grant for a single socket file.
     ///
-    /// If `mode == Connect`, the path must already exist and must not be
-    /// a directory.
+    /// If `mode == Connect`, the path must already exist and identify a
+    /// pathname Unix socket.
     ///
     /// If `mode == ConnectBind`, the path may not yet exist (bind creates
     /// it). In that case the parent directory must exist; canonicalisation
@@ -411,10 +415,30 @@ impl UnixSocketCapability {
         let path = path.as_ref();
 
         let resolved = match path.canonicalize() {
-            Ok(p) if p.is_dir() => {
-                return Err(NonoError::ExpectedFile(path.to_path_buf()));
+            Ok(p) => {
+                #[cfg(not(unix))]
+                {
+                    let _ = p;
+                    return Err(NonoError::UnsupportedPlatform(
+                        "pathname Unix socket capabilities require a Unix platform".to_string(),
+                    ));
+                }
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileTypeExt;
+                    let metadata =
+                        p.metadata()
+                            .map_err(|source| NonoError::PathCanonicalization {
+                                path: path.to_path_buf(),
+                                source,
+                            })?;
+                    if !metadata.file_type().is_socket() {
+                        return Err(NonoError::ExpectedUnixSocket(path.to_path_buf()));
+                    }
+                    p
+                }
             }
-            Ok(p) => p,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // ConnectBind is allowed to grant paths that do not exist
                 // yet — bind(2) will create the socket file. Canonicalise
@@ -2189,6 +2213,7 @@ mod procfs_remap_tests {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::net::UnixListener;
     use tempfile::tempdir;
 
     #[test]
@@ -2212,6 +2237,26 @@ mod tests {
         assert_eq!(cap.access, AccessMode::Read);
         assert!(cap.resolved.is_absolute());
         assert!(cap.is_file);
+    }
+
+    #[test]
+    fn test_fs_capability_accepts_non_directory_nodes() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        let dir = tempdir().unwrap();
+        let fifo = dir.path().join("events.fifo");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let fifo_cap = FsCapability::new_file(&fifo, AccessMode::ReadWrite).unwrap();
+        assert!(fifo_cap.is_file);
+
+        let socket = dir.path().join("service.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let socket_cap = FsCapability::new_file(&socket, AccessMode::ReadWrite).unwrap();
+        assert!(socket_cap.is_file);
+
+        let device_cap = FsCapability::new_file("/dev/null", AccessMode::ReadWrite).unwrap();
+        assert!(device_cap.is_file);
     }
 
     #[test]
@@ -3337,15 +3382,57 @@ mod tests {
     }
 
     #[test]
-    fn test_unix_socket_connect_on_existing_file() {
+    fn test_unix_socket_connect_on_existing_socket() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("existing.sock");
-        fs::write(&path, b"").unwrap(); // stand-in for a real socket file
+        let _listener = UnixListener::bind(&path).unwrap();
 
         let cap = UnixSocketCapability::new_file(&path, UnixSocketMode::Connect).unwrap();
         assert_eq!(cap.mode, UnixSocketMode::Connect);
         assert!(!cap.is_directory());
         assert!(cap.resolved.is_absolute());
+    }
+
+    #[test]
+    fn test_unix_socket_file_resolves_symlink_to_socket() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("service.sock");
+        let alias = dir.path().join("service-link.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        std::os::unix::fs::symlink(&socket, &alias).unwrap();
+
+        let cap = UnixSocketCapability::new_file(&alias, UnixSocketMode::Connect).unwrap();
+        assert_eq!(cap.original, alias);
+        assert_eq!(cap.resolved, socket.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_unix_socket_file_rejects_regular_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("not-a-socket");
+        fs::write(&path, b"").unwrap();
+
+        let result = UnixSocketCapability::new_file(&path, UnixSocketMode::Connect);
+        assert!(matches!(result, Err(NonoError::ExpectedUnixSocket(_))));
+    }
+
+    #[test]
+    fn test_unix_socket_file_rejects_fifo_and_device() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        let dir = tempdir().unwrap();
+        let fifo = dir.path().join("not-a-socket.fifo");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+
+        let fifo_result = UnixSocketCapability::new_file(&fifo, UnixSocketMode::Connect);
+        assert!(matches!(fifo_result, Err(NonoError::ExpectedUnixSocket(_))));
+
+        let device_result = UnixSocketCapability::new_file("/dev/null", UnixSocketMode::Connect);
+        assert!(matches!(
+            device_result,
+            Err(NonoError::ExpectedUnixSocket(_))
+        ));
     }
 
     #[test]
@@ -3381,7 +3468,7 @@ mod tests {
 
         let result = UnixSocketCapability::new_file(dir.path(), UnixSocketMode::Connect);
         assert!(
-            matches!(result, Err(NonoError::ExpectedFile(_))),
+            matches!(result, Err(NonoError::ExpectedUnixSocket(_))),
             "new_file must reject a directory path: {result:?}"
         );
     }
@@ -3442,7 +3529,7 @@ mod tests {
     fn test_unix_socket_covers_file_exact_match() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("a.sock");
-        fs::write(&path, b"").unwrap();
+        UnixListener::bind(&path).unwrap();
         let cap = UnixSocketCapability::new_file(&path, UnixSocketMode::Connect).unwrap();
 
         // Exact match covers; anything else does not.
@@ -3506,7 +3593,7 @@ mod tests {
     fn test_unix_socket_display() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("a.sock");
-        fs::write(&path, b"").unwrap();
+        UnixListener::bind(&path).unwrap();
 
         let file_cap = UnixSocketCapability::new_file(&path, UnixSocketMode::Connect).unwrap();
         let rendered = format!("{file_cap}");
@@ -3530,7 +3617,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let a = dir.path().join("a.sock");
         let b = dir.path().join("b.sock");
-        fs::write(&a, b"").unwrap();
+        UnixListener::bind(&a).unwrap();
 
         let caps = CapabilitySet::new()
             .allow_unix_socket(&a, UnixSocketMode::Connect)
@@ -3556,7 +3643,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let connect_sock = dir.path().join("connect-only.sock");
         let bind_sock = dir.path().join("bind.sock");
-        fs::write(&connect_sock, b"").unwrap();
+        UnixListener::bind(&connect_sock).unwrap();
         // bind_sock deliberately does not exist — allow_unix_socket with
         // ConnectBind must accept that.
 
@@ -3626,7 +3713,7 @@ mod tests {
     fn test_capability_set_unix_socket_send_covered_by_connect_grant() {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("dgram.sock");
-        fs::write(&sock, b"").unwrap();
+        UnixListener::bind(&sock).unwrap();
 
         let caps = CapabilitySet::new()
             .allow_unix_socket(&sock, UnixSocketMode::Connect)
@@ -3646,7 +3733,7 @@ mod tests {
     fn test_deduplicate_unix_sockets_merges_identical_grants() {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("a.sock");
-        fs::write(&sock, b"").unwrap();
+        UnixListener::bind(&sock).unwrap();
 
         let mut caps = CapabilitySet::new()
             .allow_unix_socket(&sock, UnixSocketMode::Connect)
@@ -3665,7 +3752,7 @@ mod tests {
         // path, the retained entry ends up as ConnectBind (superset).
         let dir = tempdir().unwrap();
         let sock = dir.path().join("a.sock");
-        fs::write(&sock, b"").unwrap();
+        UnixListener::bind(&sock).unwrap();
 
         let mut caps = CapabilitySet::new()
             .allow_unix_socket(&sock, UnixSocketMode::Connect)
@@ -3686,7 +3773,7 @@ mod tests {
         // because a group/default also covers it.
         let dir = tempdir().unwrap();
         let sock = dir.path().join("a.sock");
-        fs::write(&sock, b"").unwrap();
+        UnixListener::bind(&sock).unwrap();
 
         let group_cap = UnixSocketCapability {
             original: sock.clone(),
@@ -3724,7 +3811,7 @@ mod tests {
         // different keys — both should survive.
         let dir = tempdir().unwrap();
         let sock = dir.path().join("a.sock");
-        fs::write(&sock, b"").unwrap();
+        UnixListener::bind(&sock).unwrap();
 
         let mut caps = CapabilitySet::new()
             .allow_unix_socket(&sock, UnixSocketMode::Connect)
@@ -3740,7 +3827,7 @@ mod tests {
     fn test_summary_includes_unix_sockets() {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("a.sock");
-        fs::write(&sock, b"").unwrap();
+        UnixListener::bind(&sock).unwrap();
 
         let caps = CapabilitySet::new()
             .allow_unix_socket(&sock, UnixSocketMode::Connect)

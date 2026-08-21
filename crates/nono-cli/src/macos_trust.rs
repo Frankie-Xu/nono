@@ -6,12 +6,17 @@
 //! This enables Go CLI tools (`gh`, `terraform`, etc.) that ignore
 //! `SSL_CERT_FILE` and only use `com.apple.trustd` for TLS verification.
 
+use core_foundation::base::TCFType;
+use core_foundation_sys::base::OSStatus;
 use nono::{NonoError, Result};
 use nono_proxy::config::PreloadedCa;
 use security_framework::certificate::SecCertificate;
+use security_framework::item::{ItemClass, ItemSearchOptions, Limit, Reference, SearchResult};
 use security_framework::os::macos::keychain::SecKeychain;
 use security_framework::passwords;
 use security_framework::trust_settings::{Domain, TrustSettings, TrustSettingsForCertificate};
+use security_framework_sys::base::SecCertificateRef;
+use security_framework_sys::trust_settings::{SecTrustSettingsDomain, kSecTrustSettingsDomainUser};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 use x509_parser::pem::parse_x509_pem;
@@ -168,7 +173,7 @@ fn is_user_cancelled_osstatus(code: i32) -> bool {
 }
 
 fn trust_cert(cert: &SecCertificate) -> std::result::Result<(), TrustCertError> {
-    ensure_cert_in_keychain(cert).map_err(TrustCertError::Other)?;
+    // Trust before import: a cancelled/failed prompt then leaves nothing orphaned.
     TrustSettings::new(Domain::User)
         .set_trust_settings_always(cert)
         .map_err(|e| {
@@ -179,10 +184,42 @@ fn trust_cert(cert: &SecCertificate) -> std::result::Result<(), TrustCertError> 
                     "failed to set trust settings: {e}"
                 )))
             }
-        })
+        })?;
+    if let Err(e) = ensure_cert_in_keychain(cert) {
+        // Import failed after trust succeeded — drop the now-orphaned trust settings.
+        if let Err(status) = remove_trust_settings(cert) {
+            warn!("Failed to roll back trust settings after import failure (OSStatus {status})");
+        }
+        return Err(TrustCertError::Other(e));
+    }
+    Ok(())
 }
 
-fn is_cert_trusted(cert: &SecCertificate) -> bool {
+/// Trust-settings APIs don't report keychain presence, so we search for it.
+fn find_keychain_cert(target_der: &[u8]) -> Option<SecCertificate> {
+    let results = match ItemSearchOptions::new()
+        .class(ItemClass::certificate())
+        .load_refs(true)
+        .limit(Limit::All)
+        .search()
+    {
+        Ok(results) => results,
+        Err(e) => {
+            debug!("keychain certificate search failed: {e}");
+            return None;
+        }
+    };
+    results.into_iter().find_map(|item| match item {
+        SearchResult::Ref(Reference::Certificate(c)) if c.to_der() == target_der => Some(c),
+        _ => None,
+    })
+}
+
+fn cert_in_keychain(cert: &SecCertificate) -> bool {
+    find_keychain_cert(&cert.to_der()).is_some()
+}
+
+fn trust_settings_report_trusted(cert: &SecCertificate) -> bool {
     let ts = TrustSettings::new(Domain::User);
     match ts.tls_trust_settings_for_certificate(cert) {
         Ok(Some(r)) => {
@@ -194,10 +231,7 @@ fn is_cert_trusted(cert: &SecCertificate) -> bool {
             trusted
         }
         Ok(None) => {
-            // NULL/empty trust settings means "always trust for all purposes"
-            // per Apple docs. SecTrustSettingsCopyTrustSettings returns
-            // errSecItemNotFound (Err) when the cert isn't present, so Ok(None)
-            // confirms presence + unconditional trust.
+            // Empty settings means unconditional trust, per Apple docs.
             debug!("trust store lookup: unconditionally trusted (empty settings)");
             true
         }
@@ -208,16 +242,61 @@ fn is_cert_trusted(cert: &SecCertificate) -> bool {
     }
 }
 
+/// `trustd` needs both; trust-settings alone can be an orphaned entry.
+fn cert_is_trusted(in_keychain: bool, trust_settings_trusted: bool) -> bool {
+    in_keychain && trust_settings_trusted
+}
+
+fn is_cert_trusted(cert: &SecCertificate) -> bool {
+    cert_is_trusted(cert_in_keychain(cert), trust_settings_report_trusted(cert))
+}
+
 fn remove_cert_from_keychain(cert_pem: &str) {
-    if let Ok(der) = pem_to_der(cert_pem)
-        && let Ok(cert) = SecCertificate::from_der(&der)
-        && let Err(e) = cert.delete()
-    {
+    let Ok(der) = pem_to_der(cert_pem) else {
+        warn!("Failed to parse stored CA cert PEM while removing it; skipping cleanup.");
+        return;
+    };
+    let Ok(cert) = SecCertificate::from_der(&der) else {
+        warn!("Failed to reconstruct stored CA cert while removing it; skipping cleanup.");
+        return;
+    };
+
+    match find_keychain_cert(&der) {
+        Some(keychain_cert) => {
+            if let Err(e) = keychain_cert.delete() {
+                warn!(
+                    "Failed to remove expired CA cert from keychain: {e}. \
+                     Run: security delete-certificate -c \"nono-proxy-ca\""
+                );
+            }
+        }
+        None => debug!("no matching CA cert found in keychain; nothing to remove there"),
+    }
+
+    // Separate store, keyed by content — not removed by deleting the keychain item.
+    if let Err(status) = remove_trust_settings(&cert) {
         warn!(
-            "Failed to remove expired CA cert from keychain: {e}. \
-             Run: security delete-certificate -c \"nono-proxy-ca\""
+            "Failed to remove trust-settings entry for expired CA cert (OSStatus {status}). \
+             Run: security remove-trusted-cert -d <exported-cert.pem>"
         );
     }
+}
+
+// Not wrapped by `security-framework`.
+#[cfg_attr(target_vendor = "apple", link(name = "Security", kind = "framework"))]
+unsafe extern "C" {
+    fn SecTrustSettingsRemoveTrustSettings(
+        cert_ref: SecCertificateRef,
+        domain: SecTrustSettingsDomain,
+    ) -> OSStatus;
+}
+
+fn remove_trust_settings(cert: &SecCertificate) -> std::result::Result<(), OSStatus> {
+    // SAFETY: `cert` outlives the call; the ref is borrowed, not owned.
+    let status = unsafe {
+        SecTrustSettingsRemoveTrustSettings(cert.as_concrete_TypeRef(), kSecTrustSettingsDomainUser)
+    };
+    if status == 0 { Ok(()) } else { Err(status) }
 }
 
 fn delete_existing_ca() {
@@ -299,6 +378,14 @@ mod tests {
                 .unwrap(),
             "nono-proxy-ca"
         );
+    }
+
+    #[test]
+    fn cert_is_trusted_requires_both_keychain_presence_and_trust_settings() {
+        assert!(cert_is_trusted(true, true));
+        assert!(!cert_is_trusted(true, false));
+        assert!(!cert_is_trusted(false, true)); // orphaned trust-settings entry
+        assert!(!cert_is_trusted(false, false));
     }
 
     #[test]

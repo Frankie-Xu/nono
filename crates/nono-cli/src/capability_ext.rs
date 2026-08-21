@@ -2977,7 +2977,7 @@ mod tests {
     fn test_allow_unix_socket_adds_cap_and_implied_read_fs_grant() {
         let dir = tempdir().expect("tempdir");
         let sock = dir.path().join("a.sock");
-        std::fs::write(&sock, b"").expect("create socket stub");
+        std::os::unix::net::UnixListener::bind(&sock).expect("create socket");
 
         let args = SandboxArgs {
             allow_unix_socket: vec![sock.clone()],
@@ -3000,6 +3000,23 @@ mod tests {
             .collect();
         assert_eq!(fs_matches.len(), 1);
         assert_eq!(fs_matches[0].access, AccessMode::Read);
+    }
+
+    #[test]
+    fn test_allow_unix_socket_rejects_existing_non_socket() {
+        let dir = tempdir().expect("tempdir");
+        let regular = dir.path().join("not-a-socket");
+        std::fs::write(&regular, b"data").expect("create regular file");
+        let args = SandboxArgs {
+            allow_unix_socket: vec![regular.clone()],
+            ..sandbox_args()
+        };
+
+        let error = from_args_locked(&args).expect_err("regular file must not be a socket grant");
+        assert!(
+            matches!(error, NonoError::ExpectedUnixSocket(ref path) if path == &regular),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -3095,7 +3112,7 @@ mod tests {
     fn test_allow_unix_socket_bind_existing_grants_readwrite_fs() {
         let dir = tempdir().expect("tempdir");
         let sock = dir.path().join("b.sock");
-        std::fs::write(&sock, b"").expect("create socket stub");
+        std::os::unix::net::UnixListener::bind(&sock).expect("create socket");
 
         let args = SandboxArgs {
             allow_unix_socket_bind: vec![sock.clone()],
@@ -3241,7 +3258,7 @@ mod tests {
     fn test_profile_unix_socket_field_connect_file() {
         let dir = tempdir().expect("tempdir");
         let sock = dir.path().join("a.sock");
-        std::fs::write(&sock, b"").expect("create socket stub");
+        std::os::unix::net::UnixListener::bind(&sock).expect("create socket");
         let profile = profile_with_fs_field("unix_socket", &sock.display().to_string());
 
         let (caps, _) =
@@ -3261,7 +3278,7 @@ mod tests {
     fn test_profile_unix_socket_field_connect_bind_file() {
         let dir = tempdir().expect("tempdir");
         let sock = dir.path().join("b.sock");
-        std::fs::write(&sock, b"").expect("create socket stub");
+        std::os::unix::net::UnixListener::bind(&sock).expect("create socket");
         let profile = profile_with_fs_field("unix_socket_bind", &sock.display().to_string());
 
         let (caps, _) =

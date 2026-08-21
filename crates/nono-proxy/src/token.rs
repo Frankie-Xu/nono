@@ -131,7 +131,7 @@ pub fn validate_proxy_auth(header_bytes: &[u8], session_token: &Zeroizing<String
 ///
 /// Expected format: base64("username:token"). The username is ignored;
 /// only the password portion is compared against the session token.
-fn validate_basic_auth(encoded: &str, session_token: &Zeroizing<String>) -> Result<()> {
+pub(crate) fn validate_basic_auth(encoded: &str, session_token: &Zeroizing<String>) -> Result<()> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 

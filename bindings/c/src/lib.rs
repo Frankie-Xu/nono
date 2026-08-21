@@ -98,7 +98,9 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
     match e {
         nono::NonoError::PathNotFound(_) => NonoErrorCode::ErrPathNotFound,
         nono::NonoError::ExpectedDirectory(_) => NonoErrorCode::ErrExpectedDirectory,
-        nono::NonoError::ExpectedFile(_) => NonoErrorCode::ErrExpectedFile,
+        nono::NonoError::ExpectedFile(_) | nono::NonoError::ExpectedUnixSocket(_) => {
+            NonoErrorCode::ErrExpectedFile
+        }
         nono::NonoError::PathCanonicalization { .. } => NonoErrorCode::ErrPathCanonicalization,
         nono::NonoError::NoCapabilities | nono::NonoError::NoCommand => {
             NonoErrorCode::ErrNoCapabilities

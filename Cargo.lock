@@ -2735,11 +2735,12 @@ dependencies = [
 
 [[package]]
 name = "nono"
-version = "0.73.0"
+version = "0.74.0"
 dependencies = [
  "der 0.8.1",
  "getrandom 0.4.3",
  "globset",
+ "idna",
  "ignore",
  "jsonschema",
  "keyring",
@@ -2765,7 +2766,7 @@ dependencies = [
 
 [[package]]
 name = "nono-cli"
-version = "0.73.0"
+version = "0.74.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.0",
@@ -2773,6 +2774,8 @@ dependencies = [
  "clap",
  "clap_complete",
  "colored",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
  "criterion",
  "dirs",
  "dns-lookup",
@@ -2792,6 +2795,7 @@ dependencies = [
  "rand 0.10.2",
  "regex",
  "security-framework 3.7.0",
+ "security-framework-sys",
  "semver",
  "serde",
  "serde_json",
@@ -2831,7 +2835,7 @@ dependencies = [
 
 [[package]]
 name = "nono-proxy"
-version = "0.73.0"
+version = "0.74.0"
 dependencies = [
  "aws-config",
  "aws-credential-types",
