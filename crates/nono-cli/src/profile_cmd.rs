@@ -2690,9 +2690,13 @@ fn reserved_profile_source(name: &str) -> Result<Option<&'static str>> {
 }
 
 fn verify_or_infer_base_hash(base_path: &Path, current_bytes: &[u8]) -> Result<()> {
-    match regular_file_exists(base_path, "profile draft base hash")? {
-        true => verify_base_hash(base_path, current_bytes),
-        false => {
+    // Single open: do not exists-check then read. A concurrent swap to a
+    // symlink, or a vanish between check and use, must fail closed.
+    match read_regular_file(base_path, "profile draft base hash") {
+        Ok(base_bytes) => verify_base_hash_bytes(base_path, &base_bytes, current_bytes),
+        Err(NonoError::ProfileRead { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
             // Agents often write only the draft JSON. Infer the baseline from
             // the live profile so promote can still show a diff; staleness
             // relative to an older draft-time snapshot cannot be proven.
@@ -2705,12 +2709,12 @@ fn verify_or_infer_base_hash(base_path: &Path, current_bytes: &[u8]) -> Result<(
             );
             Ok(())
         }
+        Err(err) => Err(err),
     }
 }
 
-fn verify_base_hash(base_path: &Path, current_bytes: &[u8]) -> Result<()> {
-    let base_bytes = read_regular_file(base_path, "profile draft base hash")?;
-    let provided = std::str::from_utf8(&base_bytes)
+fn verify_base_hash_bytes(base_path: &Path, base_bytes: &[u8], current_bytes: &[u8]) -> Result<()> {
+    let provided = std::str::from_utf8(base_bytes)
         .map_err(|e| NonoError::ProfileParse(format!("base hash is not UTF-8: {e}")))?
         .trim();
     if provided.len() != 64 || !provided.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -2737,10 +2741,9 @@ fn read_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
     {
         options.custom_flags(nix::libc::O_NOFOLLOW);
     }
-    let mut file = options.open(path).map_err(|e| NonoError::ProfileRead {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    let mut file = options
+        .open(path)
+        .map_err(|e| profile_file_open_error(path, label, e))?;
     let metadata = file.metadata().map_err(|e| NonoError::ProfileRead {
         path: path.to_path_buf(),
         source: e,
@@ -2758,6 +2761,20 @@ fn read_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
             source: e,
         })?;
     Ok(bytes)
+}
+
+fn profile_file_open_error(path: &Path, label: &str, error: std::io::Error) -> NonoError {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(nix::libc::ELOOP) {
+        return NonoError::ProfileParse(format!(
+            "{label} must not be a symlink: {}",
+            path.display()
+        ));
+    }
+    NonoError::ProfileRead {
+        path: path.to_path_buf(),
+        source: error,
+    }
 }
 
 fn regular_file_exists(path: &Path, label: &str) -> Result<bool> {
@@ -4248,6 +4265,40 @@ mod tests {
         assert!(result.is_ok(), "promote should succeed: {result:?}");
         let promoted = std::fs::read_to_string(&target).expect("read promoted");
         assert!(promoted.contains("/var/tmp"));
+    }
+
+    #[test]
+    fn verify_or_infer_base_hash_infers_when_file_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("agent-local.base");
+        let result = verify_or_infer_base_hash(&missing, b"current-profile");
+        assert!(
+            result.is_ok(),
+            "missing base file should infer the live profile: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_or_infer_base_hash_rejects_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let referent = dir.path().join("real.base");
+        std::fs::write(&referent, "0".repeat(64)).expect("write referent");
+        let link = dir.path().join("agent-local.base");
+        std::os::unix::fs::symlink(&referent, &link).expect("symlink");
+        let err = verify_or_infer_base_hash(&link, b"current-profile")
+            .expect_err("symlink base must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("symlink"), "expected symlink error, got {msg}");
+    }
+
+    #[test]
+    fn verify_or_infer_base_hash_accepts_matching_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let current = b"live-profile-bytes";
+        let base = dir.path().join("agent-local.base");
+        std::fs::write(&base, sha256_hex(current)).expect("write hash");
+        verify_or_infer_base_hash(&base, current).expect("matching regular file should pass");
     }
 
     #[test]
