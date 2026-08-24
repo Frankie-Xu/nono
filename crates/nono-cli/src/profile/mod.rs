@@ -3939,8 +3939,10 @@ pub(crate) fn user_profile_draft_dir() -> Result<PathBuf> {
 
 /// True when `path` is inside the user profile-drafts directory.
 ///
-/// Uses canonicalized [`Path::starts_with`] (not string prefix matching) so
-/// lookalike paths such as `profile-drafts-evil/` cannot match.
+/// `path` must already be canonical. The only caller, `load_from_file`,
+/// passes the path returned by `parse_file_backed_profile`.
+/// Uses [`Path::starts_with`] (not string prefix matching) so lookalike
+/// paths such as `profile-drafts-evil/` cannot match.
 pub(crate) fn is_under_user_profile_draft_dir(path: &Path) -> bool {
     let Ok(drafts) = user_profile_draft_dir() else {
         return false;
@@ -3949,11 +3951,7 @@ pub(crate) fn is_under_user_profile_draft_dir(path: &Path) -> bool {
         // Drafts dir missing or unreadable → nothing can be under it.
         return false;
     };
-    let canon = match path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => path.to_path_buf(),
-    };
-    canon.starts_with(&drafts_canon)
+    path.starts_with(&drafts_canon)
 }
 
 pub(crate) fn get_user_profile_draft_path(name: &str) -> Result<PathBuf> {
@@ -4793,6 +4791,68 @@ mod tests {
             assert!(
                 msg.contains("draft-only-base") && msg.contains("not found"),
                 "error should name the missing base: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn is_under_user_profile_draft_dir_matches_canonical_path() {
+        with_config_env(|config_dir| {
+            let drafts = config_dir.join("nono").join("profile-drafts");
+            std::fs::create_dir_all(&drafts).expect("drafts dir");
+            let file = drafts.join("child.json");
+            std::fs::write(&file, "{}").expect("write");
+            let canon = file.canonicalize().expect("canonicalize");
+            assert!(
+                is_under_user_profile_draft_dir(&canon),
+                "canonical draft path must match"
+            );
+        });
+    }
+
+    #[test]
+    fn is_under_user_profile_draft_dir_rejects_relative_path() {
+        with_config_env(|config_dir| {
+            let drafts = config_dir.join("nono").join("profile-drafts");
+            std::fs::create_dir_all(&drafts).expect("drafts dir");
+            std::fs::write(drafts.join("child.json"), "{}").expect("write");
+            let relative = Path::new("profile-drafts").join("child.json");
+            assert!(
+                !is_under_user_profile_draft_dir(&relative),
+                "relative path must not match; callers canonicalize first"
+            );
+        });
+    }
+
+    #[test]
+    fn draft_loaded_via_lexical_path_still_skips_sibling_context() {
+        with_config_env(|config_dir| {
+            let drafts = config_dir.join("nono").join("profile-drafts");
+            std::fs::create_dir_all(drafts.join("nested")).expect("drafts dir");
+            std::fs::write(
+                drafts.join("draft-only-base.json"),
+                r#"{
+                    "meta": { "name": "draft-only-base" },
+                    "filesystem": { "read": ["/tmp/should-not-merge"] }
+                }"#,
+            )
+            .expect("write draft-only base");
+            std::fs::write(
+                drafts.join("child.json"),
+                r#"{
+                    "extends": "draft-only-base",
+                    "meta": { "name": "child" }
+                }"#,
+            )
+            .expect("write draft child");
+
+            // `..` is not canonical; parse_file_backed_profile canonicalizes
+            // before draft-dir detection, so sibling lookup must stay skipped.
+            let lexical = drafts.join("nested").join("..").join("child.json");
+            let err = load_profile_from_path(&lexical).expect_err("must not resolve draft sibling");
+            assert!(
+                matches!(err, NonoError::ProfileInheritance(_)),
+                "expected inheritance error, got {err:?}"
             );
         });
     }
