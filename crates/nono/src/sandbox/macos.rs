@@ -1938,6 +1938,17 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_profile_blocked_without_tcp_bind_port_range_has_no_bind() {
+        let caps = CapabilitySet::new().block_network();
+        assert!(caps.tcp_bind_port_ranges().is_empty());
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(deny network*)"));
+        assert!(!profile.contains("(allow network-bind)"));
+        assert!(!profile.contains("(allow network-inbound)"));
+    }
+
+    #[test]
     fn test_generate_profile_signal_isolated_allows_same_sandbox() {
         // Isolated now emits same-sandbox rules (matching Linux behaviour)
         // to allow signaling child processes that inherited the sandbox.

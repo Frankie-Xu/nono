@@ -691,8 +691,10 @@ pub(super) enum NetworkDecision {
 ///      `proxy_port`, `proxy_bind_ports`, or within `proxy_bind_port_ranges`
 ///      (mirrors macOS ProxyOnly `open_port` outbound rules; issue #1652).
 ///    - `bind()` is allowed on `proxy_bind_ports` or within `proxy_bind_port_ranges`
-///      (loopback only). The proxy listener port is connect-only.
-///    - Non-loopback destinations are denied.
+///      regardless of bind address (Landlock also filters bind by port only).
+///      The proxy listener port is connect-only. Servers typically bind
+///      `0.0.0.0`/`::`, which is not loopback.
+///    - `connect()` to non-loopback destinations is denied.
 pub(super) fn is_allowed_loopback_tcp_bind_port(port: u16, config: &SupervisorConfig<'_>) -> bool {
     if config.proxy_bind_ports.contains(&port) {
         return true;
@@ -774,7 +776,7 @@ pub(super) fn decide_network_notification(
         }
         SYS_BIND => {
             let port = sockaddr.port;
-            let allowed = sockaddr.is_loopback && is_allowed_loopback_tcp_bind_port(port, config);
+            let allowed = is_allowed_loopback_tcp_bind_port(port, config);
             if allowed {
                 debug!("Proxy seccomp: allowing bind on port {}", port);
                 NetworkDecision::Allow
@@ -2271,6 +2273,31 @@ mod tests {
                 decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(8250), &config,),
                 NetworkDecision::Deny,
                 "declared ports must not bypass loopback restriction"
+            );
+        }
+
+        /// Regression: `listen_port` servers typically bind `0.0.0.0` (not
+        /// loopback). Declared bind grants must still allow that; connect stays
+        /// loopback-only (issue #1652).
+        #[test]
+        fn af_inet_bind_on_declared_port_allows_non_loopback() {
+            let backend = DenyAllBackend;
+            let config =
+                make_config_with_ranges(&backend, 8080, vec![9000], vec![(8250, 8255)], &[]);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_external(9000), &config),
+                NetworkDecision::Allow,
+                "bind 0.0.0.0:listen_port must be allowed"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_external(8253), &config),
+                NetworkDecision::Allow,
+                "bind 0.0.0.0:listen_port_range must be allowed"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_external(8249), &config),
+                NetworkDecision::Deny,
+                "undeclared bind port must stay denied even on 0.0.0.0"
             );
         }
 

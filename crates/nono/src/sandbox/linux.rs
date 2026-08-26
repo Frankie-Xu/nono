@@ -4919,6 +4919,28 @@ mod tests {
     }
 
     #[test]
+    fn test_seccomp_network_fallback_mode_blocked_with_tcp_bind_port_range_is_none() {
+        let caps = CapabilitySet::new()
+            .block_network()
+            .allow_tcp_bind_port_range(8000, 8100)
+            .expect("valid range");
+        assert_eq!(
+            seccomp_network_fallback_mode(&caps),
+            SeccompNetFallback::None
+        );
+    }
+
+    #[test]
+    fn test_seccomp_network_fallback_mode_blocked_without_tcp_bind_port_range_is_block_all() {
+        let caps = CapabilitySet::new().block_network();
+        assert!(caps.tcp_bind_port_ranges().is_empty());
+        assert_eq!(
+            seccomp_network_fallback_mode(&caps),
+            SeccompNetFallback::BlockAll
+        );
+    }
+
+    #[test]
     fn test_static_network_baseline_selection() {
         assert_eq!(
             static_network_baseline_filter(&CapabilitySet::new()),
