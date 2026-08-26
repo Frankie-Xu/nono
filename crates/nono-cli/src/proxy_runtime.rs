@@ -4460,7 +4460,7 @@ mod tests {
             command: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                r#"cat > "$1"; printf '%s' '{"material":{"type":"secret","value":"provider-token"}}'"#
+                r#"/bin/cat > "$1"; printf '%s' '{"material":{"type":"secret","value":"provider-token"}}'"#
                     .to_string(),
                 "provider".to_string(),
                 stdin_path.to_string_lossy().into_owned(),
