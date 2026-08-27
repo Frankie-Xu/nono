@@ -1179,6 +1179,40 @@ fn validate_profile_no_proxy(profile: &Profile) -> Result<()> {
     )
 }
 
+/// Validate `environment.allow_vars`/`deny_vars` glob patterns.
+fn validate_profile_env_var_patterns(profile: &Profile) -> Result<()> {
+    let Some(env_config) = profile.environment.as_ref() else {
+        return Ok(());
+    };
+    if let Some(allow_vars) = env_config.allow_vars.as_ref()
+        && let Some(err) = crate::exec_strategy::validate_env_var_patterns(allow_vars, "allow_vars")
+    {
+        return Err(NonoError::ProfileParse(err));
+    }
+    if !env_config.deny_vars.is_empty()
+        && let Some(err) =
+            crate::exec_strategy::validate_env_var_patterns(&env_config.deny_vars, "deny_vars")
+    {
+        return Err(NonoError::ProfileParse(err));
+    }
+    Ok(())
+}
+
+/// Validate `network.allow_domain`/`deny_domain` hostname patterns.
+fn validate_profile_domain_patterns(profile: &Profile) -> Result<()> {
+    for entry in &profile.network.allow_domain {
+        nono::net_filter::validate_host_pattern(entry.domain()).map_err(|err| {
+            NonoError::ProfileParse(format!("network.allow_domain entry invalid: {err}"))
+        })?;
+    }
+    for pattern in &profile.network.deny_domain {
+        nono::net_filter::validate_host_pattern(pattern).map_err(|err| {
+            NonoError::ProfileParse(format!("network.deny_domain entry invalid: {err}"))
+        })?;
+    }
+    Ok(())
+}
+
 #[must_use = "network.no_proxy allow_domain conflict validation result must be handled"]
 pub(crate) fn validate_no_proxy_allow_domain_conflicts(
     no_proxy: &[String],
@@ -2171,8 +2205,9 @@ pub struct RollbackConfig {
 pub struct EnvironmentConfig {
     /// Allow-list of environment variable names passed to the sandboxed process.
     ///
-    /// Supports exact names (`"PATH"`) and prefix patterns ending with `*`
-    /// (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.).
+    /// Supports exact names (`"PATH"`), and glob patterns where `*` may appear
+    /// anywhere in the name (`"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`). A bare `"*"`
+    /// matches everything.
     ///
     /// - Absent (field not written in JSON): no filter, all variables pass through.
     /// - `[]` (explicitly empty): blocks all inherited variables; only nono-injected
@@ -2185,12 +2220,18 @@ pub struct EnvironmentConfig {
 
     /// Deny-list of environment variable names stripped from the sandboxed process.
     ///
-    /// Supports exact names (`"GH_TOKEN"`) and prefix patterns ending with `*`
-    /// (`"GITHUB_*"` strips all vars starting with `GITHUB_`).
-    /// Denied vars are stripped even if they also appear in `allow_vars`.
-    /// Use this to strip specific secrets while keeping everything else inherited.
+    /// Supports the same glob syntax as `allow_vars` (`"GH_TOKEN"`, `"GITHUB_*"`,
+    /// `"*_TOKEN"`, `"*SECRET*"`). Denied vars are stripped even if they also
+    /// match `allow_vars`. Use this to strip specific secrets while keeping
+    /// everything else inherited.
     #[serde(default)]
     pub deny_vars: Vec<String>,
+
+    /// When true, `allow_vars`/`deny_vars` patterns are matched against
+    /// variable names case-insensitively (so `*token*` also matches
+    /// `JENKINS_TOKEN`, `jenkins_token`, and `Jenkins_Token`).
+    #[serde(default)]
+    pub case_insensitive_vars: bool,
 
     /// Static environment variables injected into the sandboxed process.
     ///
@@ -3149,6 +3190,8 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     {
         return Err(NonoError::ProfileParse(err));
     }
+    validate_profile_env_var_patterns(&profile)?;
+    validate_profile_domain_patterns(&profile)?;
     merge_implicit_default_groups(&mut profile)?;
     // Re-run after extends/platform overrides: base and child profiles can
     // independently add no_proxy and allow_domain entries that only conflict
@@ -3283,6 +3326,8 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     {
         return Err(NonoError::ProfileParse(err));
     }
+    validate_profile_env_var_patterns(&profile)?;
+    validate_profile_domain_patterns(&profile)?;
 
     validate_command_policies(
         profile.command_policies.as_ref(),
@@ -3783,6 +3828,11 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                     (Some(base), Some(child)) => Some(dedup_append(base, child)),
                 },
                 deny_vars: dedup_append(&base_env.deny_vars, &child_env.deny_vars),
+                // Sticky: once a base profile opts into case-insensitive
+                // matching, a child cannot silently reintroduce a
+                // case-sensitive bypass by omitting the flag.
+                case_insensitive_vars: base_env.case_insensitive_vars
+                    || child_env.case_insensitive_vars,
                 set_vars: {
                     let mut merged = base_env.set_vars.clone();
                     merged.extend(child_env.set_vars.clone());
@@ -5310,6 +5360,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 allow_vars: None,
                 deny_vars: vec!["GH_TOKEN".into()],
+                case_insensitive_vars: false,
                 set_vars: Default::default(),
             }),
             ..Default::default()
@@ -5318,6 +5369,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 allow_vars: None,
                 deny_vars: vec!["ANTHROPIC_API_KEY".into()],
+                case_insensitive_vars: false,
                 set_vars: Default::default(),
             }),
             ..Default::default()
@@ -5335,6 +5387,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 allow_vars: None,
                 deny_vars: vec!["GH_TOKEN".into(), "ANTHROPIC_API_KEY".into()],
+                case_insensitive_vars: false,
                 set_vars: Default::default(),
             }),
             ..Default::default()
@@ -5343,6 +5396,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 allow_vars: None,
                 deny_vars: vec!["ANTHROPIC_API_KEY".into()],
+                case_insensitive_vars: false,
                 set_vars: Default::default(),
             }),
             ..Default::default()
