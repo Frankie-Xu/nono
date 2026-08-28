@@ -1598,6 +1598,10 @@ where
 /// Replace a broker phantom in a header value with the real credential. Empty
 /// `allowed_credentials` authorizes by grant set, non-empty by credential name.
 /// Fail-closed: an unauthorized phantom is left raw so the upstream 401s.
+///
+/// A value with no bare `nono_<64hex>` marker falls back to the resolver's own
+/// (template-aware) rewrite: a templated phantom's visible shape carries no
+/// marker for this function's substring scan to find.
 pub(crate) fn resolve_nonce_in_header_value(
     value: &str,
     consumer: &str,
@@ -1607,7 +1611,13 @@ pub(crate) fn resolve_nonce_in_header_value(
     const NONCE_PREFIX: &str = "nono_";
     const NONCE_LEN: usize = 5 + 64; // "nono_" + 64 hex chars
 
-    let start = value.find(NONCE_PREFIX)?;
+    let Some(start) = value.find(NONCE_PREFIX) else {
+        return if allowed_credentials.is_empty() {
+            resolver.rewrite_header_value(value, consumer)
+        } else {
+            resolver.rewrite_header_value_for_credentials(value, allowed_credentials)
+        };
+    };
     let end = start.checked_add(NONCE_LEN)?;
     if end > value.len() {
         return None;
@@ -1652,10 +1662,6 @@ pub(crate) fn resolve_nonce_in_header_value(
     }
 
     Some(format!("{}{}{}", &value[..start], real_str, &value[end..]))
-}
-
-fn contains_phantom_nonce(value: &str) -> bool {
-    value.contains("nono_")
 }
 
 /// Handle the AWS SigV4 arm of an intercepted inner request.
@@ -2155,7 +2161,13 @@ fn build_websocket_upstream_request(
     }
     let nonce_consumer = service.map(|name| format!("proxy.{name}"));
     for field in filtered_headers {
-        let resolved_value = if contains_phantom_nonce(&field.value) {
+        // Ask the resolver, not a bare `nono_` scan: a templated phantom carries
+        // no marker and would otherwise be forwarded upstream unrewritten.
+        let carries_phantom = match nonce_resolver {
+            Some(resolver) => resolver.contains_phantom(&field.value),
+            None => crate::token::contains_phantom(field.value.as_bytes(), &[]),
+        };
+        let resolved_value = if carries_phantom {
             let consumer = nonce_consumer.as_deref().ok_or_else(|| {
                 ProxyError::Credential("phantom nonce has no selected route consumer".to_string())
             })?;
@@ -2198,7 +2210,6 @@ fn parse_request_line(line: &str) -> Result<(String, String, String)> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use zeroize::Zeroizing;
 
     #[test]
     fn parse_request_line_extracts_components() {
@@ -3033,9 +3044,7 @@ mod tests {
         config.alpn_protocols = vec![b"h2".to_vec()];
         tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
     }
-
-    // --- resolve_nonce_in_header_value tests ---
-
+    /// Bare-nonce resolver: exercises the trait's default `rewrite_header_value`.
     struct TestResolver {
         nonce: String,
         real: Vec<u8>,
@@ -3113,12 +3122,6 @@ mod tests {
             &resolver,
         );
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn detects_malformed_reserved_nonce_marker() {
-        assert!(contains_phantom_nonce("Bearer nono_too-short"));
-        assert!(!contains_phantom_nonce("Bearer ordinary-token"));
     }
 
     #[test]
@@ -3324,6 +3327,85 @@ mod tests {
         .unwrap();
         assert!(outbound.contains("x-session: REAL\r\n"));
         assert!(!outbound.contains(&nonce));
+    }
+
+    /// Templated resolver: its phantoms carry no `nono_` marker, so the WS path
+    /// must consult `contains_phantom` rather than scan for one.
+    struct TemplatedTestResolver {
+        templates: Vec<crate::token::PhantomTemplate>,
+        phantom: String,
+        real: Vec<u8>,
+    }
+
+    impl crate::token::NonceResolver for TemplatedTestResolver {
+        fn resolve(&self, nonce: &str, _consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
+            (nonce == self.phantom).then(|| Zeroizing::new(self.real.clone()))
+        }
+
+        fn rewrite_header_value(&self, value: &str, consumer: &str) -> Option<String> {
+            crate::token::rewrite_first_phantom(value, &self.templates, |nonce| {
+                self.resolve(nonce, consumer)
+            })
+        }
+
+        fn contains_phantom(&self, value: &str) -> bool {
+            crate::token::contains_phantom(value.as_bytes(), &self.templates)
+        }
+    }
+
+    fn templated_ws_request(phantom: &str) -> ParsedRequest {
+        ParsedRequest {
+            method: "GET".to_string(),
+            path: "/socket".to_string(),
+            version: "HTTP/1.1".to_string(),
+            header_bytes: format!(
+                "Host: chat.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nAuthorization: Bearer {phantom}\r\n"
+            )
+            .into_bytes(),
+            buffered: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn websocket_request_resolves_templated_phantom() {
+        let phantom = format!("sk-ant-oat01-{}", "a".repeat(64));
+        let resolver = TemplatedTestResolver {
+            templates: vec![crate::token::PhantomTemplate::parse("sk-ant-oat01-{}").unwrap()],
+            phantom: phantom.clone(),
+            real: b"sk-ant-oat01-REAL".to_vec(),
+        };
+        let outbound = build_websocket_upstream_request(
+            &templated_ws_request(&phantom),
+            "chat.example",
+            None,
+            Some("chat"),
+            &[],
+            Some(&resolver),
+        )
+        .unwrap();
+        assert!(outbound.contains("authorization: Bearer sk-ant-oat01-REAL\r\n"));
+        assert!(!outbound.contains(&phantom));
+    }
+
+    #[test]
+    fn websocket_request_rejects_unresolvable_templated_phantom() {
+        let phantom = format!("sk-ant-oat01-{}", "a".repeat(64));
+        let resolver = TemplatedTestResolver {
+            templates: vec![crate::token::PhantomTemplate::parse("sk-ant-oat01-{}").unwrap()],
+            phantom: format!("sk-ant-oat01-{}", "b".repeat(64)),
+            real: b"sk-ant-oat01-REAL".to_vec(),
+        };
+        assert!(
+            build_websocket_upstream_request(
+                &templated_ws_request(&phantom),
+                "chat.example",
+                None,
+                Some("chat"),
+                &[],
+                Some(&resolver),
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

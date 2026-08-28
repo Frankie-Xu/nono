@@ -205,8 +205,11 @@ fn shared_redeem_phantoms(
 }
 
 /// Like [`strip_proxy_headers`], but also redeems any phantom via
-/// `resolver`. The returned flag lets the audit event distinguish an injected
-/// credential from a bare route match.
+/// [`crate::token::NonceResolver::rewrite_header_value`] or, when
+/// `allowed_credentials` is non-empty, the route-authoritative
+/// [`crate::token::NonceResolver::rewrite_header_value_for_credentials`]. The
+/// returned flag lets the audit event distinguish an injected credential from a
+/// bare route match.
 fn strip_and_redeem_proxy_headers(
     header_bytes: &[u8],
     consumer: &str,
@@ -963,6 +966,31 @@ impl crate::token::NonceResolver for CompositeNonceResolver {
         self.external
             .as_ref()
             .and_then(|resolver| resolver.resolve_for_credentials(nonce, allowed_credentials))
+    }
+
+    fn rewrite_header_value(&self, value: &str, consumer: &str) -> Option<String> {
+        self.external
+            .as_ref()
+            .and_then(|resolver| resolver.rewrite_header_value(value, consumer))
+            .or_else(|| self.oauth.rewrite_header_value(value, consumer))
+    }
+
+    fn rewrite_header_value_for_credentials(
+        &self,
+        value: &str,
+        allowed_credentials: &[String],
+    ) -> Option<String> {
+        // Only the broker tracks credential names; OAuth-capture has none.
+        self.external.as_ref().and_then(|resolver| {
+            resolver.rewrite_header_value_for_credentials(value, allowed_credentials)
+        })
+    }
+
+    fn contains_phantom(&self, value: &str) -> bool {
+        self.external
+            .as_ref()
+            .is_some_and(|resolver| resolver.contains_phantom(value))
+            || self.oauth.contains_phantom(value)
     }
 }
 
@@ -2967,10 +2995,12 @@ mod tests {
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "access_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "refresh_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                     ],
                     request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
@@ -5070,6 +5100,57 @@ mod tests {
         assert!(
             !s.contains(&nonce),
             "phantom nonce must not reach upstream: {s:?}"
+        );
+    }
+
+    /// Resolver minting a templated phantom, as an OAuth-capture store does.
+    /// Keyed on the whole rendered phantom, which carries no `nono_` marker.
+    struct TemplatedResolver {
+        phantom: String,
+        template: crate::token::PhantomTemplate,
+        real: Vec<u8>,
+    }
+
+    impl crate::token::NonceResolver for TemplatedResolver {
+        fn resolve(&self, nonce: &str, _consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
+            (nonce == self.phantom).then(|| Zeroizing::new(self.real.clone()))
+        }
+
+        fn rewrite_header_value(&self, value: &str, consumer: &str) -> Option<String> {
+            crate::token::rewrite_first_phantom(
+                value,
+                std::slice::from_ref(&self.template),
+                |nonce| self.resolve(nonce, consumer),
+            )
+        }
+    }
+
+    /// The whole templated span must be replaced, or the prefix reaches
+    /// upstream glued to the real credential and the request 401s.
+    #[test]
+    fn strip_and_redeem_proxy_headers_redeems_templated_phantom() {
+        let template = crate::token::PhantomTemplate::parse("sk-ant-oat01-{}").unwrap();
+        let phantom = template.render(&"b".repeat(64));
+        let resolver = TemplatedResolver {
+            phantom: phantom.clone(),
+            template,
+            real: b"sk-ant-real".to_vec(),
+        };
+        let headers = format!("Authorization: Bearer {phantom}\r\n");
+        let (redeemed, swapped) =
+            strip_and_redeem_proxy_headers(headers.as_bytes(), "proxy.headroom", &[], &resolver);
+        assert!(
+            swapped,
+            "templated phantom must redeem on absolute-form path"
+        );
+        let s = String::from_utf8(redeemed).unwrap();
+        assert!(
+            s.contains("Authorization: Bearer sk-ant-real"),
+            "got: {s:?}"
+        );
+        assert!(
+            !s.contains("sk-ant-oat01-"),
+            "template prefix must not reach upstream: {s:?}"
         );
     }
 
