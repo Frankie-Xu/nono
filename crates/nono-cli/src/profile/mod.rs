@@ -1251,6 +1251,7 @@ fn custom_credential_from_manifest_entry(cred: &nono::manifest::Credential) -> C
     CustomCredentialDef {
         upstream: cred.upstream.as_str().to_string(),
         credential_key: Some(cred.source.as_str().to_string()),
+        redeem_phantoms: Vec::new(),
         auth: None,
         inject_mode,
         inject_header,
@@ -5904,6 +5905,8 @@ mod tests {
         assert_eq!(route.inject_mode, InjectMode::Header);
         assert_eq!(route.inject_header, "Authorization");
         assert_eq!(route.credential_format.as_deref(), Some("Bearer {}"));
+        // Manifest Credential has no redeem_phantoms field; do not invent names.
+        assert!(route.redeem_phantoms.is_empty());
 
         // End-to-end: resolve_credentials must accept the mapped route.
         let net_policy = crate::network_policy::load_network_policy(
