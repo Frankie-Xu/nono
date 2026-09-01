@@ -1656,21 +1656,37 @@ where
     }
 }
 
+/// Split one header line into a trimmed field name and the raw value.
+/// Missing `:` or an empty name fail closed (`None`).
+fn split_header_name_value(line: &str) -> Option<(&str, &str)> {
+    let (name, value) = line.split_once(':')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, value))
+}
+
 /// Returns true when headers declare `Transfer-Encoding: chunked`.
+///
+/// Names are split on `:` and trimmed so detection matches hop-header stripping.
 pub(crate) fn has_chunked_transfer_encoding(header_bytes: &[u8]) -> bool {
     let header_str = match std::str::from_utf8(header_bytes) {
         Ok(s) => s,
         Err(_) => return false,
     };
     for line in header_str.lines() {
-        if line.to_lowercase().starts_with("transfer-encoding:") {
-            let value = line.split_once(':').map(|(_, v)| v).unwrap_or("");
-            if value
-                .split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
-            {
-                return true;
-            }
+        let Some((name, value)) = split_header_name_value(line) else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("transfer-encoding") {
+            continue;
+        }
+        if value
+            .split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+        {
+            return true;
         }
     }
     false
@@ -2055,13 +2071,19 @@ pub(crate) fn filter_headers_for_upgrade(
 }
 
 /// Extract Content-Length value from raw headers.
+///
+/// Header names are matched after `split(':')` and trim, matching hop-header
+/// stripping. Missing `:` or a non-integer value fail closed (`None`).
 pub(crate) fn extract_content_length(header_bytes: &[u8]) -> Option<usize> {
     let header_str = std::str::from_utf8(header_bytes).ok()?;
     for line in header_str.lines() {
-        if line.to_lowercase().starts_with("content-length:") {
-            let value = line.split_once(':')?.1.trim();
-            return value.parse().ok();
+        let Some((name, value)) = split_header_name_value(line) else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
         }
+        return value.trim().parse().ok();
     }
     None
 }
@@ -3275,6 +3297,35 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_content_length_accepts_space_before_colon() {
+        let header = b"Content-Type: application/json\r\nContent-Length : 42\r\n\r\n";
+        assert_eq!(extract_content_length(header), Some(42));
+    }
+
+    #[test]
+    fn test_extract_content_length_malformed_header_fails_closed() {
+        assert_eq!(
+            extract_content_length(b"Content-Length 42\r\n\r\n"),
+            None,
+            "missing colon must not parse a length"
+        );
+        assert_eq!(
+            extract_content_length(b" : 42\r\n\r\n"),
+            None,
+            "empty name must not parse a length"
+        );
+        assert_eq!(
+            extract_content_length(b"Content-Length:\r\n\r\n"),
+            None,
+            "empty value must not parse a length"
+        );
+        assert_eq!(
+            extract_content_length(b"Content-Length: not-a-number\r\n\r\n"),
+            None
+        );
+    }
+
+    #[test]
     fn test_has_chunked_transfer_encoding() {
         let header = b"Transfer-Encoding: chunked\r\nHost: example.com\r\n\r\n";
         assert!(has_chunked_transfer_encoding(header));
@@ -3282,6 +3333,32 @@ mod tests {
         assert!(has_chunked_transfer_encoding(header));
         let header = b"Content-Type: application/json\r\n\r\n";
         assert!(!has_chunked_transfer_encoding(header));
+    }
+
+    #[test]
+    fn test_has_chunked_transfer_encoding_accepts_space_before_colon() {
+        let header = b"Transfer-Encoding : chunked\r\nHost: example.com\r\n\r\n";
+        assert!(has_chunked_transfer_encoding(header));
+        let header = b"Transfer-Encoding : gzip, chunked\r\n\r\n";
+        assert!(has_chunked_transfer_encoding(header));
+    }
+
+    #[test]
+    fn test_has_chunked_transfer_encoding_malformed_header_fails_closed() {
+        assert!(
+            !has_chunked_transfer_encoding(b"Transfer-Encoding chunked\r\n\r\n"),
+            "missing colon must not be treated as chunked"
+        );
+        assert!(
+            !has_chunked_transfer_encoding(b" : chunked\r\n\r\n"),
+            "empty name must not be treated as chunked"
+        );
+        assert!(!has_chunked_transfer_encoding(
+            b"Transfer-Encoding:\r\n\r\n"
+        ));
+        assert!(!has_chunked_transfer_encoding(
+            b"Transfer-Encoding: gzip\r\n\r\n"
+        ));
     }
 
     #[test]
@@ -3297,6 +3374,12 @@ mod tests {
         ));
         assert!(!should_reframe_with_content_length(
             b"Content-Type: text/plain\r\n\r\n"
+        ));
+        assert!(should_reframe_with_content_length(
+            b"Transfer-Encoding : chunked\r\n\r\n"
+        ));
+        assert!(should_reframe_with_content_length(
+            b"Content-Length : 0\r\n\r\n"
         ));
     }
 
