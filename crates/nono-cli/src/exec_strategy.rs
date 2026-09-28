@@ -3339,6 +3339,9 @@ fn handle_supervisor_message(
             // Set by the trust interceptor branch when an instruction file is verified.
             let mut verified_digest: Option<String> = None;
 
+            // Track whether the approval backend decision was recorded, to avoid double-recording
+            let mut backend_decision_recorded = false;
+
             let decision = if let Some(protected_root) =
                 crate::protected_paths::overlapping_protected_root(
                     &request.path,
@@ -3380,7 +3383,7 @@ fn handle_supervisor_message(
                         // Stash the verified digest for TOCTOU re-check at open time
                         verified_digest = Some(verified.digest);
                         // Instruction file verified — proceed to approval backend
-                        match request_approval_with_relay_paused(
+                        let backend_decision = match request_approval_with_relay_paused(
                             config,
                             &nono::supervisor::ApprovalRequest::from(request.clone()),
                             pty.as_deref_mut(),
@@ -3412,7 +3415,17 @@ fn handle_supervisor_message(
                                     reason: format!("Approval backend error: {e}"),
                                 }
                             }
-                        }
+                        };
+                        // Record the approval backend decision immediately, so it's captured in audit
+                        // even if file operations fail afterward.
+                        record_capability_audit(
+                            config,
+                            nono::supervisor::ApprovalRequest::from(request.clone()),
+                            decision_started,
+                            backend_decision.clone(),
+                        )?;
+                        backend_decision_recorded = true;
+                        backend_decision
                     }
                     Err(reason) => {
                         // Instruction file failed trust verification — auto-deny
@@ -3436,7 +3449,7 @@ fn handle_supervisor_message(
                 }
             } else {
                 // 3. Delegate to approval backend (non-instruction files)
-                match request_approval_with_relay_paused(
+                let backend_decision = match request_approval_with_relay_paused(
                     config,
                     &nono::supervisor::ApprovalRequest::from(request.clone()),
                     pty,
@@ -3468,7 +3481,17 @@ fn handle_supervisor_message(
                             reason: format!("Approval backend error: {e}"),
                         }
                     }
-                }
+                };
+                // Record the approval backend decision immediately, so it's captured in audit
+                // even if file operations fail afterward.
+                record_capability_audit(
+                    config,
+                    nono::supervisor::ApprovalRequest::from(request.clone()),
+                    decision_started,
+                    backend_decision.clone(),
+                )?;
+                backend_decision_recorded = true;
+                backend_decision
             };
 
             // 3. If granted, open the path and send fd before the response
@@ -3490,12 +3513,7 @@ fn handle_supervisor_message(
                                 },
                             };
                             sock.send_response(&response)?;
-                            record_capability_audit(
-                                config,
-                                nono::supervisor::ApprovalRequest::from(request),
-                                decision_started,
-                                response_decision(&response),
-                            )?;
+                            // File operation failure is recorded, but the backend approval was already recorded above
                             return Ok(());
                         }
                     }
@@ -3508,12 +3526,7 @@ fn handle_supervisor_message(
                             },
                         };
                         sock.send_response(&response)?;
-                        record_capability_audit(
-                            config,
-                            nono::supervisor::ApprovalRequest::from(request),
-                            decision_started,
-                            response_decision(&response),
-                        )?;
+                        // File operation failure is recorded, but the backend approval was already recorded above
                         return Ok(());
                     }
                 }
@@ -3525,12 +3538,15 @@ fn handle_supervisor_message(
                 decision,
             };
             sock.send_response(&response)?;
-            record_capability_audit(
-                config,
-                nono::supervisor::ApprovalRequest::from(request),
-                decision_started,
-                response_decision(&response),
-            )?;
+            // Only record audit if we haven't already recorded the approved decision above
+            if !backend_decision_recorded {
+                record_capability_audit(
+                    config,
+                    nono::supervisor::ApprovalRequest::from(request),
+                    decision_started,
+                    response_decision(&response),
+                )?;
+            }
         }
         SupervisorMessage::OpenUrl(url_request) => {
             let request_id = url_request.request_id.clone();
