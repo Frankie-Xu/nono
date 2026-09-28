@@ -432,7 +432,7 @@ pub(super) mod git {
     /// reading the process environment, so tests can exercise PATH
     /// resolution without mutating global process state (unsafe under a
     /// parallel test runner).
-    fn run_with_path(
+    pub(super) fn run_with_path(
         cwd: Option<&Path>,
         global_config_override: Option<&Path>,
         ambient_path: &str,
@@ -448,7 +448,13 @@ pub(super) mod git {
         // `capability_ext.rs`) — not the final set, but enough to catch a
         // sandbox-writable PATH directory from a literal `filesystem.allow`
         // entry processed earlier in the same profile.
-        let safe_path = nono::sanitize_broker_path_for_binary(ambient_path, "git", outer_caps);
+        let safe_path = nono::safe_broker_path_for_binary(ambient_path, "git", outer_caps)
+            .ok_or_else(|| {
+                NonoError::ProfileParse(
+                    "cannot resolve 'git': no remaining PATH entry is safe for this sandbox"
+                        .to_string(),
+                )
+            })?;
         cmd.env("PATH", &safe_path);
         if let Some(d) = cwd {
             cmd.current_dir(d);
@@ -614,6 +620,30 @@ pub(crate) fn expand_dynamic_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_config_rejects_empty_sanitized_path() {
+        use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let writable_bin = root.path().join("bin");
+        std::fs::create_dir_all(&writable_bin).expect("mkdir");
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_bin.clone(),
+            resolved: nono::try_canonicalize(&writable_bin),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let err = git::run_with_path(None, None, &writable_bin.display().to_string(), &caps)
+            .expect_err("empty sanitized PATH must fail before spawning git");
+        assert!(
+            err.to_string().contains("no remaining PATH entry is safe"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn parse_token_recognises_at_provider_colon_query() {

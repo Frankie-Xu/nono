@@ -443,15 +443,17 @@ fn load_command_credential_source(
     // runs host-side, unsandboxed. Strip any PATH entry the sandbox could
     // write to before spawning, so it can't plant a trojan for this lookup
     // to find.
-    // `command` may be a bare name resolved by PATH lookup, and this process
-    // runs host-side, unsandboxed. Strip any PATH entry the sandbox could
-    // write to before spawning, so it can't plant a trojan for this lookup
-    // to find.
-    let safe_path = nono::sanitize_broker_path_for_binary(
+    let safe_path = nono::safe_broker_path_for_binary(
         &std::env::var("PATH").unwrap_or_default(),
         command,
         outer_caps,
-    );
+    )
+    .ok_or_else(|| {
+        nono::NonoError::SandboxInit(format!(
+            "cannot resolve supervisor credential source '{command}': \
+             no remaining PATH entry is safe for this sandbox"
+        ))
+    })?;
     let mut child = std::process::Command::new(command)
         .args(args)
         .env("PATH", &safe_path)
@@ -1465,5 +1467,37 @@ mod intercept_tests {
             "real binary in the non-writable directory should have run"
         );
         assert_eq!(String::from_utf8_lossy(&result).trim(), "real-secret");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_command_credential_source_rejects_empty_sanitized_path() {
+        use nono::{AccessMode, CapabilitySource, FsCapability};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let writable_dir = root.path().join("writable-bin");
+        std::fs::create_dir_all(&writable_dir).expect("mkdir writable");
+        let mut caps = nono::CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_dir.clone(),
+            resolved: nono::try_canonicalize(&writable_dir),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let path = writable_dir.display().to_string();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("PATH", &path)]);
+        let err = load_command_credential_source("mycreds", &[], None, &caps)
+            .expect_err("empty sanitized PATH must fail before spawning credentials command");
+
+        assert!(
+            err.to_string().contains("no remaining PATH entry is safe"),
+            "unexpected error: {err}"
+        );
     }
 }
