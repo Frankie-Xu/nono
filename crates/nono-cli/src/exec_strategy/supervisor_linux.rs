@@ -2708,7 +2708,7 @@ mod tests {
         #[test]
         fn af_inet_connect_to_open_port_localhost_allowed() {
             let backend = DenyAllBackend;
-            let caps = CapabilitySet::new()
+            let caps = nono::CapabilitySet::new()
                 .allow_localhost_port_range(8250, 8255)
                 .expect("valid localhost range");
             let mut config = make_config(&backend, 8080, vec![], &[]);
@@ -2756,7 +2756,7 @@ mod tests {
         #[test]
         fn af_inet_connect_to_non_loopback_declared_port_denied() {
             let backend = DenyAllBackend;
-            let caps = CapabilitySet::new()
+            let caps = nono::CapabilitySet::new()
                 .allow_localhost_port_range(8250, 8255)
                 .expect("valid localhost range");
             let mut config = make_config(&backend, 8080, vec![], &[]);
