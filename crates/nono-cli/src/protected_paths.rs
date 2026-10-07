@@ -146,6 +146,27 @@ pub fn overlapping_protected_root(
     None
 }
 
+/// Return whether a proposed profile-save target overlaps a protected root.
+///
+/// This is intentionally stricter than [`overlapping_protected_root`] on
+/// macOS: the profile-save UI must never offer a grant that is equal to,
+/// inside, or a directory ancestor of nono's own state. Runtime Seatbelt
+/// mediation can safely permit some parent grants after deny rules are
+/// installed, but saving one from an automatic suggestion is not appropriate.
+#[must_use]
+pub fn profile_save_target_overlaps_protected_root(
+    path: &Path,
+    is_file: bool,
+    protected_roots: &[PathBuf],
+) -> bool {
+    let target = try_canonicalize(path);
+
+    protected_roots.iter().any(|protected_root| {
+        let root = try_canonicalize(protected_root);
+        target.starts_with(&root) || (!is_file && root.starts_with(&target))
+    })
+}
+
 /// Emit Seatbelt deny rules for all protected roots.
 ///
 /// On macOS, this adds `(deny file-read-data ...)` and `(deny file-write* ...)`
@@ -181,12 +202,7 @@ pub(crate) fn emit_protected_root_deny_rules(
 /// Emit Seatbelt deny rules for a single path.
 #[cfg(target_os = "macos")]
 fn emit_deny_rules_for_path(path: &Path, caps: &mut CapabilitySet) -> Result<()> {
-    let escaped = crate::policy::escape_seatbelt_path(crate::policy::path_to_utf8(path)?)?;
-    let filter = format!("subpath \"{}\"", escaped);
-    caps.add_platform_rule(format!("(allow file-read-metadata ({}))", filter))?;
-    caps.add_platform_rule(format!("(deny file-read-data ({}))", filter))?;
-    caps.add_platform_rule(format!("(deny file-write* ({}))", filter))?;
-    Ok(())
+    crate::policy::emit_macos_deny_rules_for_path(path, caps)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -350,6 +366,35 @@ mod tests {
     }
 
     #[test]
+    fn profile_save_target_rejects_exact_descendant_and_parent_paths() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let protected = tmp.path().join(".nono");
+        let descendant = protected.join("sessions");
+        let unrelated = tmp.path().join("project");
+
+        assert!(profile_save_target_overlaps_protected_root(
+            &protected,
+            false,
+            std::slice::from_ref(&protected),
+        ));
+        assert!(profile_save_target_overlaps_protected_root(
+            &descendant,
+            false,
+            std::slice::from_ref(&protected),
+        ));
+        assert!(profile_save_target_overlaps_protected_root(
+            tmp.path(),
+            false,
+            std::slice::from_ref(&protected),
+        ));
+        assert!(!profile_save_target_overlaps_protected_root(
+            &unrelated,
+            false,
+            std::slice::from_ref(&protected),
+        ));
+    }
+
+    #[test]
     fn overlapping_protected_root_reports_match() {
         let tmp = TempDir::new().expect("tmpdir");
         let protected = tmp.path().join(".nono");
@@ -411,6 +456,10 @@ mod tests {
         assert!(
             joined.contains("allow file-read-metadata"),
             "should allow metadata: {joined}"
+        );
+        assert!(
+            joined.contains("deny network-outbound") && joined.contains("subpath"),
+            "should recursively deny Unix socket connections: {joined}"
         );
     }
 }

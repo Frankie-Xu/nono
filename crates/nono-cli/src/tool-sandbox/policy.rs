@@ -5,6 +5,9 @@ static PASSTHROUGH_INTERCEPT_ACTION: crate::command_policy::InterceptActionConfi
 pub(super) struct ResolvedInterceptAction<'a> {
     pub(super) action: &'a crate::command_policy::InterceptActionConfig,
     pub(super) rule_label: Option<ResolvedInterceptRuleLabel<'a>>,
+    /// Index in the effective (post-merge) intercept list. This is also the
+    /// stable identity of a matched rule's sandbox-specific proxy.
+    pub(super) rule_index: Option<usize>,
     /// Per-rule sandbox override for this matched invocation (passthrough).
     /// `None` for the fallthrough and rules without an override.
     pub(super) sandbox: Option<&'a crate::command_policy::CommandSandboxConfig>,
@@ -23,6 +26,7 @@ impl<'a> ResolvedInterceptAction<'a> {
         Self {
             action: &PASSTHROUGH_INTERCEPT_ACTION,
             rule_label: None,
+            rule_index: None,
             sandbox: None,
         }
     }
@@ -55,6 +59,7 @@ pub(super) fn resolve_intercept_action<'a>(
                 return Ok(ResolvedInterceptAction {
                     action: &rule.action,
                     rule_label: Some(ResolvedInterceptRuleLabel::Args(args)),
+                    rule_index: Some(index),
                     sandbox: rule.sandbox.as_ref(),
                 });
             }
@@ -72,6 +77,7 @@ pub(super) fn resolve_intercept_action<'a>(
             return Ok(ResolvedInterceptAction {
                 action: &rule.action,
                 rule_label: Some(ResolvedInterceptRuleLabel::Predicate(index)),
+                rule_index: Some(index),
                 sandbox: rule.sandbox.as_ref(),
             });
         }
@@ -181,12 +187,12 @@ pub(super) fn resolve_exec_command(
     command: &[String],
 ) -> nono::Result<(std::path::PathBuf, Vec<Vec<u8>>)> {
     let helper_raw = command.first().ok_or_else(|| {
-        nono::NonoError::SandboxInit("tool-sandbox exec action has empty command".to_string())
+        nono::NonoError::SandboxInit("command-policy exec action has empty command".to_string())
     })?;
     let helper_path = std::path::PathBuf::from(crate::policy::expand_env_vars_strict(helper_raw)?);
     if !helper_path.is_absolute() {
         return Err(nono::NonoError::SandboxInit(format!(
-            "tool-sandbox exec helper must be an absolute path; got '{}'",
+            "command-policy exec helper must be an absolute path; got '{}'",
             helper_path.display()
         )));
     }
@@ -213,7 +219,7 @@ pub(super) fn resolve_exec_helper<'a>(
     let (helper_path, extra_args) = resolve_exec_command(command)?;
     let helper = exec_helpers.get(&helper_path).ok_or_else(|| {
         nono::NonoError::SandboxInit(format!(
-            "tool-sandbox exec helper not pre-resolved: {}",
+            "command-policy exec helper not pre-resolved: {}",
             helper_path.display()
         ))
     })?;
@@ -344,7 +350,7 @@ fn invocation_args(argv: &[Vec<u8>]) -> nono::Result<Vec<String>> {
         .skip(1)
         .map(|arg| {
             std::str::from_utf8(arg).map(str::to_owned).map_err(|_| {
-                nono::NonoError::SandboxInit("tool-sandbox argv is not UTF-8".to_string())
+                nono::NonoError::SandboxInit("command-policy argv is not UTF-8".to_string())
             })
         })
         .collect()
@@ -358,10 +364,12 @@ fn invocation_env(env: &[Vec<u8>]) -> nono::Result<std::collections::BTreeMap<St
             continue;
         };
         let name = std::str::from_utf8(name).map_err(|_| {
-            nono::NonoError::SandboxInit("tool-sandbox env name is not UTF-8".to_string())
+            nono::NonoError::SandboxInit("command-policy environment name is not UTF-8".to_string())
         })?;
         let value = std::str::from_utf8(value).map_err(|_| {
-            nono::NonoError::SandboxInit("tool-sandbox env value is not UTF-8".to_string())
+            nono::NonoError::SandboxInit(
+                "command-policy environment value is not UTF-8".to_string(),
+            )
         })?;
         result.insert(name.to_string(), value.to_string());
     }
@@ -375,17 +383,16 @@ fn split_env_entry_for_policy(entry: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) fn proxy_port_from_env(env: &[Vec<u8>]) -> Option<u16> {
-    env.iter().find_map(|entry| {
-        let (name, value) = split_env_entry_for_policy(entry)?;
-        if !matches!(
-            name,
-            b"HTTPS_PROXY" | b"HTTP_PROXY" | b"https_proxy" | b"http_proxy"
+pub(super) fn proxy_port_from_vars(env: &[(String, String)]) -> Option<u16> {
+    env.iter().find_map(|(name, value)| {
+        if matches!(
+            name.as_str(),
+            "HTTPS_PROXY" | "HTTP_PROXY" | "https_proxy" | "http_proxy"
         ) {
-            return None;
+            loopback_http_proxy_port(value)
+        } else {
+            None
         }
-        let value = std::str::from_utf8(value).ok()?;
-        loopback_http_proxy_port(value)
     })
 }
 
@@ -405,17 +412,22 @@ fn loopback_http_proxy_port(value: &str) -> Option<u16> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn load_supervisor_credential_source(
     source: &crate::command_policy::AmbientCredentialSourceConfig,
+    outer_caps: &nono::CapabilitySet,
 ) -> nono::Result<Vec<u8>> {
     match source {
         crate::command_policy::AmbientCredentialSourceConfig::Keystore { key } => {
-            let secret = nono::keystore::load_secret_by_ref(nono::keystore::DEFAULT_SERVICE, key)?;
+            let secret = nono::keystore::load_secret_by_ref(
+                nono::keystore::DEFAULT_SERVICE,
+                key,
+                Some(outer_caps),
+            )?;
             Ok(secret.as_bytes().to_vec())
         }
         crate::command_policy::AmbientCredentialSourceConfig::Command {
             command,
             args,
             timeout_secs,
-        } => load_command_credential_source(command, args, *timeout_secs),
+        } => load_command_credential_source(command, args, *timeout_secs, outer_caps),
     }
 }
 
@@ -424,19 +436,37 @@ fn load_command_credential_source(
     command: &str,
     args: &[String],
     timeout_secs: Option<u64>,
+    outer_caps: &nono::CapabilitySet,
 ) -> nono::Result<Vec<u8>> {
     let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(30));
-    let mut child = std::process::Command::new(command)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            nono::NonoError::SandboxInit(format!(
-                "failed to start supervisor credential source '{command}': {err}"
-            ))
-        })?;
+    // `command` may be a bare name resolved by PATH lookup, and this process
+    // runs host-side, unsandboxed. Strip any PATH entry the sandbox could
+    // write to before spawning, so it can't plant a trojan for this lookup
+    // to find.
+    let safe_path = nono::safe_broker_path_for_binary(
+        &std::env::var("PATH").unwrap_or_default(),
+        command,
+        outer_caps,
+    )
+    .ok_or_else(|| {
+        nono::NonoError::SandboxInit(format!(
+            "cannot resolve supervisor credential source '{command}': \
+             no remaining PATH entry is safe for this sandbox"
+        ))
+    })?;
+    let mut child = crate::owned_children::spawn(
+        std::process::Command::new(command)
+            .args(args)
+            .env("PATH", &safe_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .map_err(|err| {
+        nono::NonoError::SandboxInit(format!(
+            "failed to start supervisor credential source '{command}': {err}"
+        ))
+    })?;
 
     let start = std::time::Instant::now();
     loop {
@@ -590,7 +620,7 @@ pub(super) fn approval_deny_reason(decision: &nono::supervisor::ApprovalDecision
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) fn policy_credential_names(
+pub(crate) fn policy_credential_names(
     policy: &crate::command_policy::CommandSandboxConfig,
 ) -> Vec<&str> {
     let mut names = Vec::with_capacity(policy.use_credentials.len() + policy.credentials.len());
@@ -618,7 +648,7 @@ pub(super) fn reject_unenforced_resources(
         return Err(nono::NonoError::BlockedCommand {
             command: command.to_string(),
             reason:
-                "sandbox.resources is parsed by tool-sandbox Schema 2 but not yet enforced by this runtime"
+                "sandbox.resources is parsed by command-sandbox Schema 2 but not yet enforced by this runtime"
                     .to_string(),
         });
     }
@@ -714,6 +744,7 @@ mod intercept_tests {
             .expect("resolve intercept");
 
         assert_eq!(resolved.rule_label(), "push --force");
+        assert_eq!(resolved.rule_index, Some(0));
         assert!(matches!(
             resolved.action,
             InterceptActionConfig::Approve { .. }
@@ -1172,6 +1203,7 @@ mod intercept_tests {
         )
         .expect("resolve intercept");
         assert_eq!(with.sandbox, Some(&override_sandbox));
+        assert_eq!(with.rule_index, Some(0));
 
         let without = resolve_intercept_action(
             &config,
@@ -1180,6 +1212,7 @@ mod intercept_tests {
         )
         .expect("resolve intercept");
         assert_eq!(without.sandbox, None);
+        assert_eq!(without.rule_index, Some(1));
 
         // Fallthrough (no matching rule) also has no override.
         let fallthrough = resolve_intercept_action(
@@ -1189,6 +1222,7 @@ mod intercept_tests {
         )
         .expect("resolve intercept");
         assert_eq!(fallthrough.sandbox, None);
+        assert_eq!(fallthrough.rule_index, None);
     }
 
     #[test]
@@ -1287,6 +1321,7 @@ mod intercept_tests {
                 timeout_secs: Some(30),
                 mode: None,
                 backends: Vec::new(),
+                auth: None,
             },
         );
 
@@ -1328,7 +1363,7 @@ mod intercept_tests {
         assert!(matches!(
             err,
             Some(message)
-                if message.contains("sandbox.resources is parsed by tool-sandbox Schema 2 but not yet enforced")
+                if message.contains("sandbox.resources is parsed by command-sandbox Schema 2 but not yet enforced")
         ));
     }
 
@@ -1365,5 +1400,105 @@ mod intercept_tests {
     #[test]
     fn resolve_exec_command_rejects_relative_helper() {
         assert!(resolve_exec_command(&["relative/helper".to_string()]).is_err());
+    }
+
+    /// Live regression test: `load_command_credential_source` runs the
+    /// `command_policies.commands[].credential.ambient_source` "command"
+    /// backend host-side, unsandboxed, resolving the configured command by
+    /// bare name. A trojan planted in a directory the sandbox has write
+    /// access to must not run.
+    #[cfg(unix)]
+    #[test]
+    fn load_command_credential_source_skips_trojan_in_writable_path_dir() {
+        use nono::{AccessMode, CapabilitySource, FsCapability};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let writable_dir = root.path().join("writable-bin");
+        let real_dir = root.path().join("real-bin");
+        std::fs::create_dir_all(&writable_dir).expect("mkdir writable");
+        std::fs::create_dir_all(&real_dir).expect("mkdir real");
+
+        let trojan_marker = root.path().join("trojan_marker");
+        let real_marker = root.path().join("real_marker");
+        for (dir, marker, output) in [
+            (&writable_dir, &trojan_marker, "trojan-secret"),
+            (&real_dir, &real_marker, "real-secret"),
+        ] {
+            let script = dir.join("mycreds");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\n/usr/bin/touch {}\necho {}\nexit 0\n",
+                    marker.display(),
+                    output
+                ),
+            )
+            .expect("write script");
+            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+
+        let mut caps = nono::CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_dir.clone(),
+            resolved: nono::try_canonicalize(&writable_dir),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let poisoned_path = format!("{}:{}", writable_dir.display(), real_dir.display());
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("PATH", &poisoned_path)]);
+
+        let result = load_command_credential_source("mycreds", &[], None, &caps)
+            .expect("real fallback binary should run and succeed");
+
+        assert!(
+            !trojan_marker.exists(),
+            "trojan in the sandbox-writable directory must not have run"
+        );
+        assert!(
+            real_marker.exists(),
+            "real binary in the non-writable directory should have run"
+        );
+        assert_eq!(String::from_utf8_lossy(&result).trim(), "real-secret");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_command_credential_source_rejects_empty_sanitized_path() {
+        use nono::{AccessMode, CapabilitySource, FsCapability};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let writable_dir = root.path().join("writable-bin");
+        std::fs::create_dir_all(&writable_dir).expect("mkdir writable");
+        let mut caps = nono::CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_dir.clone(),
+            resolved: nono::try_canonicalize(&writable_dir),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let path = writable_dir.display().to_string();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("PATH", &path)]);
+        let err = load_command_credential_source("mycreds", &[], None, &caps)
+            .expect_err("empty sanitized PATH must fail before spawning credentials command");
+
+        assert!(
+            err.to_string().contains("no remaining PATH entry is safe"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -1,7 +1,7 @@
 # Contributing to nono
 
-nono is a capability-based sandboxing system for running untrusted AI agents
-with OS-enforced isolation. Contributions are welcome from anyone who
+nono is a capability-based process level sandboxing system for running untrusted AI agents,
+using OS-enforced isolation. Contributions are welcome from anyone who
 understands what they are submitting.
 
 If anything here is unclear, ask in [Discord](https://discord.gg/G6qDa7cC7x)
@@ -11,8 +11,13 @@ before writing code. A five-minute conversation saves a rejected PR.
 
 ## Before You Write Code
 
-For anything beyond a typo fix, open an issue first or find an existing one.
-PRs without a linked issue will not be reviewed.
+For external contributions and agent-proposed work beyond a typo fix, open an
+issue first or find an existing one. PRs without a linked issue will not be
+reviewed.
+
+Maintainers may make routine, maintainer-directed changes without a tracking
+issue. This does not bypass the review, security, DCO, attribution, governance,
+or NEP requirements that apply to the change.
 
 This is especially true for changes that touch the Landlock enforcement path,
 the sandbox policy model, or the credential proxy. Those areas have security
@@ -22,16 +27,22 @@ For scoped, well-defined starting points, see the
 [good-first-issue](https://github.com/nolabs-ai/nono/issues?q=is%3Aopen+label%3A%22good+first+issue%22)
 label.
 
+For large-scale, capability-related, or security-sensitive changes,
+such as a major new feature, a breaking change, or anything touching
+the library/CLI security boundary, open a NEP first. See
+[neps/README.md](./neps/README.md) for when one is needed and the process
+for writing one.
+
 ---
 
-## Read CLAUDE.md First
+## Read AGENTS.md First
 
-Before touching any code, read [CLAUDE.md](./CLAUDE.md). It is the
+Before touching any code, read [AGENTS.md](./AGENTS.md). It is the
 authoritative source for this project's coding standards, security
 requirements, error handling conventions, and platform-specific constraints.
 The PR checklist references it directly.
 
-A few things from CLAUDE.md that affect every contribution:
+A few things from AGENTS.md that affect every contribution:
 
 **Error handling.** Use `NonoError` for all errors. Propagate with `?`.
 Never use `.unwrap()` or `.expect()`. This is enforced by Clippy and will
@@ -51,8 +62,7 @@ value. Rust runs unit tests in parallel; an unrestored env var causes flaky
 failures in unrelated tests.
 
 **Security posture.** On any error, deny access. Never silently degrade to
-a less secure state. No escape hatch: once a sandbox is applied, there is no
-API to expand permissions.
+a less secure state.
 
 ---
 
@@ -151,14 +161,25 @@ The changelog is auto-generated from commit messages at release time.
 Use the right type. A `fix` that is labeled `chore` will not appear in the
 release notes under Bug Fixes.
 
+## Releases
+
+Maintainers preparing a release must follow the
+[release runbook](./docs/maintainers/releasing.md). It defines the release PR,
+tagging process.
+
+Day-to-day maintainer work is covered by the
+[maintainer operations guide](./docs/maintainers/maintaining.md).
+
 ---
 
 ## Contribution Process
 
 **1. Open or find an issue.**
 
-Every PR must reference an existing issue. Open one before writing code.
-PRs without a linked issue will not be reviewed.
+External contributions and agent-proposed work must reference an existing
+issue. Open one before writing code. Maintainer-directed routine work may
+proceed without a tracking issue, but significant and security-critical work
+continues to follow [GOVERNANCE.md](./GOVERNANCE.md) and the NEP process.
 
 **2. Fork the repo and create a branch.**
 
@@ -171,7 +192,7 @@ Match the branch name to your commit type. `fix/proxy-rotation` is good.
 
 **3. Write the code.**
 
-Follow [CLAUDE.md](./CLAUDE.md) for all coding standards. Key requirements
+Follow [AGENTS.md](./AGENTS.md) for all coding standards. Key requirements
 repeated here for visibility:
 
 - Use `NonoError` for all errors. Propagate with `?`.
@@ -208,7 +229,8 @@ will be asked to amend before review begins.
 **5. Open a pull request against `main`.**
 
 The PR template will prompt you for:
-- A linked issue (`Closes #NNN`)
+- A linked issue (`Closes #NNN`) for external and agent-proposed work, or a
+  maintainer-directed-work statement
 - A summary of what the PR does and why
 - A test plan describing how you verified the change
 - A checklist including DCO signoff confirmation
@@ -219,7 +241,7 @@ pretends coverage is complete.
 
 If your PR was generated or assisted by an AI tool, complete the Agent
 Disclosure and Agent Compliance Check sections in the PR template.
-See [CLAUDE.md](./CLAUDE.md) for the full agent contribution policy,
+See [AGENTS.md](./AGENTS.md) for the full agent contribution policy,
 including hard stop conditions that prohibit certain automated contributions.
 
 **6. Review.**
@@ -233,13 +255,8 @@ with a link to the PR.
 
 ## Scope: What nono Does and Does Not Do
 
-nono applies OS-enforced capability restrictions to sandbox AI agents and
-the tools they call. Once a sandbox is applied, there is no API to expand
-permissions. The policy lives in the profile, not in the prompt.
-
-nono is in alpha. Security guarantees are not yet stable. A third-party
-security audit is planned prior to v1.0. Do not overstate what the current
-implementation guarantees.
+nono applies OS-enforced capability process restrictions to sandbox AI agents and
+the tools they call.
 
 ---
 
@@ -260,6 +277,9 @@ https://github.com/nolabs-ai/nono/security/advisories/new
 
 See [SECURITY.md](./SECURITY.md) for the full disclosure policy, including
 guidance on LLM-generated findings.
+
+Maintainers handling a private report must follow the
+[security response runbook](./docs/maintainers/security-response.md).
 
 ---
 

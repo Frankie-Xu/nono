@@ -50,9 +50,8 @@ From here **fork the config**, tweak it, theme it, make it your own, and share i
 > “Datadog engineers want their agents to move fast, and we want our credentials and production systems kept safe while they do. nono is the only sandbox that gives us both fine-grained, per-command policies and sophisticated credential management that fits existing, complex real-world toolchains.”
 > James Carnegie -- Staff Security Engineer, Datadog
 
->  "Security is embedded in everything we build at Okta. nono gives us the confidence to innovate with AI agents by isolating their execution in a highly secure, pol
-icy-controlled sandbox. It ensures our credentials remain locked down and protected, without sacrificing developer velocity"
-> Leonardo Zanivan", Principal Engineer, Okta
+> "Security is embedded in everything we build at Okta. nono gives us the confidence to innovate with AI agents by isolating their execution in a highly secure, policy-controlled sandbox. It ensures our credentials remain locked down and protected, without sacrificing developer velocity"
+> Leonardo Zanivan, Principal Engineer, Okta
 
 **Copied by many** — nono pioneered the zero-latency, zero-setup agent sandbox, and continues to innovate and lead the way in agent sandboxing.
 
@@ -71,7 +70,28 @@ curl -fsSL https://nono.sh/install.sh | sh
 brew install nono
 ```
 
-**Other platforms** — Debian/Ubuntu, Fedora, Arch, RHEL, openSUSE, WSL2, and Nix: [see install instructions](https://nono.sh/docs/cli/getting_started/installation).
+#### Nix
+
+The project provides a Nix flake with two outputs:
+
+- `#default` (from source) — builds from source using `buildRustPackage` (first run compiles the crate and its dependencies)
+- `#prebuilt` — fetches the official release binary from GitHub Releases (fast, no compilation)
+
+```bash
+# Run without installing (from source)
+nix run github:nolabs-ai/nono
+
+# Run the prebuilt binary (no compilation)
+nix run github:nolabs-ai/nono#prebuilt
+
+# Install into your profile
+nix profile add github:nolabs-ai/nono
+
+# Pin to the latest release
+nix run "github:nolabs-ai/nono?ref=$(curl -fsSL https://api.github.com/repos/nolabs-ai/nono/releases/latest | jq -r .tag_name)"
+```
+
+**Other platforms** — Debian/Ubuntu, Fedora, Arch, RHEL, openSUSE, WSL2: [see install instructions](https://nono.sh/docs/cli/getting_started/installation).
 
 ## Run it!
 
@@ -105,7 +125,7 @@ Are you an agent developer and want to publish your own agent package? We would 
 
 nono does not stop at "put the agent in a sandbox". Agents delegate real work to tools: `git`, `gh`, `curl`, `kubectl`, package managers, build scripts, MCP clients / servers, and whatever else is on `PATH`. Those tools are often where secrets, network access, and side effects show up. Most sandboxes just give the agent a blanket policy where a secret is universally available to the entire agent and every tool, but nono is different:
 
-nono can put delegated tools in their own isolated child sandboxes, outside the agent's control. The agent gets its session sandbox; when it calls a controlled tool, nono's broker launches that tool with a separate policy, separate filesystem grants, separate network rules, and separate credentials. The tool does not inherit the agent's broad `--allow` grants, CWD access, raw credential paths, or network access unless its own policy says so.
+nono can put delegated tools in their own isolated command sandboxes, outside the agent's control. The agent gets its session sandbox; when it calls a controlled tool, nono's broker launches that tool under a command policy with its own filesystem policy, network policy, and credentials. The command sandbox does not inherit the session sandbox's broad `--allow` grants, CWD access, raw credential paths, or network access unless its command sandbox policy says so.
 
 That means a profile can express rules like:
 

@@ -131,11 +131,15 @@ pub enum Commands {
 
 \x1b[1mUSAGE\x1b[0m
   nono run [flags] <program>...
+  nono run --remote --agent <agent> [--workspace <name-or-id>] [prompt]
 
 {all-args}
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono run --allow . claude                    # Read/write current dir, run claude
+  nono run --remote --agent claude             # Choose a workspace and attach
+  nono run --remote --agent claude --workspace my-project --detached
+                                               # Launch remotely without attaching
   nono run --profile nolabs-ai/claude claude        # Use a profile
   nono run --profile nolabs-ai/claude --allow-domain api.openai.com claude
                                                # Restrict outbound access to listed domains
@@ -197,15 +201,15 @@ pub enum Commands {
   nono why --host api.openai.com --port 443    # Query network access
   nono why --self --path /var --op write       # Inside sandbox, query own capabilities
   nono why --profile gh --command gh -- issue comment 1052
-                                                # Query ETI command argv policy
+                                                # Query command-policy argv rules
 
-\x1b[1mETI TOOL DENIALS\x1b[0m
-  `nono why --command <cmd> -- <args...>` diagnoses tool-sandbox argv policy.
+\x1b[1mCOMMAND-POLICY DENIALS\x1b[0m
+  `nono why --command <cmd> -- <args...>` diagnoses command-policy argv rules.
   A message like:
 
-    nono: tool-sandbox denied gh: Command 'gh' is blocked: agents may read issues but not comment on them
+    nono: command policy denied gh: Command 'gh' is blocked: agents may read issues but not comment on them
 
-  is an ephemeral tool invocation command-policy denial from
+  is a command-policy denial from
   command_policies.commands.<name>.from.<caller>.invocation_policy. If the
   command uses proxy credentials, also check endpoint_policy for HTTP method
   and path rules.
@@ -427,6 +431,9 @@ IN-BAND DETACH:
 
     # Escape hatch: use a complete WebSocket attach URL
     nono connect wss://console.example.com/api/v1/sessions/local:host:abc123/terminal
+
+SESSION PICKER:
+    Use Up/Down or j/k to move, Enter to connect, and q or Esc to cancel.
 "
     )]
     Connect(ConnectArgs),
@@ -476,28 +483,6 @@ IN-BAND DETACH:
 ")]
     Inspect(InspectArgs),
 
-    /// Clean up old session files
-    #[command(help_template = "\
-{about}
-
-\x1b[1mUSAGE\x1b[0m
-  nono prune [flags]
-
-{all-args}
-{after-help}")]
-    #[command(after_help = "EXAMPLES:
-    # Preview what would be cleaned
-    nono prune --dry-run
-
-    # Remove sessions older than 7 days
-    nono prune --older-than 7
-
-    # Keep only 10 most recent sessions
-    nono prune --keep 10
-")]
-    #[command(hide = true)]
-    Prune(PruneArgs),
-
     /// Manage runtime session storage
     #[command(subcommand_help_heading = "COMMANDS")]
     #[command(help_template = "\
@@ -516,30 +501,6 @@ IN-BAND DETACH:
     Session(SessionArgs),
 
     // ── Policy & profiles ────────────────────────────────────────────────
-    /// [deprecated] Use 'nono profile' instead
-    #[command(subcommand_help_heading = "COMMANDS")]
-    #[command(help_template = "\
-{about}
-
-\x1b[1mUSAGE\x1b[0m
-  nono policy <command>
-
-\x1b[1mNOTE\x1b[0m
-  These commands are deprecated. Use the corresponding 'nono profile'
-  form; every invocation of 'nono policy <sub>' prints a deprecation
-  warning to stderr.
-
-{all-args}
-{after-help}")]
-    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
-  nono policy groups        # deprecated -> use 'nono profile groups'
-  nono policy profiles      # deprecated -> use 'nono profile list'
-  nono policy show <name>   # deprecated -> use 'nono profile show <name>'
-  nono policy diff a b      # deprecated -> use 'nono profile diff a b'
-  nono policy validate <f>  # deprecated -> use 'nono profile validate <f>'
-")]
-    Policy(crate::deprecated_policy::PolicyArgs),
-
     /// Create, inspect, and compare nono profiles
     #[command(subcommand_help_heading = "COMMANDS")]
     #[command(help_template = "\
@@ -926,12 +887,6 @@ pub struct CompletionsArgs {
     pub help: Option<bool>,
 }
 
-// NOTE: `PolicyArgs`, `PolicyCommands`, and `Policy*Args` types that
-// backed `nono policy <sub>` now live in `crate::deprecated_policy`. They
-// share their inner arg shapes with `ProfileGroupsArgs` / `ProfileListArgs`
-// / `ProfileShowArgs` / `ProfileDiffArgs` / `ProfileValidateArgs` via
-// `pub use` aliases so there is no parallel set of types to keep in sync.
-
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
 pub struct ProfileCmdArgs {
@@ -1131,8 +1086,8 @@ pub struct SandboxArgs {
     /// If the path exists, implies --allow-file on the socket. If it
     /// does not yet exist (the typical bind(2) case), implies --allow
     /// on the parent directory so the kernel can create the socket
-    /// file. Prefer --allow-unix-socket-dir-bind for runtime-generated
-    /// filenames.
+    /// file. A covering deny therefore requires bypassing the parent.
+    /// Prefer --allow-unix-socket-dir-bind for runtime-generated filenames.
     #[arg(long, value_name = "SOCKET", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_bind: Vec<PathBuf>,
 
@@ -1159,21 +1114,17 @@ pub struct SandboxArgs {
     #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_subtree_bind: Vec<PathBuf>,
 
-    /// Override a deny rule for a path. Pair with --allow/--read/--write grant
-    /// ALIAS(canonical="--bypass-protection", introduced="v0.41.0", remove_by="v1.0.0", issue="#594")
+    /// Override a deny rule. Pair with a filesystem or Unix socket grant
     #[arg(
         long = "bypass-protection",
-        alias = "override-deny",
         value_name = "PATH",
         help_heading = "FILESYSTEM"
     )]
     pub bypass_protection: Vec<PathBuf>,
 
     /// Suppress save-profile prompts for denials under this path. Does not grant access
-    /// ALIAS(canonical="--suppress-save-prompt", introduced="v0.52.0", remove_by="indefinite", issue="#875")
     #[arg(
         long = "suppress-save-prompt",
-        alias = "ignore-denied",
         value_name = "PATH",
         help_heading = "FILESYSTEM"
     )]
@@ -1189,10 +1140,8 @@ pub struct SandboxArgs {
 
     // ── Network ──────────────────────────────────────────────────────────
     /// Block outbound network access (allowed by default)
-    /// ALIAS(canonical="--block-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
     #[arg(
         long = "block-net",
-        alias = "net-block",
         conflicts_with = "allow_net",
         env = "NONO_BLOCK_NET",
         value_parser = clap::builder::BoolishValueParser::new(),
@@ -1202,10 +1151,8 @@ pub struct SandboxArgs {
     pub block_net: bool,
 
     /// Deprecated compatibility flag. Network is unrestricted by default.
-    /// ALIAS(canonical="--allow-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
     #[arg(
         long = "allow-net",
-        alias = "net-allow",
         env = "NONO_ALLOW_NET",
         value_parser = clap::builder::BoolishValueParser::new(),
         action = clap::ArgAction::SetTrue,
@@ -1235,11 +1182,8 @@ pub struct SandboxArgs {
     /// Add a domain to the proxy allowlist (repeatable).
     /// Use a plain hostname for unrestricted access, or a URL with a path glob
     /// to restrict to specific endpoints (e.g., https://github.com/org/**)
-    /// ALIAS(canonical="--allow-domain", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "allow-domain",
-        alias = "allow-proxy",
-        alias = "proxy-allow",
         env = "NONO_ALLOW_DOMAIN",
         value_name = "DOMAIN_OR_URL",
         help_heading = "NETWORK"
@@ -1258,23 +1202,11 @@ pub struct SandboxArgs {
     pub deny_proxy: Vec<String>,
 
     /// Allow the sandboxed child to listen on a TCP port (repeatable)
-    /// ALIAS(canonical="--listen-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[arg(
-        long = "listen-port",
-        alias = "allow-bind",
-        value_name = "PORT",
-        help_heading = "NETWORK"
-    )]
+    #[arg(long = "listen-port", value_name = "PORT", help_heading = "NETWORK")]
     pub allow_bind: Vec<u16>,
 
     /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable)
-    /// ALIAS(canonical="--open-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[arg(
-        long = "open-port",
-        alias = "allow-port",
-        value_name = "PORT",
-        help_heading = "NETWORK"
-    )]
+    #[arg(long = "open-port", value_name = "PORT", help_heading = "NETWORK")]
     pub allow_port: Vec<u16>,
 
     /// Allow outbound TCP connect to a specific port (repeatable; Linux Landlock V4+ only)
@@ -1286,10 +1218,8 @@ pub struct SandboxArgs {
     pub allow_connect_port: Vec<u16>,
 
     /// Chain outbound traffic through an upstream proxy (host:port)
-    /// ALIAS(canonical="--upstream-proxy", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "upstream-proxy",
-        alias = "external-proxy",
         value_name = "HOST:PORT",
         env = "NONO_UPSTREAM_PROXY",
         help_heading = "NETWORK"
@@ -1297,10 +1227,8 @@ pub struct SandboxArgs {
     pub external_proxy: Option<String>,
 
     /// Route these domains direct instead of through the upstream proxy
-    /// ALIAS(canonical="--upstream-bypass", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "upstream-bypass",
-        alias = "external-proxy-bypass",
         value_name = "DOMAIN",
         env = "NONO_UPSTREAM_BYPASS",
         value_delimiter = ',',
@@ -1337,10 +1265,8 @@ pub struct SandboxArgs {
 
     // ── Credentials ──────────────────────────────────────────────────────
     /// Inject credentials via reverse proxy for a service (repeatable)
-    /// ALIAS(canonical="--credential", introduced="v0.0.0", remove_by="v1.0.0", issue="#143")
     #[arg(
         long = "credential",
-        alias = "proxy-credential",
         env = "NONO_CREDENTIAL",
         value_name = "SERVICE",
         help_heading = "CREDENTIALS"
@@ -1404,6 +1330,16 @@ pub struct SandboxArgs {
     /// Allow GPU access (Metal/IOKit on Apple Silicon macOS, render nodes on Linux)
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_gpu: bool,
+
+    /// Refuse to start instead of warning when a filesystem grant overlaps a
+    /// directory on PATH. nono's own credential/browser brokers already
+    /// sanitize PATH before resolving anything by bare name, so this isn't
+    /// about protecting them — it's about the directory itself: once the
+    /// sandboxed process can plant a same-named binary there, anything else
+    /// on the host that later resolves that name (a shell, cron, another
+    /// tool) runs it with full privileges, outside nono entirely
+    #[arg(long, help_heading = "OPTIONS")]
+    pub strict_broker_path: bool,
 
     /// Linux sandbox enforcement mechanism [auto|landlock|external] (default: auto).
     ///
@@ -1575,11 +1511,8 @@ pub struct ProxyArgs {
     /// Add a domain to the proxy allowlist (repeatable).
     /// Plain hostname for unrestricted access, or a URL with a path glob
     /// to restrict to specific endpoints (e.g., https://github.com/org/**)
-    /// ALIAS(canonical="--allow-domain", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "allow-domain",
-        alias = "allow-proxy",
-        alias = "proxy-allow",
         env = "NONO_ALLOW_DOMAIN",
         value_name = "DOMAIN_OR_URL",
         help_heading = "NETWORK"
@@ -1597,10 +1530,8 @@ pub struct ProxyArgs {
     pub deny_proxy: Vec<String>,
 
     /// Chain outbound traffic through an upstream proxy (host:port)
-    /// ALIAS(canonical="--upstream-proxy", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "upstream-proxy",
-        alias = "external-proxy",
         value_name = "HOST:PORT",
         env = "NONO_UPSTREAM_PROXY",
         help_heading = "NETWORK"
@@ -1608,10 +1539,8 @@ pub struct ProxyArgs {
     pub external_proxy: Option<String>,
 
     /// Route these domains direct instead of through the upstream proxy
-    /// ALIAS(canonical="--upstream-bypass", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[arg(
         long = "upstream-bypass",
-        alias = "external-proxy-bypass",
         value_name = "DOMAIN",
         env = "NONO_UPSTREAM_BYPASS",
         value_delimiter = ',',
@@ -1678,10 +1607,8 @@ pub struct ProxyArgs {
 
     // ── Credentials ──────────────────────────────────────────────────────
     /// Inject credentials via reverse proxy for a service (repeatable)
-    /// ALIAS(canonical="--credential", introduced="v0.0.0", remove_by="v1.0.0", issue="#143")
     #[arg(
         long = "credential",
-        alias = "proxy-credential",
         env = "NONO_CREDENTIAL",
         value_name = "SERVICE",
         help_heading = "CREDENTIALS"
@@ -1747,8 +1674,8 @@ pub struct WrapSandboxArgs {
     /// If the path exists, implies --allow-file on the socket. If it
     /// does not yet exist (the typical bind(2) case), implies --allow
     /// on the parent directory so the kernel can create the socket
-    /// file. Prefer --allow-unix-socket-dir-bind for runtime-generated
-    /// filenames.
+    /// file. A covering deny therefore requires bypassing the parent.
+    /// Prefer --allow-unix-socket-dir-bind for runtime-generated filenames.
     #[arg(long, value_name = "SOCKET", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_bind: Vec<PathBuf>,
 
@@ -1775,21 +1702,17 @@ pub struct WrapSandboxArgs {
     #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_subtree_bind: Vec<PathBuf>,
 
-    /// Override a deny rule for a path. Pair with --allow/--read/--write grant
-    /// ALIAS(canonical="--bypass-protection", introduced="v0.41.0", remove_by="v1.0.0", issue="#594")
+    /// Override a deny rule. Pair with a filesystem or Unix socket grant
     #[arg(
         long = "bypass-protection",
-        alias = "override-deny",
         value_name = "PATH",
         help_heading = "FILESYSTEM"
     )]
     pub bypass_protection: Vec<PathBuf>,
 
     /// Suppress save-profile prompts for denials under this path. Does not grant access
-    /// ALIAS(canonical="--suppress-save-prompt", introduced="v0.52.0", remove_by="indefinite", issue="#875")
     #[arg(
         long = "suppress-save-prompt",
-        alias = "ignore-denied",
         value_name = "PATH",
         help_heading = "FILESYSTEM"
     )]
@@ -1805,10 +1728,8 @@ pub struct WrapSandboxArgs {
 
     // ── Network ──────────────────────────────────────────────────────────
     /// Block outbound network access (allowed by default)
-    /// ALIAS(canonical="--block-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
     #[arg(
         long = "block-net",
-        alias = "net-block",
         env = "NONO_BLOCK_NET",
         value_parser = clap::builder::BoolishValueParser::new(),
         action = clap::ArgAction::SetTrue,
@@ -1817,23 +1738,11 @@ pub struct WrapSandboxArgs {
     pub block_net: bool,
 
     /// Allow the sandboxed child to listen on a TCP port (repeatable)
-    /// ALIAS(canonical="--listen-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[arg(
-        long = "listen-port",
-        alias = "allow-bind",
-        value_name = "PORT",
-        help_heading = "NETWORK"
-    )]
+    #[arg(long = "listen-port", value_name = "PORT", help_heading = "NETWORK")]
     pub allow_bind: Vec<u16>,
 
     /// Allow bidirectional localhost TCP on a port: connect + listen (repeatable)
-    /// ALIAS(canonical="--open-port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
-    #[arg(
-        long = "open-port",
-        alias = "allow-port",
-        value_name = "PORT",
-        help_heading = "NETWORK"
-    )]
+    #[arg(long = "open-port", value_name = "PORT", help_heading = "NETWORK")]
     pub allow_port: Vec<u16>,
 
     /// Allow outbound TCP connect to a specific port (repeatable; Linux Landlock V4+ only)
@@ -1977,6 +1886,10 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             extends: args.extends,
             allow_launch_services: args.allow_launch_services,
             allow_gpu: args.allow_gpu,
+            // Not exposed as a `wrap` flag, matching its already-minimal flag
+            // surface (e.g. no `--memory`). `wrap` still gets the warning,
+            // which is unconditional — only the strict refusal is opt-in.
+            strict_broker_path: false,
             allow_http2: false,
             config: args.config,
             verbose: args.verbose,
@@ -1995,12 +1908,16 @@ impl From<WrapSandboxArgs> for SandboxArgs {
 #[command(disable_help_flag = true)]
 pub struct RunArgs {
     #[command(flatten)]
+    pub remote_options: RemoteRunArgs,
+
+    #[command(flatten)]
     pub sandbox: SandboxArgs,
 
     /// Start the session without attaching the current terminal.
     /// The supervisor keeps the sandboxed process running in the background;
     /// use `nono attach <session>` later to inspect or interact with it.
-    #[arg(long, help_heading = "OPTIONS")]
+    /// ALIAS(canonical="--detached", introduced="unreleased", remove_by="indefinite", issue="N/A")
+    #[arg(long, alias = "detach", help_heading = "OPTIONS")]
     pub detached: bool,
 
     /// How long (seconds) to wait for a detached session to become attachable.
@@ -2077,6 +1994,31 @@ pub struct RunArgs {
     )]
     pub startup_timeout_secs: Option<u64>,
 
+    /// Sustained number of denied network syscalls recorded individually per
+    /// second (default 20). Denials beyond the budget are still denied and are
+    /// reported in one summary audit event. Overrides
+    /// `diagnostics.network_denial_audit.rate_per_sec`.
+    #[arg(
+        long = "network-denial-audit-rate",
+        value_name = "PER_SEC",
+        value_parser = clap::value_parser!(u32)
+            .range(1..=i64::from(crate::profile::NETWORK_DENIAL_AUDIT_MAX_RATE)),
+        help_heading = "OPTIONS"
+    )]
+    pub network_denial_audit_rate: Option<u32>,
+
+    /// Number of denied network syscalls that may be recorded individually in
+    /// one burst (default 50). Overrides
+    /// `diagnostics.network_denial_audit.burst`.
+    #[arg(
+        long = "network-denial-audit-burst",
+        value_name = "COUNT",
+        value_parser = clap::value_parser!(u32)
+            .range(1..=i64::from(crate::profile::NETWORK_DENIAL_AUDIT_MAX_BURST)),
+        help_heading = "OPTIONS"
+    )]
+    pub network_denial_audit_burst: Option<u32>,
+
     /// Disable the audit trail for this session
     #[arg(
         long,
@@ -2137,6 +2079,35 @@ pub struct RunArgs {
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct RemoteRunArgs {
+    /// Launch a persistent agent in a remote workspace and attach this terminal
+    #[arg(long, requires = "agent", help_heading = "REMOTE")]
+    pub remote: bool,
+    /// Server-managed agent to launch (for example claude)
+    #[arg(long, requires = "remote", help_heading = "REMOTE")]
+    pub agent: Option<String>,
+    /// Remote workspace name or ID; prompts when omitted in a terminal
+    #[arg(long, requires = "remote", help_heading = "REMOTE")]
+    pub workspace: Option<String>,
+    /// Platform origin; defaults to the enrolled platform
+    #[arg(long = "platform-url", requires = "remote", help_heading = "REMOTE")]
+    pub platform_url: Option<String>,
+    /// Console origin; defaults to enrolled console discovery
+    #[arg(long, requires = "remote", help_heading = "REMOTE")]
+    pub console: Option<String>,
+    /// Protected Run API personal access token file (or NONO_RUN_TOKEN)
+    #[arg(long = "run-token-file", requires = "remote", help_heading = "REMOTE")]
+    pub run_token_file: Option<PathBuf>,
+    /// Console token file override; normally browser authorization is automatic
+    #[arg(
+        long = "connect-token-file",
+        requires = "remote",
+        help_heading = "REMOTE"
+    )]
+    pub connect_token_file: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -2214,7 +2185,7 @@ pub struct SetupArgs {
 #[derive(Parser, Debug)]
 #[command(disable_help_flag = true)]
 pub struct WhyArgs {
-    /// Tool-sandbox command name to check (ETI command policy)
+    /// Command name to check against command policy
     #[arg(long, help_heading = "QUERY")]
     pub command: Option<String>,
 
@@ -2229,6 +2200,10 @@ pub struct WhyArgs {
     /// Path to check
     #[arg(long, help_heading = "QUERY")]
     pub path: Option<PathBuf>,
+
+    /// Match absolute literal paths against profile rules without resolving them on this host
+    #[arg(long, requires_all = ["path", "profile"], help_heading = "QUERY")]
+    pub lexical_profile_path: bool,
 
     /// Operation to check: read, write, or readwrite
     #[arg(long, value_enum, help_heading = "QUERY")]
@@ -2245,6 +2220,18 @@ pub struct WhyArgs {
     /// Network port (default 443)
     #[arg(long, default_value = "443", help_heading = "QUERY")]
     pub port: u16,
+
+    /// Add a domain to the proxy allowlist for this query (repeatable)
+    #[arg(
+        long = "allow-domain",
+        value_name = "DOMAIN_OR_URL",
+        help_heading = "QUERY"
+    )]
+    pub allow_proxy: Vec<String>,
+
+    /// Block a domain through the proxy for this query (repeatable)
+    #[arg(long = "deny-domain", value_name = "DOMAIN", help_heading = "QUERY")]
+    pub deny_proxy: Vec<String>,
 
     /// Output JSON instead of human-readable format
     #[arg(long, help_heading = "OPTIONS")]
@@ -2280,8 +2267,7 @@ pub struct WhyArgs {
     pub write_file: Vec<PathBuf>,
 
     /// Block network access (for query context)
-    /// ALIAS(canonical="--block-net", introduced="v0.0.0", remove_by="indefinite", issue="#302")
-    #[arg(long = "block-net", alias = "net-block", help_heading = "CONTEXT")]
+    #[arg(long = "block-net", help_heading = "CONTEXT")]
     pub block_net: bool,
 
     /// Use a named profile for query context
@@ -2674,6 +2660,10 @@ pub struct AuditCleanupArgs {
     /// Remove sessions older than N days
     #[arg(long, value_name = "DAYS")]
     pub older_than: Option<u64>,
+
+    /// Remove oldest sessions until the remaining total is under N megabytes
+    #[arg(long, value_name = "MB")]
+    pub max_total_size: Option<u64>,
 
     /// Show what would be removed without deleting
     #[arg(long)]
@@ -3461,6 +3451,54 @@ mod tests {
     }
 
     #[test]
+    fn test_run_network_denial_audit_flags_parse() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--network-denial-audit-rate",
+            "100",
+            "--network-denial-audit-burst",
+            "500",
+            "--",
+            "echo",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.network_denial_audit_rate, Some(100));
+                assert_eq!(args.network_denial_audit_burst, Some(500));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn test_run_network_denial_audit_flags_default_to_unset() {
+        let cli = Cli::parse_from(["nono", "run", "--", "echo"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.network_denial_audit_rate, None);
+                assert_eq!(args.network_denial_audit_burst, None);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn test_run_network_denial_audit_flags_reject_out_of_range() {
+        for bad in [
+            ["--network-denial-audit-rate", "0"],
+            ["--network-denial-audit-rate", "1001"],
+            ["--network-denial-audit-burst", "0"],
+            ["--network-denial-audit-burst", "10001"],
+            ["--network-denial-audit-rate", "-1"],
+            ["--network-denial-audit-burst", "abc"],
+        ] {
+            let parsed = Cli::try_parse_from(["nono", "run", bad[0], bad[1], "--", "echo"]);
+            assert!(parsed.is_err(), "{bad:?} must be rejected at parse time");
+        }
+    }
+
+    #[test]
     fn test_audit_list() {
         let cli = Cli::parse_from(["nono", "audit", "list", "--today"]);
         match cli.command {
@@ -3522,6 +3560,21 @@ mod tests {
     }
 
     #[test]
+    fn test_audit_cleanup_max_total_size() {
+        let cli = Cli::parse_from(["nono", "audit", "cleanup", "--max-total-size", "500"]);
+        match cli.command {
+            Commands::Audit(args) => match args.command {
+                AuditCommands::Cleanup(cleanup_args) => {
+                    assert_eq!(cleanup_args.max_total_size, Some(500));
+                    assert!(cleanup_args.keep.is_none());
+                }
+                _ => panic!("Expected Cleanup subcommand"),
+            },
+            _ => panic!("Expected Audit command"),
+        }
+    }
+
+    #[test]
     fn test_session_cleanup() {
         let cli = Cli::parse_from(["nono", "session", "cleanup", "--older-than", "7"]);
         match cli.command {
@@ -3532,15 +3585,6 @@ mod tests {
                 }
             },
             _ => panic!("Expected Session command"),
-        }
-    }
-
-    #[test]
-    fn test_prune_still_parses_as_hidden_compat_command() {
-        let cli = Cli::parse_from(["nono", "prune", "--dry-run"]);
-        match cli.command {
-            Commands::Prune(args) => assert!(args.dry_run),
-            _ => panic!("Expected hidden Prune command"),
         }
     }
 
@@ -3815,6 +3859,18 @@ mod tests {
     }
 
     #[test]
+    fn test_no_audit_flag_parses() {
+        let cli = Cli::parse_from(["nono", "run", "--allow", ".", "--no-audit", "echo", "hello"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.no_audit);
+                assert!(!args.no_audit_integrity);
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
     fn test_no_audit_integrity_flag_parses() {
         let cli = Cli::parse_from([
             "nono",
@@ -3928,7 +3984,7 @@ mod tests {
     }
 
     #[test]
-    fn test_network_flag_aliases_still_parse() {
+    fn test_network_flags_parse() {
         let cli = Cli::parse_from([
             "nono",
             "run",
@@ -3964,39 +4020,7 @@ mod tests {
             _ => panic!("Expected Run command"),
         }
 
-        let cli = Cli::parse_from([
-            "nono",
-            "run",
-            "--allow",
-            ".",
-            "--net-allow",
-            "echo",
-            "hello",
-        ]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert!(args.sandbox.allow_net);
-            }
-            _ => panic!("Expected Run command"),
-        }
-
-        let cli = Cli::parse_from([
-            "nono",
-            "run",
-            "--allow",
-            ".",
-            "--proxy-allow",
-            "api.openai.com",
-            "echo",
-        ]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.sandbox.allow_proxy, vec!["api.openai.com"]);
-            }
-            _ => panic!("Expected Run command"),
-        }
-
-        let cli = Cli::parse_from(["nono", "why", "--host", "example.com", "--net-block"]);
+        let cli = Cli::parse_from(["nono", "why", "--host", "example.com", "--block-net"]);
         match cli.command {
             Commands::Why(args) => {
                 assert!(args.block_net);
@@ -4036,7 +4060,7 @@ mod tests {
     }
 
     #[test]
-    fn test_why_help_mentions_eti_command_policy_denials() {
+    fn test_why_help_mentions_command_policy_denials() {
         let mut cmd = Cli::command();
         let help = cmd
             .find_subcommand_mut("why")
@@ -4044,7 +4068,7 @@ mod tests {
             .render_long_help()
             .to_string();
 
-        assert!(help.contains("ETI TOOL DENIALS"), "{help}");
+        assert!(help.contains("COMMAND-POLICY DENIALS"), "{help}");
         assert!(
             help.contains("command_policies.commands.<name>.from.<caller>.invocation_policy"),
             "{help}"
@@ -4158,32 +4182,6 @@ mod tests {
     }
 
     #[test]
-    fn test_override_deny_alias_populates_bypass_protection() {
-        // The legacy `--override-deny` flag is retained as a clap alias for
-        // `--bypass-protection`. This test locks in that parsing behavior so
-        // removing the alias in the v1.0.0 cleanup is deliberate, not accidental.
-        let cli = Cli::parse_from([
-            "nono",
-            "run",
-            "--override-deny",
-            "/tmp/test",
-            "--allow",
-            "/tmp/test",
-            "echo",
-        ]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.sandbox.bypass_protection.len(), 1);
-                assert_eq!(
-                    args.sandbox.bypass_protection[0],
-                    PathBuf::from("/tmp/test")
-                );
-            }
-            _ => panic!("Expected Run command"),
-        }
-    }
-
-    #[test]
     fn test_suppress_save_prompt_multiple() {
         let cli = Cli::parse_from([
             "nono",
@@ -4206,28 +4204,6 @@ mod tests {
                 assert_eq!(
                     args.sandbox.suppress_save_prompt[1],
                     PathBuf::from("/tmp/b")
-                );
-            }
-            _ => panic!("Expected Run command"),
-        }
-    }
-
-    #[test]
-    fn test_ignore_denied_alias_maps_to_suppress_save_prompt() {
-        let cli = Cli::parse_from([
-            "nono",
-            "run",
-            "--ignore-denied",
-            "/tmp/a",
-            "--allow",
-            ".",
-            "echo",
-        ]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(
-                    args.sandbox.suppress_save_prompt,
-                    vec![PathBuf::from("/tmp/a")]
                 );
             }
             _ => panic!("Expected Run command"),

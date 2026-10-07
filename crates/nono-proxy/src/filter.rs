@@ -7,7 +7,7 @@
 use crate::config::{is_proxy_denied_metadata_ip, parse_host_ip_literal};
 use crate::error::Result;
 use nono::net_filter::{FilterResult, HostFilter};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use tracing::debug;
 
 /// Result of a filter check including resolved socket addresses.
@@ -123,13 +123,32 @@ impl ProxyFilter {
             .unwrap_or_else(|| self.inner.check_host(host, resolved_ips))
     }
 
+    /// Checks deny (incl. `host:port`) before the allowlist, so a wildcard
+    /// `allow_domain: ["*"]` can't shadow a port-scoped deny entry.
     fn check_host_result(&self, host: &str, port: u16, resolved_ips: &[IpAddr]) -> FilterResult {
+        // Normalize before appending the port: a raw trailing dot would land
+        // mid-string (e.g. "evil.com.:443"), past where normalization looks.
+        let normalized_host = HostFilter::normalize_authority_host(host);
+        // Bracket IPv6 literals so their embedded colons can't be mistaken
+        // for the port separator (e.g. "[::1]:8975", not "::1:8975").
+        let host_port = if normalized_host.parse::<Ipv6Addr>().is_ok() {
+            format!("[{normalized_host}]:{port}")
+        } else {
+            format!("{normalized_host}:{port}")
+        };
+
+        if let Some(deny) = self.inner.check_deny(&host_port) {
+            return deny;
+        }
+        if let Some(deny) = self.inner.check_deny(host) {
+            return deny;
+        }
+
         let result = self.inner.check_host(host, resolved_ips);
         if !matches!(result, FilterResult::DenyNotAllowed { .. }) {
             return result;
         }
 
-        let host_port = format!("{host}:{port}");
         self.inner.check_host(&host_port, resolved_ips)
     }
 
@@ -214,6 +233,58 @@ mod tests {
         // bare domain must NOT match wildcard
         let result = filter.check_host_with_ips("ads.example.com", &public_ip);
         assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_proxy_filter_denied_host_port_honored_under_wildcard_allow() {
+        // A port-scoped deny must hold under a wildcard allow, without
+        // affecting other ports on the same host.
+        let filter =
+            ProxyFilter::new(&["*".to_string()]).with_denied_hosts(&["127.0.0.1:8975".to_string()]);
+        let loopback = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
+
+        let result = filter.check_host_result("127.0.0.1", 8975, &loopback);
+        assert!(!result.is_allowed(), "denied port must not be allowed");
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+
+        let result = filter.check_host_result("127.0.0.1", 8787, &loopback);
+        assert!(
+            result.is_allowed(),
+            "unrelated port on the same host must remain allowed"
+        );
+    }
+
+    #[test]
+    fn test_proxy_filter_denied_host_port_honored_for_trailing_dot_fqdn() {
+        // A trailing-dot FQDN must not bypass a port-scoped deny via
+        // unnormalized host:port construction (see check_host_result).
+        let filter =
+            ProxyFilter::new(&["*".to_string()]).with_denied_hosts(&["evil.com:443".to_string()]);
+
+        let result = filter.check_host_result("evil.com.", 443, &[]);
+        assert!(
+            !result.is_allowed(),
+            "trailing-dot form must still be denied"
+        );
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+    }
+
+    #[test]
+    fn test_proxy_filter_denied_host_port_honored_for_ipv6_literal() {
+        // An IPv6 host:port deny must match the bracketed authority form,
+        // not "::1:8975" (ambiguous with the port separator).
+        let filter =
+            ProxyFilter::new(&["*".to_string()]).with_denied_hosts(&["[::1]:8975".to_string()]);
+
+        let result = filter.check_host_result("::1", 8975, &[]);
+        assert!(!result.is_allowed(), "IPv6 host:port form must be denied");
+        assert!(matches!(result, FilterResult::DenyHost { .. }));
+
+        let result = filter.check_host_result("::1", 8787, &[]);
+        assert!(
+            result.is_allowed(),
+            "unrelated port on the same IPv6 host must remain allowed"
+        );
     }
 
     #[test]

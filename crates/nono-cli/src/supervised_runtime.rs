@@ -40,6 +40,9 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     /// resolved from the profile `security.approval_backends`. `None` falls
     /// back to the interactive terminal prompt (no behavior change).
     pub(crate) approval_backend: Option<Arc<dyn nono::ApprovalBackend>>,
+    /// Budget for recording denied network syscalls individually.
+    #[cfg(target_os = "linux")]
+    pub(crate) network_denial_audit: crate::profile::NetworkDenialAuditLimits,
     pub(crate) silent: bool,
 }
 
@@ -221,6 +224,8 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         audit_signer,
         redaction_policy,
         approval_backend: configured_approval_backend,
+        #[cfg(target_os = "linux")]
+        network_denial_audit,
         silent,
     } = ctx;
 
@@ -328,6 +333,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         session_id: &supervisor_session_id,
         attach_initial_client: !session.detached_start,
         detach_sequence: session.detach_sequence.as_deref(),
+        caps,
         open_url_origins: proxy
             .and_then(|p| p.open_url.as_ref())
             .map(|o| o.origins.as_slice())
@@ -338,6 +344,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             .unwrap_or(false),
         audit_recorder: audit_recorder.clone(),
         network_audit_events: supervisor_network_audit_events.as_ref(),
+        proxy_handle,
         redaction_policy,
         allow_launch_services_active: proxy
             .and_then(|p| p.open_url.as_ref())
@@ -355,6 +362,8 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         },
         #[cfg(target_os = "linux")]
         proxy_bind_port_ranges: caps.localhost_port_ranges().to_vec(),
+        #[cfg(target_os = "linux")]
+        network_denial_audit,
         #[cfg(target_os = "linux")]
         unix_socket_allowlist: caps.unix_socket_capabilities(),
         #[cfg(target_os = "linux")]

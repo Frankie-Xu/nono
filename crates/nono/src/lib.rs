@@ -46,8 +46,10 @@
 //! - **Other platforms**: Returns `UnsupportedPlatform` error
 
 pub mod audit;
+pub mod broker_path;
 pub mod capability;
 pub mod diagnostic;
+pub mod env_glob;
 pub mod error;
 pub mod keystore;
 pub mod manifest;
@@ -64,6 +66,10 @@ pub mod trust;
 pub mod undo;
 
 // Re-exports for convenience
+pub use broker_path::{
+    safe_broker_path_for_binary, sanitize_broker_path, sanitize_broker_path_for_binary,
+    writable_path_dirs,
+};
 pub use capability::{
     AccessMode, CapabilitySet, CapabilitySource, CoveringCapabilities, FsCapability, IpcMode,
     NetworkMode, ProcessInfoMode, SignalMode, SocketScope, UnixSocketCapability, UnixSocketMode,
@@ -75,6 +81,7 @@ pub use diagnostic::{
     SessionDiagnosticReport, SessionObservationInput, StderrObservationKind, UrlDenialReason,
     UrlDenialRecord, dedupe_denials, filesystem_denials_from_violations, follow_up_diagnostics,
 };
+pub use env_glob::env_var_glob_matches;
 pub use error::{NonoError, Result};
 pub use keystore::{
     LoadedSecret, is_apple_password_uri, is_bw_uri, is_env_uri, is_file_uri, is_keyring_uri,

@@ -54,6 +54,11 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
     // The sandboxed paths keep the built-in default.
     proxy_config.max_connections = args.max_connections;
 
+    // Standalone mode has no rollback consumer for audit events, so disable
+    // the audit buffer entirely. Without this, the 4096-event buffer fills up
+    // and logs "audit buffer full" on every request.
+    proxy_config.enable_network_audit = false;
+
     // An explicit `--pass` pins the proxy credential to a caller-chosen value
     // instead of a random per-session token. Reject a blank password so it
     // can't collapse to an effectively-absent secret. `--no-auth` and `--pass`
@@ -92,9 +97,14 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
     // approval registry from the profile, mirroring `start_proxy_runtime`. Without
     // these, `cmd://` routes fail with "managed credential unavailable" because the
     // proxy has no backend to invoke the capture command.
+    // Standalone mode has no sandboxed child (see module doc comment above),
+    // so there is nothing untrusted that could have written to PATH; pass an
+    // empty capability set so the credential-capture browser helper's PATH
+    // is left untouched beyond dropping empty/relative entries.
     let credential_capture_backend = crate::proxy_runtime::build_credential_capture_backend(
         &proxy.credential_capture,
         proxy.session_id.clone(),
+        nono::CapabilitySet::default(),
     )?;
     let approval_registry =
         crate::approval_runtime::build_proxy_approval_registry(proxy.command_policies.as_ref())?;
@@ -119,29 +129,9 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
     print_connection_info(&handle, &proxy_config, args.no_auth, silent);
 
     // Block the foreground until the user interrupts, then shut down cleanly.
-    //
-    // Nothing consumes the in-memory network audit buffer on the standalone
-    // path (only the sandboxed rollback path drains it), so it would fill to
-    // its 4096-event cap and then log "audit buffer full" on every subsequent
-    // request. Periodically drain it to void to keep the buffer bounded and
-    // silent. The events carry no value here — they're collected only for
-    // rollback audit recording, which this command does not perform.
     rt.block_on(async {
-        let mut drain = tokio::time::interval(std::time::Duration::from_secs(30));
-        // The first tick fires immediately; we only care about subsequent ones.
-        drain.tick().await;
-        loop {
-            tokio::select! {
-                signal = tokio::signal::ctrl_c() => {
-                    if let Err(e) = signal {
-                        tracing::warn!("failed to listen for Ctrl-C: {}; shutting down", e);
-                    }
-                    break;
-                }
-                _ = drain.tick() => {
-                    let _ = handle.drain_audit_events();
-                }
-            }
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("failed to listen for Ctrl-C: {}; shutting down", e);
         }
     });
 
@@ -241,6 +231,14 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         .map(|p| p.credential_capture.clone())
         .unwrap_or_default();
     let command_policies = loaded.as_ref().and_then(|p| p.command_policies.clone());
+    let credential_providers = loaded
+        .as_ref()
+        .map(|p| p.credential_providers.clone())
+        .unwrap_or_default();
+    let credential_routes = loaded
+        .as_ref()
+        .map(|p| p.credential_routes.clone())
+        .unwrap_or_default();
 
     let upstream_proxy_addr = args
         .external_proxy
@@ -370,6 +368,8 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         proxy_leaf_validity: tls_options.leaf_validity,
         command_policies,
         credential_capture,
+        credential_providers,
+        credential_routes,
         session_id: crate::session::generate_session_id(),
         enable_h2,
         ..ProxyLaunchOptions::default()
@@ -542,6 +542,8 @@ mod tests {
         let args = parse_args(&[]);
         let opts = build_launch_options(&args).expect("empty args are valid");
         assert!(opts.credential_capture.is_empty());
+        assert!(opts.credential_providers.is_empty());
+        assert!(opts.credential_routes.is_empty());
         assert!(opts.command_policies.is_none());
         // A session id is always minted so the capture backend can scope caches.
         assert!(!opts.session_id.is_empty());
@@ -745,6 +747,109 @@ mod tests {
             .get("github")
             .expect("github capture entry carried through");
         assert_eq!(entry.command, vec!["true", "auth", "github"]);
+    }
+
+    #[test]
+    fn profile_credential_provider_and_route_carry_through()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _lock = ENV_LOCK
+            .lock()
+            .map_err(|_| std::io::Error::other("env lock poisoned"))?;
+        let _env = cleared_env();
+        let dir = tempfile::tempdir()?;
+        let profile_path = dir.path().join("provider.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "provider-test" },
+                "credential_providers": {
+                    "example": {
+                        "type": "oauth_capture",
+                        "token_endpoints": [{
+                            "host": "https://auth.example.com",
+                            "path": "/oauth/token",
+                            "response_fields": [{ "path": "access_token" }]
+                        }],
+                        "api_hosts": ["https://api.example.com"]
+                    }
+                },
+                "credential_routes": [{
+                    "name": "example",
+                    "provider": "example",
+                    "env_var": "EXAMPLE_TOKEN",
+                    "base_url_env_var": "EXAMPLE_BASE_URL"
+                }]
+            }"#,
+        )?;
+
+        let profile_path_arg = profile_path.to_string_lossy();
+        let args = parse_args(&["--profile", profile_path_arg.as_ref()]);
+        let opts = build_launch_options(&args)?;
+
+        assert!(opts.credential_providers.contains_key("example"));
+        assert_eq!(opts.credential_routes.len(), 1);
+        assert_eq!(opts.credential_routes[0].name, "example");
+        assert_eq!(opts.credential_routes[0].provider, "example");
+
+        let config = build_proxy_config_from_flags(&opts)?;
+        assert_eq!(config.oauth_capture.len(), 1);
+        assert_eq!(config.oauth_capture[0].provider, "example");
+        assert_eq!(config.routes.len(), 1);
+        assert_eq!(config.routes[0].prefix, "example");
+        assert_eq!(config.routes[0].upstream, "https://api.example.com");
+        Ok(())
+    }
+
+    #[test]
+    fn profile_extends_carries_credential_provider_and_route_through()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _lock = ENV_LOCK
+            .lock()
+            .map_err(|_| std::io::Error::other("env lock poisoned"))?;
+        let _env = cleared_env();
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("oauth-base.json"),
+            r#"{
+                "meta": { "name": "oauth-base" },
+                "credential_providers": {
+                    "example": {
+                        "type": "oauth_capture",
+                        "token_endpoints": [{
+                            "host": "https://auth.example.com",
+                            "path": "/oauth/token",
+                            "response_fields": [{ "path": "access_token" }]
+                        }],
+                        "api_hosts": ["https://api.example.com"]
+                    }
+                },
+                "credential_routes": [{
+                    "name": "example",
+                    "provider": "example"
+                }]
+            }"#,
+        )?;
+        let child_path = dir.path().join("oauth-child.json");
+        std::fs::write(
+            &child_path,
+            r#"{
+                "meta": { "name": "oauth-child" }
+            }"#,
+        )?;
+
+        let child_path_arg = child_path.to_string_lossy();
+        let args = parse_args(&[
+            "--profile",
+            child_path_arg.as_ref(),
+            "--extends",
+            "oauth-base",
+        ]);
+        let opts = build_launch_options(&args)?;
+
+        assert!(opts.credential_providers.contains_key("example"));
+        assert_eq!(opts.credential_routes.len(), 1);
+        assert_eq!(opts.credential_routes[0].provider, "example");
+        Ok(())
     }
 
     #[test]

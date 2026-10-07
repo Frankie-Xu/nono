@@ -237,6 +237,7 @@ pub fn resolve_credentials(
                 prefix: name.clone(),
                 upstream: cred.upstream.clone(),
                 credential_key: cred.credential_key.clone(),
+                redeem_phantoms: cred.redeem_phantoms.clone(),
                 inject_mode: cred.inject_mode.clone(),
                 inject_header: cred.inject_header.clone(),
                 credential_format: cred.credential_format.clone(),
@@ -291,6 +292,7 @@ pub fn resolve_credentials(
                 prefix: name.clone(),
                 upstream: cred.upstream.clone(),
                 credential_key: Some(key),
+                redeem_phantoms: Vec::new(),
                 inject_mode: InjectMode::Header,
                 inject_header: cred.inject_header.clone(),
                 credential_format: cred.credential_format.clone(),
@@ -350,6 +352,9 @@ pub fn build_proxy_config(
 /// Expand `--deny-domain` entries: if an entry matches a group name in the
 /// network policy, expand it to the group's hosts and suffixes. Otherwise
 /// treat it as a literal hostname.
+///
+/// Unlike [`expand_proxy_allow`], `host:port` is kept intact — stripping it
+/// would widen a deny to every port on that host.
 pub fn expand_proxy_deny(policy: &NetworkPolicy, entries: &[String]) -> Vec<String> {
     let mut result = Vec::new();
     for entry in entries {
@@ -364,11 +369,7 @@ pub fn expand_proxy_deny(policy: &NetworkPolicy, entries: &[String]) -> Vec<Stri
                 result.push(wildcard);
             }
         } else {
-            let host = entry
-                .rsplit_once(':')
-                .and_then(|(h, p)| p.parse::<u16>().ok().map(|_| h))
-                .unwrap_or(entry.as_str());
-            result.push(host.to_string());
+            result.push(entry.clone());
         }
     }
     result
@@ -454,6 +455,7 @@ pub fn partition_allow_domain(
                         prefix,
                         upstream: format!("{}://{}", scheme, domain),
                         credential_key: None,
+                        redeem_phantoms: Vec::new(),
                         inject_mode: InjectMode::default(),
                         inject_header: "Authorization".to_string(),
                         credential_format: None,
@@ -481,6 +483,13 @@ pub fn partition_allow_domain(
     Ok((plain_hosts, endpoint_routes))
 }
 
+/// Warn about `:port` suffixes on **allow**-side entries only.
+///
+/// `expand_proxy_allow` still strips ports (see its doc comment for the
+/// compatibility reason), so a port on an allow entry is genuinely ignored
+/// and worth flagging. Deny entries are not affected: `expand_proxy_deny`
+/// preserves the port and the filter honors it, so callers must not route
+/// `deny_domain`/`--deny-domain` entries through this function.
 pub fn collect_allow_domain_port_warnings(entries: &[String], source: &str) -> Vec<String> {
     entries
         .iter()
@@ -610,6 +619,7 @@ mod tests {
         custom.insert(
             "telegram".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.telegram.org".to_string(),
                 credential_key: Some("telegram_bot_token".to_string()),
                 auth: None,
@@ -654,6 +664,7 @@ mod tests {
         custom.insert(
             "openai".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://my-proxy.example.com/openai".to_string(),
                 credential_key: Some("my_openai_key".to_string()),
                 auth: None,
@@ -694,6 +705,7 @@ mod tests {
         custom.insert(
             "telegram".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.telegram.org".to_string(),
                 credential_key: Some("telegram_bot_token".to_string()),
                 auth: None,
@@ -744,6 +756,7 @@ mod tests {
         custom.insert(
             "local".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "http://localhost:8080/api".to_string(),
                 credential_key: Some("local_api_key".to_string()),
                 auth: None,
@@ -834,6 +847,7 @@ mod tests {
         custom.insert(
             "local".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "http://127.1.2.3:8080/api".to_string(),
                 credential_key: Some("local_api_key".to_string()),
                 auth: None,
@@ -871,6 +885,7 @@ mod tests {
         custom.insert(
             "local".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "http://0.0.0.0:3000/api".to_string(),
                 credential_key: Some("local_api_key".to_string()),
                 auth: None,
@@ -908,6 +923,7 @@ mod tests {
         custom.insert(
             "test".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.example.com".to_string(),
                 credential_key: Some("api_key".to_string()),
                 auth: None,
@@ -950,6 +966,7 @@ mod tests {
         custom.insert(
             "openai".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("op://Development/OpenAI/credential".to_string()),
                 auth: None,
@@ -1086,6 +1103,7 @@ mod tests {
         custom.insert(
             "evil".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.example.com".to_string(),
                 credential_key: Some("safe_key".to_string()),
                 auth: None,
@@ -1173,6 +1191,7 @@ mod tests {
         custom.insert(
             "my_api".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.example.com".to_string(),
                 credential_key: None,
                 auth: Some(OAuth2Config {
@@ -1232,6 +1251,7 @@ mod tests {
         custom.insert(
             "standard".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://api.example.com".to_string(),
                 credential_key: Some("my_key".to_string()),
                 auth: None,
@@ -1390,6 +1410,7 @@ mod tests {
         custom.insert(
             "mockhttp".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://mockhttp.org".to_string(),
                 credential_key: Some("env://MOCK_API_KEY".to_string()),
                 auth: None,
@@ -1433,6 +1454,7 @@ mod tests {
         custom.insert(
             "svc_a".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://svc-a.example.com".to_string(),
                 credential_key: Some("env://SVC_A_KEY".to_string()),
                 auth: None,
@@ -1457,6 +1479,7 @@ mod tests {
         custom.insert(
             "svc_b".to_string(),
             CustomCredentialDef {
+                redeem_phantoms: Vec::new(),
                 upstream: "https://svc-b.example.com".to_string(),
                 credential_key: Some("env://SVC_B_KEY".to_string()),
                 auth: None,
@@ -1499,13 +1522,55 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_proxy_deny_strips_port() {
+    fn test_expand_proxy_deny_preserves_port() {
+        // Unlike expand_proxy_allow, deny entries keep their :port suffix so
+        // the filter can deny only that port rather than the whole host.
         let json = embedded_network_policy_json();
         let policy = load_network_policy(json).unwrap();
 
         let entries = vec!["evil.com:443".to_string()];
         let denied = expand_proxy_deny(&policy, &entries);
-        assert_eq!(denied, vec!["evil.com"]);
+        assert_eq!(denied, vec!["evil.com:443"]);
+    }
+
+    #[test]
+    fn test_expand_proxy_deny_host_port_does_not_affect_other_ports() {
+        // A host:port deny must not widen to a bare-host deny that also
+        // blocks unrelated ports (e.g. a credential route on a different port).
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+
+        let entries = vec!["127.0.0.1:8975".to_string()];
+        let denied = expand_proxy_deny(&policy, &entries);
+        assert_eq!(denied, vec!["127.0.0.1:8975"]);
+        assert!(!denied.contains(&"127.0.0.1".to_string()));
+    }
+
+    #[test]
+    fn test_expand_proxy_allow_still_strips_port() {
+        // Deliberately unlike expand_proxy_deny: allow keeps matching every
+        // port on a host, for compatibility.
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+
+        let entries = vec!["evil.com:443".to_string()];
+        let allowed = expand_proxy_allow(&policy, &entries);
+        assert_eq!(allowed, vec!["evil.com"]);
+    }
+
+    #[test]
+    fn test_build_proxy_config_denied_host_port_entry_propagated() {
+        // A host:port deny entry must reach ProxyConfig.denied_hosts intact.
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+        let profile_name = policy.profiles.keys().next().unwrap().clone();
+        let resolved = resolve_network_profile(&policy, &profile_name).unwrap();
+
+        let entries = vec!["127.0.0.1:8975".to_string()];
+        let denied_hosts = expand_proxy_deny(&policy, &entries);
+        let config = build_proxy_config(&resolved, &[], &denied_hosts);
+
+        assert_eq!(config.denied_hosts, vec!["127.0.0.1:8975".to_string()]);
     }
 
     #[test]

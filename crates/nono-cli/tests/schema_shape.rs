@@ -67,14 +67,9 @@ fn test_schema_network_config_matches_rust_model() {
             "allow_http2",
             "network_profile",
             "allow_domain",
-            "proxy_allow",
-            "allow_proxy",
             "deny_domain",
             "credentials",
-            "proxy_credentials",
             "open_port",
-            "port_allow",
-            "allow_port",
             "open_port_range",
             "listen_port",
             "listen_port_range",
@@ -83,9 +78,7 @@ fn test_schema_network_config_matches_rust_model() {
             "custom_credentials",
             "tls_intercept",
             "upstream_proxy",
-            "external_proxy",
             "upstream_bypass",
-            "external_proxy_bypass",
         ],
     );
 }
@@ -130,7 +123,6 @@ fn test_schema_top_level_profile_matches_rust_model() {
             "diagnostics",
             "linux",
             "env_credentials",
-            "secrets",
             "environment",
             "command_policies",
             "credential_capture",
@@ -140,12 +132,10 @@ fn test_schema_top_level_profile_matches_rust_model() {
             "hooks",
             "session_hooks",
             "rollback",
-            "undo",
             "open_urls",
             "allow_launch_services",
             "allow_gpu",
             "allow_parent_of_protected",
-            "interactive",
             "skipdirs",
             "packs",
             "binary",
@@ -518,6 +508,7 @@ fn test_schema_custom_credential_def_matches_rust_model() {
             "tls_client_cert",
             "tls_client_key",
             "rate_limit",
+            "redeem_phantoms",
         ],
     );
 }
@@ -621,16 +612,18 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
     assert_schema_properties(
         &schema,
         "ApprovalBackendConfig",
-        &["backends", "mode", "timeout_secs", "type", "url"],
+        &["auth", "backends", "mode", "timeout_secs", "type", "url"],
     );
     assert_schema_properties(
         &schema,
         "CommandCredentialConfig",
         &[
+            "aws_auth",
             "base_url_env_var",
             "credential_format",
             "credential_key",
             "env_var",
+            "format",
             "inject_header",
             "mode",
             "path",
@@ -683,6 +676,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "open_urls",
             "resources",
             "stdio",
+            "unix_socket_bind",
             "unsafe_macos_seatbelt_rules",
             "use_credentials",
         ],
@@ -765,6 +759,31 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
                 == Some("#/$defs/CommandEdgeConfig")),
         "CommandPolicyConfig.from must allow edge objects with sandbox and invocation_policy"
     );
+}
+
+#[test]
+fn test_schema_validates_command_proxy_credential_with_aws_auth() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "command_policies": {
+            "credentials": {
+                "bedrock": {
+                    "type": "proxy",
+                    "upstream": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                    "aws_auth": {
+                        "profile": "production",
+                        "region": "us-east-1",
+                        "service": "bedrock"
+                    }
+                }
+            }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("command proxy credential with aws_auth should validate");
 }
 
 #[test]
@@ -1001,7 +1020,6 @@ fn test_schema_filesystem_config_matches_rust_model() {
             "deny",
             "bypass_protection",
             "suppress_save_prompt",
-            "ignore",
         ],
     );
 }
@@ -1143,7 +1161,66 @@ fn test_schema_rollback_config_matches_rust_model() {
 #[test]
 fn test_schema_diagnostics_config_matches_rust_model() {
     let schema = load_schema();
-    assert_schema_properties(&schema, "DiagnosticsConfig", &["suppress_system_services"]);
+    assert_schema_properties(
+        &schema,
+        "DiagnosticsConfig",
+        &[
+            "suppress_system_services",
+            "redaction",
+            "network_denial_audit",
+        ],
+    );
+}
+
+#[test]
+fn test_schema_network_denial_audit_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "NetworkDenialAuditConfig",
+        &["rate_per_sec", "burst"],
+    );
+}
+
+/// The schema bounds must equal the ceilings `NetworkDenialAuditLimits`
+/// enforces, so an editor accepting a value never disagrees with nono.
+#[test]
+fn test_schema_network_denial_audit_bounds_match_runtime_ceilings() {
+    let schema = load_schema();
+    let props = &schema["$defs"]["NetworkDenialAuditConfig"]["properties"];
+    assert_eq!(props["rate_per_sec"]["minimum"], 1);
+    assert_eq!(props["rate_per_sec"]["maximum"], 1000);
+    assert_eq!(props["burst"]["minimum"], 1);
+    assert_eq!(props["burst"]["maximum"], 10000);
+}
+
+#[test]
+fn test_schema_redaction_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(&schema, "RedactionConfig", &["extra_env_vars"]);
+}
+
+/// Every env-var pattern list resolves to one definition, so tightening
+/// validation in `validate_env_var_patterns` has a single schema counterpart
+/// instead of three that can drift apart.
+#[test]
+fn test_schema_env_var_pattern_lists_share_one_definition() {
+    let schema = load_schema();
+    assert!(
+        schema.pointer("/$defs/EnvVarPattern").is_some(),
+        "schema should define $defs/EnvVarPattern"
+    );
+    for pointer in [
+        "/$defs/EnvironmentConfig/properties/allow_vars/items/$ref",
+        "/$defs/EnvironmentConfig/properties/deny_vars/items/$ref",
+        "/$defs/RedactionConfig/properties/extra_env_vars/items/$ref",
+    ] {
+        assert_eq!(
+            schema.pointer(pointer).and_then(Value::as_str),
+            Some("#/$defs/EnvVarPattern"),
+            "{pointer} should reference the shared env-var pattern definition"
+        );
+    }
 }
 
 #[test]
@@ -1167,7 +1244,12 @@ fn test_schema_environment_config_matches_rust_model() {
     assert_schema_properties(
         &schema,
         "EnvironmentConfig",
-        &["allow_vars", "deny_vars", "set_vars"],
+        &[
+            "allow_vars",
+            "deny_vars",
+            "case_insensitive_vars",
+            "set_vars",
+        ],
     );
 }
 
@@ -1269,4 +1351,88 @@ fn test_schema_validates_credential_provider_inject_header_and_format() {
     validator
         .validate(&profile)
         .expect("credential provider inject_header/credential_format should validate");
+}
+
+#[test]
+fn test_schema_rejects_empty_and_nul_env_patterns() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+
+    let empty_pattern = json!({ "environment": { "allow_vars": [""] } });
+    assert!(
+        validator.validate(&empty_pattern).is_err(),
+        "schema should reject an empty allow_vars pattern"
+    );
+
+    let nul_pattern = json!({ "environment": { "deny_vars": ["AWS_\0TOKEN"] } });
+    assert!(
+        validator.validate(&nul_pattern).is_err(),
+        "schema should reject a NUL byte in a deny_vars pattern"
+    );
+
+    let valid_infix = json!({ "environment": { "allow_vars": ["*_TOKEN", "AWS_*_TOKEN"] } });
+    assert!(
+        validator.validate(&valid_infix).is_ok(),
+        "schema should accept infix/leading wildcard patterns"
+    );
+
+    for blank in ["   ", "\t", " \n "] {
+        let whitespace_pattern = json!({ "environment": { "deny_vars": [blank] } });
+        assert!(
+            validator.validate(&whitespace_pattern).is_err(),
+            "schema should reject a whitespace-only deny_vars pattern {blank:?}"
+        );
+    }
+}
+
+/// `diagnostics.redaction.extra_env_vars` shares its grammar and its
+/// validation with `environment.deny_vars`, so the schema must reject the
+/// same entries `validate_env_var_patterns` rejects. An entry accepted here
+/// and dropped at runtime is a rule the author believes is in force and is
+/// not.
+#[test]
+fn test_schema_rejects_empty_whitespace_and_nul_redaction_patterns() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+
+    for rejected in ["", "   ", "\t", " \n ", "ACME\u{0}TOKEN"] {
+        let profile = json!({
+            "diagnostics": { "redaction": { "extra_env_vars": [rejected] } }
+        });
+        assert!(
+            validator.validate(&profile).is_err(),
+            "schema should reject extra_env_vars entry {rejected:?}"
+        );
+    }
+
+    let accepted = json!({
+        "diagnostics": {
+            "redaction": {
+                "extra_env_vars": ["DEPLOY_TOKEN", "ACME_*", "*_SECRET", "AWS_*_TOKEN", "*"]
+            }
+        }
+    });
+    validator
+        .validate(&accepted)
+        .expect("schema should accept exact names and wildcard redaction patterns");
+}
+
+#[test]
+fn test_schema_validates_profile_authoring_guide_environment_example() {
+    // The exact JSON snippet from the "environment" section of
+    // profile-authoring-guide.md — must stay valid as the schema evolves.
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "environment": {
+            "allow_vars": ["*"],
+            "deny_vars": ["*TOKEN*", "*KEY*", "*SECRET*"],
+            "case_insensitive_vars": true,
+            "set_vars": { "RUST_LOG": "debug", "XDG_CONFIG_HOME": "$HOME/.config" }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("profile-authoring-guide.md environment example should validate");
 }

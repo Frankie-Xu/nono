@@ -12,7 +12,7 @@ fn parse_env_credential_map_args(values: &[String]) -> Result<Vec<(String, Strin
     }
 
     let mut pairs = Vec::with_capacity(values.len() / 2);
-    for chunk in values.chunks_exact(2) {
+    for chunk in values.as_chunks::<2>().0 {
         let credential_ref = chunk[0].trim();
         let env_var = chunk[1].trim();
 
@@ -38,6 +38,7 @@ pub(crate) fn load_env_credentials(
     args: &SandboxArgs,
     profile_secrets: &HashMap<String, String>,
     silent: bool,
+    outer_caps: &nono::CapabilitySet,
 ) -> Result<Vec<LoadedSecret>> {
     let cli_secret_mappings = parse_env_credential_map_args(&args.env_credential_map)?;
 
@@ -114,5 +115,9 @@ pub(crate) fn load_env_credentials(
         }
     }
 
-    nono::keystore::load_secrets(nono::keystore::DEFAULT_SERVICE, &secret_mappings)
+    nono::keystore::load_secrets(
+        nono::keystore::DEFAULT_SERVICE,
+        &secret_mappings,
+        Some(outer_caps),
+    )
 }

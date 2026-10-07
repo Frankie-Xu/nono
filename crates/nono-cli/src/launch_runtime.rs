@@ -34,7 +34,7 @@ pub(crate) struct LaunchPlan {
     pub(crate) cmd_args: Vec<OsString>,
     pub(crate) caps: CapabilitySet,
     /// Resolved filesystem deny paths (groups + profile `filesystem.deny`).
-    /// Threaded to the tool-sandbox so a mediated command's live working
+    /// Threaded to command mediation so a mediated command's live working
     /// directory can be rejected when it falls under a path the agent is denied.
     pub(crate) deny_paths: Vec<PathBuf>,
     pub(crate) loaded_secrets: Vec<nono::LoadedSecret>,
@@ -146,12 +146,12 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) proxy_leaf_validity: Option<std::time::Duration>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     /// Environment variables the proxy must source (e.g. credential-bearing
-    /// values) for tool-sandbox brokered commands.
+    /// values) for brokered command sandboxes.
     pub(crate) proxy_source_env_vars: HashMap<String, String>,
-    /// Per-credential base-URL environment variables injected into tool-sandbox
+    /// Per-credential base-URL environment variables injected into command
     /// brokered commands so they target the proxy reverse-route.
     pub(crate) tool_sandbox_base_url_env_vars: HashMap<String, String>,
-    /// Credential names that are brokered to tool-sandbox commands via the proxy.
+    /// Credential names brokered to command sandboxes through the proxy.
     pub(crate) tool_sandbox_proxy_credentials: HashSet<String>,
     /// Proxy/supervisor session identifier, propagated to credential-capture.
     pub(crate) session_id: String,
@@ -166,6 +166,10 @@ pub(crate) struct ProxyLaunchOptions {
     /// Profile-declared client-side proxy bypass entries for generated
     /// NO_PROXY/no_proxy.
     pub(crate) no_proxy: Vec<String>,
+    /// When true, the proxy does not allocate the in-memory network audit
+    /// buffer. Set from `--no-audit`. Does not change filter, credentials,
+    /// or fail-closed auth.
+    pub(crate) audit_disabled: bool,
 }
 
 impl ProxyLaunchOptions {
@@ -215,6 +219,12 @@ impl NetworkIntent {
     }
 }
 
+fn mark_network_audit_disabled(network: &mut NetworkIntent) {
+    if let NetworkIntent::ProxyFiltered(opts) = network {
+        opts.audit_disabled = true;
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ExecutionFlags {
     pub(crate) strategy: exec_strategy::ExecStrategy,
@@ -233,7 +243,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) proc_comm_notify: bool,
-    pub(crate) bypass_protection_paths: Vec<PathBuf>,
+    pub(crate) bypass_protection_paths: Vec<crate::policy::AppliedBypass>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) profile_display_name: Option<String>,
@@ -245,12 +255,17 @@ pub(crate) struct ExecutionFlags {
     pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
+    pub(crate) case_insensitive_env_vars: bool,
     /// Expanded `environment.set_vars` (key, expanded-value), `None` if absent.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
     pub(crate) startup_timeout_secs: Option<u64>,
+    /// Resolved budget for recording denied network syscalls individually
+    /// (CLI flag, then profile, then default).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) network_denial_audit: crate::profile::NetworkDenialAuditLimits,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     /// Command binaries already resolved while validating `command_policies`,
-    /// reused when building the tool-sandbox plan instead of re-resolving.
+    /// reused when building the command-mediation plan instead of re-resolving.
     pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
     /// Named approval backends from the profile `security` section (decoupled
     /// from `command_policies`). Drives the supervised-mode approval backend.
@@ -301,12 +316,21 @@ impl ExecutionFlags {
                 ..TrustLaunchOptions::default()
             },
             network: NetworkIntent::default(),
-            redaction_policy: nono::ScrubPolicy::secure_default(),
+            redaction_policy: profile_redaction_policy(
+                &prepared.redaction_extra_env_vars,
+                &prepared.redaction_derived_env_vars,
+            )?,
             session_hooks: prepared.session_hooks.clone(),
             allowed_env_vars: prepared.allowed_env_vars.clone(),
             denied_env_vars: prepared.denied_env_vars.clone(),
+            case_insensitive_env_vars: prepared.case_insensitive_env_vars,
             set_vars: prepared.set_vars.clone(),
             startup_timeout_secs: None,
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::resolve(
+                prepared.network_denial_audit,
+                None,
+                None,
+            )?,
             command_policies: prepared.command_policies.clone(),
             resolved_command_binaries: prepared.resolved_command_binaries.clone(),
             approval_backends: prepared.approval_backends.clone(),
@@ -322,7 +346,6 @@ pub(crate) fn prepare_run_launch_plan(
     silent: bool,
 ) -> Result<LaunchPlan> {
     let detach_sequence = load_configured_detach_sequence()?;
-    let redaction_policy = load_configured_redaction_policy()?;
     let args = run_args.sandbox;
     let no_diagnostics = run_args.no_diagnostics;
     let diagnostics_json = run_args.diagnostics_json;
@@ -335,7 +358,9 @@ pub(crate) fn prepare_run_launch_plan(
     let startup_timeout_secs = run_args.startup_timeout_secs;
 
     if no_audit && !silent {
-        eprintln!("  [nono] Warning: --no-audit disables session and command-policy audit events.");
+        eprintln!(
+            "  [nono] Warning: --no-audit disables session, command-policy, and network audit events."
+        );
     }
     if no_audit_integrity && !silent {
         eprintln!(
@@ -404,7 +429,10 @@ pub(crate) fn prepare_run_launch_plan(
         .ok()
         .filter(|id| !id.is_empty())
         .unwrap_or_else(crate::session::generate_session_id);
-    let network = prepare_proxy_launch_options(&args, &prepared, silent, session_id.clone())?;
+    let mut network = prepare_proxy_launch_options(&args, &prepared, silent, session_id.clone())?;
+    if no_audit {
+        mark_network_audit_disabled(&mut network);
+    }
     let rollback_options = prepare_rollback_launch_options(
         &run_args.rollback_exclude,
         run_args.rollback_all,
@@ -447,8 +475,12 @@ pub(crate) fn prepare_run_launch_plan(
         },
         trust,
         network,
-        redaction_policy,
         startup_timeout_secs,
+        network_denial_audit: crate::profile::NetworkDenialAuditLimits::resolve(
+            prepared.network_denial_audit,
+            run_args.network_denial_audit_rate,
+            run_args.network_denial_audit_burst,
+        )?,
         ..ExecutionFlags::from_prepared(&prepared, silent)?
     };
     Ok(LaunchPlan {
@@ -465,6 +497,33 @@ pub(crate) fn load_configured_detach_sequence() -> Result<Option<Vec<u8>>> {
     Ok(config::user::load_user_config()?
         .and_then(|user_config| user_config.ui.detach_sequence)
         .map(|sequence| sequence.bytes().to_vec()))
+}
+
+/// Build the redaction policy for a run: the user-configured policy, widened
+/// by the profile's `diagnostics.redaction.extra_env_vars` and by the
+/// destination variables of the credentials the profile declares.
+///
+/// Profile entries are applied last and are add-only, so a profile can only
+/// widen redaction. In particular a profile entry re-redacts a name that user
+/// config dropped via `[redaction].unsafe_redaction_overrides`, which is the
+/// fail-secure direction.
+///
+/// `derived_env_vars` are added as exact names, not patterns: they are read
+/// out of the profile rather than authored as redaction rules, so they must
+/// cover exactly the variables the profile named and never a family around
+/// them.
+pub(crate) fn profile_redaction_policy(
+    extra_env_vars: &[String],
+    derived_env_vars: &[String],
+) -> Result<nono::ScrubPolicy> {
+    let mut redactions = load_configured_redaction_policy()?;
+    for pattern in extra_env_vars {
+        redactions.add_env_var_pattern(pattern);
+    }
+    for name in derived_env_vars {
+        redactions.add_env_var(name);
+    }
+    Ok(redactions)
 }
 
 pub(crate) fn load_configured_redaction_policy() -> Result<nono::ScrubPolicy> {
@@ -655,8 +714,29 @@ mod tests {
     use super::*;
     use crate::cli::SandboxArgs;
 
+    #[test]
+    fn mark_network_audit_disabled_only_sets_proxy_intent() {
+        let mut unrestricted = NetworkIntent::Unrestricted;
+        mark_network_audit_disabled(&mut unrestricted);
+        assert!(matches!(unrestricted, NetworkIntent::Unrestricted));
+
+        let mut blocked = NetworkIntent::BlockAll;
+        mark_network_audit_disabled(&mut blocked);
+        assert!(matches!(blocked, NetworkIntent::BlockAll));
+
+        let mut proxy = NetworkIntent::ProxyFiltered(Box::default());
+        mark_network_audit_disabled(&mut proxy);
+        assert!(
+            proxy
+                .proxy_options()
+                .is_some_and(|opts| opts.audit_disabled),
+            "--no-audit must propagate onto ProxyLaunchOptions"
+        );
+    }
+
     fn run_args_with_sandbox(sandbox: SandboxArgs) -> RunArgs {
         RunArgs {
+            remote_options: Default::default(),
             sandbox,
             detached: false,
             detach_timeout_secs: None,
@@ -671,6 +751,8 @@ mod tests {
             no_diagnostics: false,
             diagnostics_json: false,
             startup_timeout_secs: None,
+            network_denial_audit_rate: None,
+            network_denial_audit_burst: None,
             no_audit: false,
             no_audit_integrity: false,
             audit_integrity: false,

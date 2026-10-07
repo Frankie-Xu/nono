@@ -63,6 +63,14 @@ phantom only works when it is sent back through a matching nono proxy route.
   locally and does not later send as a bearer token.
 </Note>
 
+<Note>
+  If a client classifies a credential by sniffing a literal prefix (e.g.
+  treating `sk-ant-oat01-…` as an OAuth token), give the field a `format` such
+  as `"sk-ant-oat01-{}"` (`kind: opaque` only). The phantom then follows that
+  shape — `{}` is the random body — and the template is stripped on egress
+  before the real token is substituted, so it never reaches the provider.
+</Note>
+
 ## The simplest profile
 
 Start with a profile that allows the tool to run normally and enables network
@@ -275,7 +283,7 @@ The examples above assume the sandboxed agent itself performs the login, using
 the top-level `network.open_port` grant for its loopback callback listener. If
 instead the login CLI runs as a mediated command (declared in
 `command_policies`), it must be granted its callback port on that command's
-network policy — the top-level grant does not extend to a tool-sandbox child:
+network policy — the session sandbox's grant does not extend to a command sandbox:
 
 ```json
 "network": {
@@ -286,7 +294,7 @@ network policy — the top-level grant does not extend to a tool-sandbox child:
 
 `vault login -method=oidc` binds `http://localhost:8250/oidc/callback` (and
 increments if busy). Use `open_port` / `open_port_range` rather than
-`tcp_bind_ports`, which cannot be enforced for tool-sandbox children on macOS.
+`tcp_bind_ports`, which cannot be enforced for command sandboxes on macOS.
 
 ## Add endpoint policy
 

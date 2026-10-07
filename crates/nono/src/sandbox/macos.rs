@@ -9,10 +9,11 @@ use crate::capability::{
     AccessMode, CapabilitySet, MACOS_PORT_RANGE_LIMIT, NetworkMode, merge_port_ranges,
 };
 use crate::error::{NonoError, Result};
+use crate::path::collect_symlink_hops;
 use crate::sandbox::SupportInfo;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
 use tracing::{debug, info};
 
@@ -185,6 +186,33 @@ pub fn support_info() -> SupportInfo {
 fn collect_parent_dirs(caps: &CapabilitySet) -> std::collections::HashSet<String> {
     let mut parents = std::collections::HashSet::new();
 
+    let insert_ancestors = |parents: &mut std::collections::HashSet<String>, path: &Path| {
+        let mut current = path.parent();
+        while let Some(parent) = current {
+            let parent_str = parent.to_string_lossy().to_string();
+
+            // Stop at root
+            if parent_str == "/" || parent_str.is_empty() {
+                break;
+            }
+
+            // If already present, ancestors were processed too - early exit
+            if !parents.insert(parent_str) {
+                break;
+            }
+            current = parent.parent();
+        }
+    };
+
+    // Intermediate hops need their own metadata grant, or the kernel
+    // denies access to them during dereference.
+    let grant_hops = |parents: &mut std::collections::HashSet<String>, original: &Path| {
+        for hop in collect_symlink_hops(original) {
+            insert_ancestors(parents, &hop);
+            parents.insert(hop.to_string_lossy().to_string());
+        }
+    };
+
     for cap in caps.fs_capabilities() {
         // Collect parents for both resolved and original paths.
         // On macOS, /tmp is a symlink to /private/tmp. If the user passes
@@ -197,22 +225,24 @@ fn collect_parent_dirs(caps: &CapabilitySet) -> std::collections::HashSet<String
         };
 
         for path in paths_to_walk {
-            let mut current = path.parent();
-            while let Some(parent) = current {
-                let parent_str = parent.to_string_lossy().to_string();
-
-                // Stop at root
-                if parent_str == "/" || parent_str.is_empty() {
-                    break;
-                }
-
-                // If already present, ancestors were processed too - early exit
-                if !parents.insert(parent_str) {
-                    break;
-                }
-                current = parent.parent();
-            }
+            insert_ancestors(&mut parents, path);
         }
+
+        grant_hops(&mut parents, &cap.original);
+    }
+
+    for cap in caps.unix_socket_capabilities() {
+        let paths_to_walk: Vec<&std::path::Path> = if cap.original != cap.resolved {
+            vec![cap.resolved.as_path(), cap.original.as_path()]
+        } else {
+            vec![cap.resolved.as_path()]
+        };
+
+        for path in paths_to_walk {
+            insert_ancestors(&mut parents, path);
+        }
+
+        grant_hops(&mut parents, &cap.original);
     }
 
     parents
@@ -247,67 +277,6 @@ fn path_filters_for_cap(cap: &crate::capability::FsCapability) -> Result<Vec<Str
     }
 
     Ok(filters)
-}
-
-/// Returns true if the capability set explicitly grants access to a keychain DB.
-///
-/// This is a narrow opt-in for tools that need OAuth/session refresh via macOS Keychain.
-fn has_explicit_keychain_db_access(caps: &CapabilitySet) -> bool {
-    let user_keychain_dbs = std::env::var("HOME").ok().map(|home| {
-        [
-            Path::new(&home).join("Library/Keychains/login.keychain-db"),
-            Path::new(&home).join("Library/Keychains/metadata.keychain-db"),
-        ]
-    });
-    let system_keychain_dbs = [
-        Path::new("/Library/Keychains/login.keychain-db").to_path_buf(),
-        Path::new("/Library/Keychains/metadata.keychain-db").to_path_buf(),
-    ];
-
-    let is_keychain_db = |path: &Path| -> bool {
-        if system_keychain_dbs
-            .iter()
-            .any(|candidate| path == candidate)
-        {
-            return true;
-        }
-        if let Some(ref user_keychain_dbs) = user_keychain_dbs
-            && user_keychain_dbs.iter().any(|candidate| path == candidate)
-        {
-            return true;
-        }
-        false
-    };
-
-    // Collect all known keychain DB paths for coverage checks below.
-    let all_keychain_dbs: Vec<PathBuf> = user_keychain_dbs
-        .as_ref()
-        .map(|dbs| dbs.to_vec())
-        .unwrap_or_default()
-        .into_iter()
-        .chain(system_keychain_dbs.iter().cloned())
-        .collect();
-
-    // Only user-intent grants unlock Mach IPC to keychain daemons. Group grants
-    // must not suppress the secd/securityd denies — Mach IPC bypasses file-level
-    // rules, so a group-sourced keychain cap would reopen access even when
-    // deny_keychains_macos is active.
-    //
-    // A directory grant covering a keychain DB also counts — e.g. a profile that
-    // allows ~/Library/Keychains (directory) covers login.keychain-db within it.
-    caps.fs_capabilities().iter().any(|cap| {
-        if !cap.source.is_user_intent() {
-            return false;
-        }
-        if cap.is_file {
-            is_keychain_db(&cap.original) || is_keychain_db(&cap.resolved)
-        } else {
-            // Directory grant: check if it covers any known keychain DB.
-            all_keychain_dbs
-                .iter()
-                .any(|db| db.starts_with(&cap.resolved) || db.starts_with(&cap.original))
-        }
-    })
 }
 
 /// Escape a path for use in Seatbelt profile strings.
@@ -486,6 +455,11 @@ fn emit_unix_socket_rules(profile: &mut String, caps: &CapabilitySet) -> Result<
     Ok(())
 }
 
+fn is_network_platform_rule(rule: &str) -> bool {
+    let rule = rule.trim_start();
+    rule.starts_with("(allow network") || rule.starts_with("(deny network")
+}
+
 fn push_localhost_tcp_outbound_seatbelt_rules(
     profile: &mut String,
     localhost_ports: &[u16],
@@ -578,31 +552,31 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     // Allow specific system operations
     profile.push_str("(allow sysctl-read)\n");
 
-    // Mach IPC: allow service resolution. Deny Keychain/security services by default.
-    // If a keychain DB is explicitly granted, skip these denies so profiles that
-    // intentionally rely on macOS Keychain OAuth refresh can work.
+    // Mach IPC: allow service resolution. Deny Keychain/security services always.
     //
     // Without these denies, blanket mach-lookup can permit Keychain retrieval via
-    // Mach IPC, bypassing file-level deny rules in profiles that do NOT opt in.
+    // Mach IPC, bypassing file-level deny rules. The library is policy-free and
+    // cannot tell an authorized grant from a bare one: a client that has decided
+    // keychain access is authorized re-allows these services through a platform
+    // rule, which is emitted later in the profile and wins under Seatbelt's
+    // last-matching-rule semantics.
     profile.push_str("(allow mach-lookup)\n");
-    if !has_explicit_keychain_db_access(caps) {
-        // Legacy keychain daemon names (macOS < 13)
-        profile.push_str("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))\n");
-        profile.push_str("(deny mach-lookup (global-name \"com.apple.securityd\"))\n");
-        // Modern keychain daemon (macOS 13 Ventura+). Legacy SecKeychain APIs
-        // route here on Ventura and later, bypassing the legacy service denies above.
-        // Without this deny, FFI/ctypes callers can read keychain entries despite
-        // the file-level deny on ~/Library/Keychains.
-        profile.push_str("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))\n");
-        // Modern security daemon (macOS 10.10+). SecItem APIs ("Data Protection"
-        // keychain) route through secd. Blocking this prevents access to iCloud
-        // Keychain and modern keychain items that bypass the legacy daemon paths.
-        profile.push_str("(deny mach-lookup (global-name \"com.apple.secd\"))\n");
-        // Security agent: shows keychain authorization dialogs. Without this deny, the
-        // agent can act as a proxy — presenting a user prompt and returning the credential
-        // on behalf of the sandboxed process even when the direct daemon paths are blocked.
-        profile.push_str("(deny mach-lookup (global-name \"com.apple.security.agent\"))\n");
-    }
+    // Legacy keychain daemon names (macOS < 13)
+    profile.push_str("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))\n");
+    profile.push_str("(deny mach-lookup (global-name \"com.apple.securityd\"))\n");
+    // Modern keychain daemon (macOS 13 Ventura+). Legacy SecKeychain APIs
+    // route here on Ventura and later, bypassing the legacy service denies above.
+    // Without this deny, FFI/ctypes callers can read keychain entries despite
+    // the file-level deny on ~/Library/Keychains.
+    profile.push_str("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))\n");
+    // Modern security daemon (macOS 10.10+). SecItem APIs ("Data Protection"
+    // keychain) route through secd. Blocking this prevents access to iCloud
+    // Keychain and modern keychain items that bypass the legacy daemon paths.
+    profile.push_str("(deny mach-lookup (global-name \"com.apple.secd\"))\n");
+    // Security agent: shows keychain authorization dialogs. Without this deny, the
+    // agent can act as a proxy — presenting a user prompt and returning the credential
+    // on behalf of the sandboxed process even when the direct daemon paths are blocked.
+    profile.push_str("(deny mach-lookup (global-name \"com.apple.security.agent\"))\n");
     profile.push_str("(allow mach-per-user-lookup)\n");
     profile.push_str("(allow mach-task-name)\n");
     profile.push_str("(deny mach-priv*)\n");
@@ -734,9 +708,14 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         }
     }
 
-    // Emit platform rules last so targeted denies win under Seatbelt's
-    // last-rule-wins semantics. See #970.
-    for rule in caps.platform_rules() {
+    // Emit filesystem and other platform rules after their broad grants.
+    // Network rules are emitted after the network section below so socket
+    // denies and their narrower bypasses retain the same ordering.
+    for rule in caps
+        .platform_rules()
+        .iter()
+        .filter(|rule| !is_network_platform_rule(rule))
+    {
         profile.push_str(rule);
         profile.push('\n');
     }
@@ -795,6 +774,40 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             ));
             current = parent.parent();
         }
+
+        // A $PATH dir reached through a multi-hop symlink needs metadata
+        // grants on the intermediate hops too, or the kernel denies EPERM
+        // (not ENOENT) dereferencing one, aborting the PATH walk.
+        for hop in collect_symlink_hops(dir) {
+            let Some(hop_str) = hop.to_str() else {
+                continue;
+            };
+            if !seen_dir.contains(hop_str) && seen_ancestor.insert(hop_str.to_string()) {
+                let escaped = escape_path(hop_str)?;
+                profile.push_str(&format!(
+                    "(allow file-read-metadata (literal \"{}\"))\n",
+                    escaped
+                ));
+            }
+            let mut current = hop.parent();
+            while let Some(parent) = current {
+                let Some(parent_str) = parent.to_str() else {
+                    break;
+                };
+                if parent_str == "/" || parent_str.is_empty() {
+                    break;
+                }
+                if seen_dir.contains(parent_str) || !seen_ancestor.insert(parent_str.to_string()) {
+                    break;
+                }
+                let escaped = escape_path(parent_str)?;
+                profile.push_str(&format!(
+                    "(allow file-read-metadata (literal \"{}\"))\n",
+                    escaped
+                ));
+                current = parent.parent();
+            }
+        }
     }
 
     // Network rules
@@ -803,19 +816,29 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     // macOS resolves all DNS through /var/run/mDNSResponder (a Unix domain
     // socket). Seatbelt classifies connect(2) on Unix sockets as
     // network-outbound, so (deny network*) blocks DNS. These rules allow
-    // AF_UNIX socket creation and outbound to the mDNSResponder path (both
-    // /var/run and /private/var/run since /var is a symlink on macOS).
+    // outbound to the mDNSResponder path (both /var/run and /private/var/run
+    // since /var is a symlink on macOS).
+    // Callers can omit these implicit grants with CapabilitySet::block_dns().
     const MDNS_RULES: &str = "\
-(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))\n\
 (allow network-outbound (path \"/private/var/run/mDNSResponder\"))\n\
 (allow network-outbound (path \"/var/run/mDNSResponder\"))\n";
 
     let localhost_ports = caps.localhost_ports();
     let has_localhost_tcp = !localhost_ports.is_empty() || !merged_ranges.is_empty();
+    // Explicit Unix socket grants still need socket creation when the
+    // implicit DNS exception is disabled.
+    if !matches!(caps.network_mode(), NetworkMode::AllowAll)
+        && (caps.dns_enabled() || !caps.unix_socket_capabilities().is_empty())
+    {
+        profile
+            .push_str("(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))\n");
+    }
     match caps.network_mode() {
         NetworkMode::Blocked => {
             profile.push_str("(deny network*)\n");
-            profile.push_str(MDNS_RULES);
+            if caps.dns_enabled() {
+                profile.push_str(MDNS_RULES);
+            }
             // Unix socket grants (see #685 / #696). Only explicit
             // UnixSocketCapability entries emit network-outbound rules;
             // generic FsCapability grants no longer implicitly grant
@@ -843,7 +866,9 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         NetworkMode::ProxyOnly { port, bind_ports } => {
             // Block all network, then allow only localhost TCP to the proxy port.
             profile.push_str("(deny network*)\n");
-            profile.push_str(MDNS_RULES);
+            if caps.dns_enabled() {
+                profile.push_str(MDNS_RULES);
+            }
             // Unix socket grants (see Blocked branch above).
             emit_unix_socket_rules(&mut profile, caps)?;
             profile.push_str(&format!(
@@ -876,6 +901,15 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             profile.push_str("(allow network-inbound)\n");
             profile.push_str("(allow network-bind)\n");
         }
+    }
+
+    for rule in caps
+        .platform_rules()
+        .iter()
+        .filter(|rule| is_network_platform_rule(rule))
+    {
+        profile.push_str(rule);
+        profile.push('\n');
     }
 
     // Per-port TCP rules are not supported on macOS (Seatbelt cannot filter by port alone).
@@ -1165,6 +1199,42 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_path_metadata_dir_through_multi_hop_symlink_grants_intermediate_hops() {
+        // Regression: a $PATH dir reached through a multi-hop symlink must
+        // get metadata grants on the intermediate hops, or the kernel denies
+        // EPERM (not ENOENT) dereferencing one, aborting the PATH walk.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_bin = dir.path().join("real_bin");
+        std::fs::create_dir(&real_bin).expect("mkdir real_bin");
+        let hop1 = dir.path().join("hop1");
+        let hop2 = dir.path().join("hop2");
+        std::os::unix::fs::symlink(&real_bin, &hop2).expect("symlink hop2 -> real_bin");
+        std::os::unix::fs::symlink(&hop2, &hop1).expect("symlink hop1 -> hop2");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_path_metadata_dir(hop1.clone());
+
+        let profile = generate_profile(&caps).unwrap();
+
+        let hop1_str = hop1.to_str().unwrap();
+        let hop2_str = hop2.to_str().unwrap();
+        assert!(
+            profile.contains(&format!(
+                "(allow file-read-metadata (literal \"{hop2_str}\"))"
+            )),
+            "intermediate hop hop2 missing metadata grant:\n{profile}"
+        );
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-read-metadata (regex \"^{}/[^/]+$\"))",
+                regex_escape_path_for_seatbelt(hop2_str).unwrap()
+            )),
+            "intermediate hop must not get the direct-children regex, only the $PATH dir itself: {hop1_str}"
+        );
+    }
+
+    #[test]
     fn test_support_info() {
         let info = support_info();
         assert!(info.is_supported);
@@ -1186,6 +1256,65 @@ mod tests {
 
         assert!(parents.contains("/Users"));
         assert!(parents.contains("/Users/test"));
+        assert!(!parents.contains("/"));
+    }
+
+    /// A symlinked leaf through a symlinked directory component:
+    /// `.gitconfig -> hosts/current/gitconfig -> hosts/mymac/gitconfig`.
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_parent_dirs_grants_intermediate_symlink_hop() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+
+        let hosts = canonical_dir.join("hosts");
+        let mymac = hosts.join("mymac");
+        std::fs::create_dir_all(&mymac).unwrap();
+        std::fs::write(mymac.join("gitconfig"), "[user]\n").unwrap();
+
+        let current = hosts.join("current");
+        std::os::unix::fs::symlink(&mymac, &current).unwrap();
+
+        let gitconfig_link = canonical_dir.join(".gitconfig");
+        std::os::unix::fs::symlink(current.join("gitconfig"), &gitconfig_link).unwrap();
+
+        let resolved = gitconfig_link.canonicalize().unwrap();
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: gitconfig_link,
+            resolved,
+            access: AccessMode::Read,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let parents = collect_parent_dirs(&caps);
+
+        assert!(parents.contains(&current.to_string_lossy().to_string()));
+
+        // Must not widen authority to a sibling under the same directory.
+        let sibling = hosts.join("other-host");
+        assert!(!parents.contains(&sibling.to_string_lossy().to_string()));
+    }
+
+    /// A single-hop socket symlink, to isolate `UnixSocketCapability`
+    /// ancestor grants from the multi-hop case tested above.
+    #[test]
+    fn test_collect_parent_dirs_grants_unix_socket_ancestors() {
+        let mut caps = CapabilitySet::new();
+        caps.add_unix_socket(crate::UnixSocketCapability {
+            original: PathBuf::from("/tmp/test.sock"),
+            resolved: PathBuf::from("/private/tmp/test.sock"),
+            scope: crate::SocketScope::File,
+            mode: crate::UnixSocketMode::Connect,
+            source: CapabilitySource::User,
+        });
+
+        let parents = collect_parent_dirs(&caps);
+
+        assert!(parents.contains("/private/tmp"));
+        assert!(parents.contains("/tmp"));
         assert!(!parents.contains("/"));
     }
 
@@ -1462,8 +1591,16 @@ mod tests {
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
     }
 
+    const KEYCHAIN_MACH_DENIES: [&str; 5] = [
+        "(deny mach-lookup (global-name \"com.apple.SecurityServer\"))",
+        "(deny mach-lookup (global-name \"com.apple.securityd\"))",
+        "(deny mach-lookup (global-name \"com.apple.security.keychaind\"))",
+        "(deny mach-lookup (global-name \"com.apple.secd\"))",
+        "(deny mach-lookup (global-name \"com.apple.security.agent\"))",
+    ];
+
     #[test]
-    fn test_generate_profile_skips_keychain_mach_deny_when_explicitly_granted() {
+    fn test_generate_profile_keeps_keychain_mach_deny_for_exact_file_grant() {
         let mut caps = CapabilitySet::new();
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
         let keychain = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
@@ -1477,24 +1614,22 @@ mod tests {
 
         let profile = generate_profile(&caps).unwrap();
 
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
-        assert!(
-            !profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
-        );
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
+        for deny in KEYCHAIN_MACH_DENIES {
+            assert!(
+                profile.contains(deny),
+                "missing {deny} in profile:\n{profile}"
+            );
+        }
     }
 
     #[test]
-    fn test_generate_profile_skips_keychain_mach_deny_for_metadata_keychain_db() {
+    fn test_generate_profile_keeps_keychain_mach_deny_for_metadata_db_grant() {
         let mut caps = CapabilitySet::new();
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
-        let metadata_keychain_db =
-            PathBuf::from(home).join("Library/Keychains/metadata.keychain-db");
+        let metadata_db = PathBuf::from(home).join("Library/Keychains/metadata.keychain-db");
         caps.add_fs(FsCapability {
-            original: metadata_keychain_db.clone(),
-            resolved: metadata_keychain_db,
+            original: metadata_db.clone(),
+            resolved: metadata_db,
             access: AccessMode::Read,
             is_file: true,
             source: CapabilitySource::Profile,
@@ -1502,45 +1637,16 @@ mod tests {
 
         let profile = generate_profile(&caps).unwrap();
 
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
-        assert!(
-            !profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
-        );
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
+        for deny in KEYCHAIN_MACH_DENIES {
+            assert!(
+                profile.contains(deny),
+                "missing {deny} in profile:\n{profile}"
+            );
+        }
     }
 
     #[test]
-    fn test_generate_profile_group_sourced_keychain_does_not_suppress_mach_deny() {
-        // Group-sourced keychain caps must not suppress Mach IPC denies.
-        let mut caps = CapabilitySet::new();
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
-        let keychain = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
-        caps.add_fs(FsCapability {
-            original: keychain.clone(),
-            resolved: keychain,
-            access: AccessMode::ReadWrite,
-            is_file: true,
-            source: CapabilitySource::Group("claude_code_macos".to_string()),
-        });
-
-        let profile = generate_profile(&caps).unwrap();
-
-        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
-        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
-        assert!(
-            profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
-        );
-        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
-        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
-    }
-
-    #[test]
-    fn test_generate_profile_directory_grant_covering_keychain_suppresses_mach_deny() {
-        // A profile-level directory grant covering ~/Library/Keychains must suppress
-        // Mach IPC denies, the same as an explicit file grant for login.keychain-db.
-        // Regression: nolabs-ai/claude grants the Keychains directory, not individual files.
+    fn test_generate_profile_keeps_keychain_mach_deny_for_directory_grant() {
         let mut caps = CapabilitySet::new();
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
         let keychains_dir = PathBuf::from(home).join("Library/Keychains");
@@ -1554,13 +1660,55 @@ mod tests {
 
         let profile = generate_profile(&caps).unwrap();
 
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        for deny in KEYCHAIN_MACH_DENIES {
+            assert!(
+                profile.contains(deny),
+                "missing {deny} in profile:\n{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_profile_group_sourced_keychain_does_not_suppress_mach_deny() {
+        let mut caps = CapabilitySet::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
+        let keychain = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
+        caps.add_fs(FsCapability {
+            original: keychain.clone(),
+            resolved: keychain,
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Group("claude_code_macos".to_string()),
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        for deny in KEYCHAIN_MACH_DENIES {
+            assert!(
+                profile.contains(deny),
+                "missing {deny} in profile:\n{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_profile_keychain_mach_allow_rule_lands_after_deny() {
+        let mut caps = CapabilitySet::new();
+        caps.add_platform_rule("(allow mach-lookup (global-name \"com.apple.securityd\"))")
+            .unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+
+        let deny = profile
+            .find("(deny mach-lookup (global-name \"com.apple.securityd\"))")
+            .expect("library always denies securityd");
+        let allow = profile
+            .find("(allow mach-lookup (global-name \"com.apple.securityd\"))")
+            .expect("platform rule is emitted");
         assert!(
-            !profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+            allow > deny,
+            "authorized mach allow must follow the default deny:\n{profile}"
         );
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
-        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
     }
 
     #[test]
@@ -1690,6 +1838,38 @@ mod tests {
             "ConnectBind must also allow network-bind on original path"
         );
         assert!(!profile.contains("(allow network-outbound)\n"));
+    }
+
+    #[test]
+    fn test_generate_profile_socket_deny_and_bypass_follow_socket_grant() {
+        let mut caps = CapabilitySet::new().block_network();
+        caps.add_unix_socket(crate::UnixSocketCapability {
+            original: PathBuf::from("/tmp/sockets"),
+            resolved: PathBuf::from("/private/tmp/sockets"),
+            scope: crate::SocketScope::DirSubtree,
+            mode: crate::UnixSocketMode::Connect,
+            source: CapabilitySource::User,
+        });
+        caps.add_platform_rule("(deny network-outbound (subpath \"/private/tmp/sockets\"))")
+            .unwrap();
+        caps.add_platform_rule(
+            "(allow network-outbound (path \"/private/tmp/sockets/allowed.sock\"))",
+        )
+        .unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+        let grant = profile
+            .find("(allow network-outbound (subpath \"/private/tmp/sockets\"))")
+            .expect("socket grant");
+        let deny = profile
+            .find("(deny network-outbound (subpath \"/private/tmp/sockets\"))")
+            .expect("socket deny");
+        let bypass = profile
+            .find("(allow network-outbound (path \"/private/tmp/sockets/allowed.sock\"))")
+            .expect("socket bypass");
+
+        assert!(grant < deny, "targeted deny must follow broad socket grant");
+        assert!(deny < bypass, "socket bypass must follow targeted deny");
     }
 
     /// Regression: Connect-only mode must emit `network-outbound` but
@@ -2123,6 +2303,63 @@ mod tests {
             ),
             "blocked mode must allow AF_UNIX SOCK_STREAM for mDNSResponder"
         );
+    }
+
+    #[test]
+    fn test_generate_profile_dns_disabled_in_restricted_modes() -> Result<()> {
+        for caps in [
+            CapabilitySet::new().block_network(),
+            CapabilitySet::new().proxy_only(12345),
+        ] {
+            let profile = generate_profile(&caps.block_dns())?;
+            assert!(profile.contains("(deny network*)"));
+            assert!(!profile.contains("mDNSResponder"));
+            assert!(!profile.contains("(socket-domain AF_UNIX)"));
+            assert!(!profile.contains("(allow network-outbound)"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_dns_preserves_explicit_socket_and_tcp_grants() -> Result<()> {
+        for caps in [
+            CapabilitySet::new().block_network(),
+            CapabilitySet::new().proxy_only(12345),
+        ] {
+            let mut caps = caps.block_dns().allow_localhost_port(3000);
+            caps.add_unix_socket(crate::UnixSocketCapability {
+                original: PathBuf::from("/tmp/build.sock"),
+                resolved: PathBuf::from("/private/tmp/build.sock"),
+                mode: crate::UnixSocketMode::Connect,
+                scope: crate::SocketScope::File,
+                source: Default::default(),
+            });
+            let profile = generate_profile(&caps)?;
+
+            assert!(!profile.contains("mDNSResponder"));
+            assert!(profile.contains("(deny network*)"));
+            assert!(profile.contains("(socket-domain AF_UNIX)"));
+            assert!(
+                profile.contains("(allow network-outbound (path \"/private/tmp/build.sock\"))")
+            );
+            assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:3000\"))"));
+            if matches!(caps.network_mode(), NetworkMode::ProxyOnly { .. }) {
+                assert!(
+                    profile.contains("(allow network-outbound (remote tcp \"localhost:12345\"))")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_dns_does_not_restrict_allow_all() -> Result<()> {
+        let caps = CapabilitySet::new();
+        assert_eq!(
+            generate_profile(&caps)?,
+            generate_profile(&caps.block_dns())?
+        );
+        Ok(())
     }
 
     #[test]

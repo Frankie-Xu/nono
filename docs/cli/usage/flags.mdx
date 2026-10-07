@@ -250,9 +250,8 @@ nono run --profile nolabs-ai/claude \
 ```
 
 For persistent behavior, put the same path in
-`filesystem.suppress_save_prompt` in a user profile. The older
-`--ignore-denied` spelling is accepted as an alias, but the suppress wording is
-preferred because this flag never turns a denial into an allow rule.
+`filesystem.suppress_save_prompt` in a user profile. The suppress wording is
+used deliberately because this flag never turns a denial into an allow rule.
 
 When nono offers to save denied paths after a run, choosing `suppress` writes
 all listed path suggestions to `filesystem.suppress_save_prompt` instead of
@@ -283,7 +282,9 @@ nono run --block-net --allow-unix-socket /tmp/.s.PGSQL.5432 -- psql
 Allow `connect(2)` and `bind(2)` on an AF_UNIX socket at this path. Use when
 the sandboxed program creates the socket itself. If the path doesn't exist
 yet (the typical `bind(2)` case), the CLI auto-grants write on the parent
-directory so the kernel can create the socket file.
+directory so the kernel can create the socket file. If that parent is covered
+by a filesystem deny, bypass the parent directory rather than only the future
+socket path; creating a new directory entry is a parent-directory operation.
 
 ```bash
 # Server that binds its own IPC socket
@@ -421,10 +422,12 @@ Incompatible with `--allow-net` (which bypasses the proxy entirely, making deny 
 
 #### `--credential`
 
-Enable credential injection for a named service via the reverse proxy. The service must be either a preset service (`openai`, `anthropic`, `gemini`, `google-ai`) or defined as a custom credential in your profile. Credentials are loaded from the system keyring under the `nono` service name, from 1Password when `credential_key` is an `op://` URI, from Apple Passwords on macOS when `credential_key` is an `apple-password://` URI, from a file when `credential_key` is a `file://` URI, or from the host environment when `credential_key` is an `env://` URI.
+Enable credential injection for a named service via the reverse proxy. The service must be either a preset service (`openai`, `anthropic`, `gemini`, `google-ai`, `github`, `gitlab`) or defined as a custom credential in your profile. Credentials are loaded from the system keyring under the `nono` service name, from 1Password when `credential_key` is an `op://` URI, from Apple Passwords on macOS when `credential_key` is an `apple-password://` URI, from a file when `credential_key` is a `file://` URI, or from the host environment when `credential_key` is an `env://` URI.
+
+See [built-in credential sources](/cli/features/credential-injection#storing-credentials) for each service's configured source. `--credential openai` uses keyring account `openai` under service `nono`; `--env-credential openai_api_key` loads a different account and injects its secret directly as `OPENAI_API_KEY` in the child environment.
 
 ```bash
-# Inject OpenAI credentials (loads from keyring account "openai_api_key")
+# Inject OpenAI credentials (loads from keyring account "openai")
 nono run --allow-cwd --network-profile claude-code --credential openai -- my-agent
 
 # Multiple credentials
@@ -685,8 +688,7 @@ nono run --allow-cwd --allow-command rm --allow-command mv -- my-script.sh
 </Note>
 
 Commands can also be allowed temporarily via the deprecated `commands.allow`
-field (the older `security` placement is also accepted with a deprecation
-warning, see issue #594):
+field:
 
 ```json
 {
@@ -716,7 +718,10 @@ nono run --allow-cwd --block-command my-dangerous-tool -- my-script.sh
 
 Bypass a deny group rule for a specific path. Required groups like `deny_credentials` block access to paths such as `~/.aws`, `~/.config/gcloud`, etc. This flag punches a targeted hole through the deny without removing the entire group.
 
-The bypass path must also be explicitly granted via `--allow`, `--read`, `--write`, or their file equivalents. `--bypass-protection` only removes the deny rule — it does not implicitly grant access.
+The bypass path must also have a matching filesystem or Unix socket grant.
+`--bypass-protection` only removes the deny rule — it does not implicitly
+grant access. The `--allow-unix-socket*` flags provide their required
+filesystem grant automatically.
 
 ```bash
 # Allow an AWS agent to access credentials
@@ -725,6 +730,13 @@ nono run --bypass-protection ~/.aws --allow ~/.aws -- my-aws-agent
 # Allow read-only access to GCP config
 nono run --bypass-protection ~/.config/gcloud --read ~/.config/gcloud -- gcloud-agent
 
+# Given the deny-private.json profile below, allow one existing socket while
+# the rest of its denied parent directory stays inaccessible
+nono run --profile ./deny-private.json --block-net \
+  --allow-unix-socket ~/.private/agent.sock \
+  --bypass-protection ~/.private/agent.sock \
+  -- my-agent
+
 # Multiple bypasses
 nono run \
   --bypass-protection ~/.aws \
@@ -732,6 +744,16 @@ nono run \
   --allow ~/.aws \
   --read ~/.config/gcloud \
   -- multi-cloud-agent
+```
+
+```json deny-private.json
+{
+  "meta": { "name": "deny-private" },
+  "workdir": { "access": "readwrite" },
+  "filesystem": {
+    "deny": ["$HOME/.private"]
+  }
+}
 ```
 
 Can be specified multiple times.
@@ -744,11 +766,9 @@ Can be specified multiple times.
 </Warning>
 
 <Note>
-  `--bypass-protection` without a matching grant (`--allow`, `--read`, `--write`, etc.) is a hard error. This prevents silent no-ops on Linux and unintended implicit grants on macOS.
-</Note>
-
-<Note>
-  **Renamed in issue #594.** This flag was renamed from its former deny-override name. The legacy name is still accepted as a deprecated alias and emits a warning on use; it will be removed in v1.0.0.
+  `--bypass-protection` without a matching filesystem or Unix socket grant is
+  a hard error. This prevents silent no-ops on Linux and unintended implicit
+  grants on macOS.
 </Note>
 
 ### Credential Options
@@ -870,6 +890,22 @@ nono run --allow-gpu -- llama-cli -m ./model.gguf -p "hello"
 
 <Note>
   When used with a profile, the profile must opt into `allow_gpu`; otherwise nono fails closed with an error. Without a profile, the CLI flag alone is sufficient.
+</Note>
+
+#### `--strict-broker-path`
+
+Refuse to start, instead of warning, when a filesystem grant (`--allow`/`--write`/a profile's `filesystem.allow`) overlaps the ambient `PATH` — either a whole directory, or one binary inside an otherwise-unwritable directory via a file-scoped grant (e.g. `filesystem.write: ["/usr/local/bin/gh"]`).
+
+This isn't about nono's own credential/browser brokers — they already sanitize `PATH` before resolving anything by bare name (see [PATH Sanitization for Host-Side Brokers](/cli/internals/security-model#path-sanitization-for-host-side-brokers)). It's about the writable path itself: once the sandboxed process can write there, it can plant (or overwrite) a same-named binary that anything *else* on the host — a shell, a cron job, an unrelated tool — will run with full privileges the next time it does an ordinary `PATH` lookup, entirely outside nono.
+
+By default nono only warns about this and proceeds, since directories like `$HOME/go/bin` are a common and often legitimate grant. `--strict-broker-path` turns that warning into a hard failure for sessions where you want to rule out the exposure entirely.
+
+```bash
+nono run --allow "$HOME/go/bin" --strict-broker-path -- my-agent
+```
+
+<Note>
+  Not available on `nono wrap`. Warnings are unconditional there; only the strict refusal is opt-in, and `wrap` keeps a minimal flag surface.
 </Note>
 
 #### `--allow-http2`
@@ -1141,6 +1177,21 @@ NONO_STARTUP_TIMEOUT=10 nono run --allow-cwd -- opencode
 
 No timeout is applied by default. When a known built-in profile exists for the binary (e.g. `opencode`, `claude`), the warning message also suggests the recommended profile.
 
+#### `--network-denial-audit-rate` and `--network-denial-audit-burst`
+
+Set how many denied network syscalls nono records individually in the audit trail and diagnostics, for this run only. `--network-denial-audit-rate` is the sustained number per second (default `20`, maximum `1000`). `--network-denial-audit-burst` is how many may be recorded at once (default `50`, maximum `10000`). Both must be at least `1`.
+
+Denials past the budget are still denied. They are counted and reported in a single summary audit event, so nothing is dropped silently. Allowed connections never consume the budget. This only affects Linux seccomp network mediation (proxy mode and pathname AF_UNIX mediation).
+
+Each flag overrides the matching `diagnostics.network_denial_audit` profile field, and the other field keeps its profile value. See [Tuning How Many Network Denials Are Recorded](/cli/features/profile-authoring#tuning-how-many-network-denials-are-recorded).
+
+```bash
+# Record every denial from a noisy run
+nono run --network-denial-audit-burst 5000 --allow-domain example.com -- ./agent
+```
+
+Applies to `nono run`.
+
 #### `--no-diagnostics`
 
 Suppress the diagnostic footer when the command exits non-zero. Useful for scripts that parse stderr and need stable output.
@@ -1277,7 +1328,7 @@ The `why` command checks why filesystem, network, scope, or command access would
 
 ### `--command`
 
-Tool-sandbox command name to check against Tool Sandbox  command policy. Pass the command arguments after `--`.
+Command name to check against command policy. Pass the command arguments after `--`.
 
 ```bash
 nono why --profile gh --command gh -- issue comment 1052

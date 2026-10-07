@@ -170,6 +170,8 @@ fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
         let name = line.split(':').next().unwrap_or("").trim();
         if name.eq_ignore_ascii_case("proxy-connection")
             || name.eq_ignore_ascii_case("proxy-authorization")
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
         {
             continue;
         }
@@ -178,15 +180,42 @@ fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Like [`strip_proxy_headers`], but also redeems any `nono_…` phantom nonce
-/// via `resolver`/`consumer`, fail-open per [`tls_intercept::handle::resolve_nonce_in_header_value`].
+/// Credential names every route on `host_port` redeems. The absolute-form path
+/// has only the target host to go on, so when several routes share an upstream it
+/// must not grant one route's phantoms to another: intersect instead.
 ///
-/// Returns the rewritten headers and whether a real credential was swapped in,
-/// so the audit event can distinguish an injected credential from a bare route
-/// match (no credential configured, or a nonce that failed to redeem).
+/// `None` means the routes declared by-value redemption but agree on nothing —
+/// no header may be redeemed at all, not even via the grant set.
+fn shared_redeem_phantoms(
+    store: &crate::route::RouteStore,
+    host_port: &str,
+) -> Option<Vec<String>> {
+    let candidates = store.lookup_all_by_upstream(host_port);
+    let any_declared = candidates
+        .iter()
+        .any(|(_, route)| !route.redeem_phantoms.is_empty());
+    let mut routes = candidates.into_iter();
+    let (_, first) = routes.next()?;
+    let mut shared = first.redeem_phantoms.clone();
+    for (_, route) in routes {
+        shared.retain(|name| route.redeem_phantoms.contains(name));
+    }
+    if any_declared && shared.is_empty() {
+        return None;
+    }
+    Some(shared)
+}
+
+/// Like [`strip_proxy_headers`], but also redeems any phantom via
+/// [`crate::token::NonceResolver::rewrite_header_value`] or, when
+/// `allowed_credentials` is non-empty, the route-authoritative
+/// [`crate::token::NonceResolver::rewrite_header_value_for_credentials`]. The
+/// returned flag lets the audit event distinguish an injected credential from a
+/// bare route match.
 fn strip_and_redeem_proxy_headers(
     header_bytes: &[u8],
     consumer: &str,
+    allowed_credentials: &[String],
     resolver: &dyn crate::token::NonceResolver,
 ) -> (Vec<u8>, bool) {
     let header_str = match std::str::from_utf8(header_bytes) {
@@ -203,6 +232,8 @@ fn strip_and_redeem_proxy_headers(
         let trimmed_name = name.trim();
         if trimmed_name.eq_ignore_ascii_case("proxy-connection")
             || trimmed_name.eq_ignore_ascii_case("proxy-authorization")
+            || trimmed_name.eq_ignore_ascii_case("content-length")
+            || trimmed_name.eq_ignore_ascii_case("transfer-encoding")
         {
             continue;
         }
@@ -210,8 +241,12 @@ fn strip_and_redeem_proxy_headers(
             Some(v) => (v, "\r\n"),
             None => (rest, ""),
         };
-        match tls_intercept::handle::resolve_nonce_in_header_value(value.trim(), consumer, resolver)
-        {
+        match tls_intercept::handle::resolve_nonce_in_header_value(
+            value.trim(),
+            consumer,
+            allowed_credentials,
+            resolver,
+        ) {
             Some(resolved) => {
                 redeemed = true;
                 out.extend_from_slice(name.as_bytes());
@@ -240,8 +275,8 @@ pub struct ProxyHandle {
     pub port: u16,
     /// Session token for client authentication
     pub token: Zeroizing<String>,
-    /// Shared in-memory network audit log
-    audit_log: audit::SharedAuditLog,
+    /// Shared in-memory network audit log. `None` when network audit is disabled.
+    audit_log: Option<audit::SharedAuditLog>,
     /// Send `true` to trigger graceful shutdown
     shutdown_tx: watch::Sender<bool>,
     /// Route prefixes that have credentials actually loaded.
@@ -277,10 +312,37 @@ impl ProxyHandle {
         let _ = self.shutdown_tx.send(true);
     }
 
+    /// Clone the collected network audit events without clearing them.
+    ///
+    /// Read-only view for the end-of-session diagnostic footer. The events
+    /// stay queued so the subsequent [`Self::drain_audit_events`] in session
+    /// finalization still delivers every event to the persistent audit
+    /// record — the snapshot must never reduce audit coverage.
+    ///
+    /// Returns an empty vec when network audit was disabled at start.
+    #[must_use]
+    pub fn snapshot_audit_events(&self) -> Vec<nono::undo::NetworkAuditEvent> {
+        match self.audit_log.as_ref() {
+            Some(audit_log) => audit::snapshot_audit_events(audit_log),
+            None => Vec::new(),
+        }
+    }
+
     /// Drain and return collected network audit events.
+    ///
+    /// Returns an empty vec when network audit was disabled at start.
     #[must_use]
     pub fn drain_audit_events(&self) -> Vec<nono::undo::NetworkAuditEvent> {
-        audit::drain_audit_events(&self.audit_log)
+        match self.audit_log.as_ref() {
+            Some(audit_log) => audit::drain_audit_events(audit_log),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether this proxy allocated the in-memory network audit buffer.
+    #[must_use]
+    pub fn network_audit_enabled(&self) -> bool {
+        self.audit_log.is_some()
     }
 
     /// Path to the TLS-intercept trust bundle, when interception is active.
@@ -338,19 +400,10 @@ impl ProxyHandle {
     /// the handle doesn't keep a copy, so the CLI passes it back in.
     #[must_use]
     pub fn route_diagnostics(&self, config: &ProxyConfig) -> Vec<String> {
-        // Reconstruct the same host filter the server applies (see `start`).
-        // A credential/endpoint route only injects or filters; traffic still
-        // has to clear the allowlist to reach the upstream at all. A route
-        // whose upstream is not allow-listed is dead config (the proxy 403s
-        // it), so skip it here rather than advertise an unreachable route.
-        let filter = if config.strict_filter {
-            crate::filter::ProxyFilter::new_strict(&config.allowed_hosts)
-        } else if config.allowed_hosts.is_empty() {
-            crate::filter::ProxyFilter::allow_all()
-        } else {
-            crate::filter::ProxyFilter::new(&config.allowed_hosts)
-        }
-        .with_denied_hosts(&config.denied_hosts);
+        // Explicit reverse routes have their own allowlist and do not inherit
+        // the general forward-proxy allowlist. Session deny rules still apply.
+        let filter =
+            crate::filter::ProxyFilter::allow_all().with_denied_hosts(&config.denied_hosts);
         // Hostname-only reachability: pass no resolved IPs so the link-local
         // SSRF check is skipped (that is a runtime DNS concern, not a config
         // one) and only the deny-list / allowlist hostname rules apply.
@@ -850,7 +903,11 @@ fn connect_target_from_normalized_authority(host_port: &str) -> Option<(String, 
 
 /// Shared state for the proxy server.
 struct ProxyState {
+    /// General forward-proxy policy selected by the sandbox/session.
     filter: ProxyFilter,
+    /// Explicit upstream authority carried by configured reverse routes.
+    /// Keeping this separate prevents a credential route from widening CONNECT.
+    route_filter: ProxyFilter,
     session_token: Zeroizing<String>,
     /// Route-level configuration (upstream, L7 filtering, custom TLS CA) for all routes.
     route_store: Arc<RouteStore>,
@@ -872,12 +929,13 @@ struct ProxyState {
     /// Active connection count for connection limiting.
     active_connections: AtomicUsize,
     /// Shared network audit log for this proxy session.
-    audit_log: audit::SharedAuditLog,
+    /// `None` when `ProxyConfig.enable_network_audit` is false.
+    audit_log: Option<audit::SharedAuditLog>,
     /// Optional approval backend registry for L7 endpoint-policy approve routes.
     approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
     /// Optional supervisor-backed capture backend for command-backed credentials.
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
-    /// Optional resolver for tool-sandbox broker nonces found in request headers.
+    /// Optional resolver for command-mediation broker nonces found in request headers.
     /// Resolves `nono_<hex>` values in `Authorization` and similar headers before
     /// forwarding upstream. Consumer IDs use the form `"proxy.<route_id>"`.
     nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
@@ -912,6 +970,42 @@ impl crate::token::NonceResolver for CompositeNonceResolver {
             .as_ref()
             .and_then(|resolver| resolver.resolve(nonce, consumer))
             .or_else(|| self.oauth.resolve(nonce, consumer))
+    }
+
+    fn resolve_for_credentials(
+        &self,
+        nonce: &str,
+        allowed_credentials: &[String],
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        // Only the broker tracks credential names; OAuth-capture has none.
+        self.external
+            .as_ref()
+            .and_then(|resolver| resolver.resolve_for_credentials(nonce, allowed_credentials))
+    }
+
+    fn rewrite_header_value(&self, value: &str, consumer: &str) -> Option<String> {
+        self.external
+            .as_ref()
+            .and_then(|resolver| resolver.rewrite_header_value(value, consumer))
+            .or_else(|| self.oauth.rewrite_header_value(value, consumer))
+    }
+
+    fn rewrite_header_value_for_credentials(
+        &self,
+        value: &str,
+        allowed_credentials: &[String],
+    ) -> Option<String> {
+        // Only the broker tracks credential names; OAuth-capture has none.
+        self.external.as_ref().and_then(|resolver| {
+            resolver.rewrite_header_value_for_credentials(value, allowed_credentials)
+        })
+    }
+
+    fn contains_phantom(&self, value: &str) -> bool {
+        self.external
+            .as_ref()
+            .is_some_and(|resolver| resolver.contains_phantom(value))
+            || self.oauth.contains_phantom(value)
     }
 }
 
@@ -1062,8 +1156,12 @@ pub async fn start_with_nonce_resolver(
     let (credential_store, proxy_diagnostics) = if config.routes.is_empty() {
         (CredentialStore::empty(), Vec::new())
     } else {
-        let outcome =
-            CredentialStore::load_with_diagnostics(&config.routes, &tls_connector).await?;
+        let outcome = CredentialStore::load_with_diagnostics(
+            &config.routes,
+            &tls_connector,
+            config.outer_caps.as_ref(),
+        )
+        .await?;
         (outcome.store, outcome.diagnostics)
     };
     let mut loaded_routes = credential_store.loaded_prefixes();
@@ -1087,6 +1185,10 @@ pub async fn start_with_nonce_resolver(
         ProxyFilter::new(&config.allowed_hosts)
     }
     .with_denied_hosts(&config.denied_hosts);
+    let mut route_allowed_hosts: Vec<String> = route_hosts.iter().cloned().collect();
+    route_allowed_hosts.extend(oauth_capture_store.host_ports());
+    let route_filter =
+        ProxyFilter::new_strict(&route_allowed_hosts).with_denied_hosts(&config.denied_hosts);
 
     // Build bypass matcher from external proxy config (once, not per-request)
     let bypass_matcher = config
@@ -1097,7 +1199,11 @@ pub async fn start_with_nonce_resolver(
 
     // Shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let audit_log = audit::new_audit_log();
+    let audit_log = if config.enable_network_audit {
+        Some(audit::new_audit_log())
+    } else {
+        None
+    };
 
     // Compute NO_PROXY hosts: allowed_hosts that can be reached via
     // direct TCP connections (i.e. their port is in direct_connect_ports).
@@ -1236,6 +1342,7 @@ pub async fn start_with_nonce_resolver(
     let intercept_ca_env_vars = config.intercept_ca_env_vars.clone();
     let state = Arc::new(ProxyState {
         filter,
+        route_filter,
         session_token: session_token.clone(),
         route_store: Arc::new(route_store),
         credential_store: Arc::new(credential_store),
@@ -1246,7 +1353,7 @@ pub async fn start_with_nonce_resolver(
         upstream_pool,
         tls_connector_h2,
         active_connections: AtomicUsize::new(0),
-        audit_log: Arc::clone(&audit_log),
+        audit_log: audit_log.clone(),
         approval_backends,
         credential_capture_backend,
         nonce_resolver: effective_nonce_resolver,
@@ -1499,7 +1606,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                         host, port, e
                                     );
                                     audit::log_denied(
-                                        Some(&state.audit_log),
+                                        state.audit_log.as_ref(),
                                         audit::ProxyMode::ConnectIntercept,
                                         &audit::EventContext {
                                             route_id,
@@ -1595,7 +1702,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                          section from the external proxy config or \
                                          wait for a future release";
                                     audit::log_denied(
-                                        Some(&state.audit_log),
+                                        state.audit_log.as_ref(),
                                         audit::ProxyMode::ConnectIntercept,
                                         &audit::EventContext {
                                             route_id,
@@ -1656,7 +1763,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 .get_or_probe(
                                     &host,
                                     port,
-                                    &state.filter,
+                                    &state.route_filter,
                                     &tls_connector_h2,
                                     upstream_proxy.as_ref(),
                                     &h2_connector_cache_key,
@@ -1676,8 +1783,8 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                             cert_cache: Arc::clone(cache),
                             tls_connector: &state.tls_connector,
                             tls_connector_h2: &tls_connector_h2,
-                            filter: &state.filter,
-                            audit_log: Some(&state.audit_log),
+                            filter: &state.route_filter,
+                            audit_log: state.audit_log.as_ref(),
                             upstream_proxy,
                             approval_backends: state.approval_backends.clone(),
                             credential_capture_backend: state.credential_capture_backend.clone(),
@@ -1695,7 +1802,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                             authority
                         );
                         audit::log_denied(
-                            Some(&state.audit_log),
+                            state.audit_log.as_ref(),
                             audit::ProxyMode::Connect,
                             &audit::EventContext {
                                 route_id,
@@ -1752,7 +1859,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &state.session_token,
                 state.config.require_auth,
                 ext_config,
-                Some(&state.audit_log),
+                state.audit_log.as_ref(),
             )
             .await
         } else if state.config.external_proxy.is_some() {
@@ -1772,7 +1879,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &state.session_token,
                 &header_bytes,
                 connect_auth_mode,
-                Some(&state.audit_log),
+                state.audit_log.as_ref(),
             )
             .await
         } else {
@@ -1783,7 +1890,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &state.session_token,
                 &header_bytes,
                 connect_auth_mode,
-                Some(&state.audit_log),
+                state.audit_log.as_ref(),
             )
             .await
         }
@@ -1810,11 +1917,11 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             credential_store: &state.credential_store,
             session_token: &state.session_token,
             require_auth: state.config.require_auth,
-            filter: &state.filter,
+            filter: &state.route_filter,
             tls_connector: &state.tls_connector,
             default_tls_config: &state.default_tls_config,
             upstream_pool: &state.upstream_pool,
-            audit_log: Some(&state.audit_log),
+            audit_log: state.audit_log.as_ref(),
             approval_backends: state.approval_backends.clone(),
             credential_capture_backend: state.credential_capture_backend.clone(),
         };
@@ -1826,7 +1933,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
         if !check.result.is_allowed() {
             let reason = check.result.reason();
             audit::log_denied(
-                Some(&state.audit_log),
+                state.audit_log.as_ref(),
                 audit::ProxyMode::Connect,
                 &audit::EventContext {
                     denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
@@ -1905,7 +2012,7 @@ async fn handle_forward_http(
         let (host, port) =
             parse_non_connect_target(first_line).unwrap_or_else(|_| ("unknown".to_string(), 0));
         audit::log_denied(
-            Some(&state.audit_log),
+            state.audit_log.as_ref(),
             audit::ProxyMode::Reverse,
             &audit::EventContext {
                 auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
@@ -1946,11 +2053,11 @@ async fn handle_forward_http(
             credential_store: &state.credential_store,
             session_token: &state.session_token,
             require_auth: state.config.require_auth,
-            filter: &state.filter,
+            filter: &state.route_filter,
             tls_connector: &state.tls_connector,
             default_tls_config: &state.default_tls_config,
             upstream_pool: &state.upstream_pool,
-            audit_log: Some(&state.audit_log),
+            audit_log: state.audit_log.as_ref(),
             approval_backends: state.approval_backends.clone(),
             credential_capture_backend: state.credential_capture_backend.clone(),
         };
@@ -1962,7 +2069,7 @@ async fn handle_forward_http(
     if !check.result.is_allowed() {
         let reason = check.result.reason();
         audit::log_denied(
-            Some(&state.audit_log),
+            state.audit_log.as_ref(),
             audit::ProxyMode::Reverse,
             &audit::EventContext {
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
@@ -1978,8 +2085,16 @@ async fn handle_forward_http(
         return Ok(());
     }
 
-    // 3. Build the origin-form request bytes: rewritten request line +
-    //    proxy-header-stripped header block + terminating CRLF.
+    // 3. Read the request body before building upstream headers so chunked
+    //    framing can be decoded and re-written with Content-Length.
+    let body = match reverse::read_request_body(stream, header_bytes, buffered).await? {
+        Some(body) => body,
+        None => return Ok(()), // send_error already written (e.g. 413 / 400)
+    };
+
+    // Build the origin-form request bytes: rewritten request line +
+    // proxy-header-stripped header block + optional Content-Length +
+    // terminating CRLF.
     let origin_line = rewrite_absolute_to_origin_form(first_line)?;
     let inbound_path = origin_line
         .split_whitespace()
@@ -1999,31 +2114,35 @@ async fn handle_forward_http(
         .route_store
         .lookup_by_upstream(&host_port)
         .map(|(prefix, _)| prefix.to_string());
+    let redeemable = matched_route.as_ref().and_then(|prefix| {
+        Some((
+            prefix,
+            shared_redeem_phantoms(&state.route_store, &host_port)?,
+        ))
+    });
     let (filtered_headers, credential_redeemed) =
-        match (&matched_route, state.nonce_resolver.as_deref()) {
-            (Some(prefix), Some(resolver)) => {
+        match (&redeemable, state.nonce_resolver.as_deref()) {
+            (Some((prefix, redeem_phantoms)), Some(resolver)) => {
                 debug!(
                     "forward-http: absolute-form target {} matches route '{}' upstream; \
                  redeeming phantom headers before forwarding",
                     host_port, prefix
                 );
                 let consumer = format!("proxy.{prefix}");
-                strip_and_redeem_proxy_headers(header_bytes, &consumer, resolver)
+                strip_and_redeem_proxy_headers(header_bytes, &consumer, redeem_phantoms, resolver)
             }
             _ => (strip_proxy_headers(header_bytes), false),
         };
-    let mut request_bytes = Vec::with_capacity(origin_line.len() + filtered_headers.len() + 2);
+
+    let mut request_bytes = Vec::with_capacity(origin_line.len() + filtered_headers.len() + 64);
     request_bytes.extend_from_slice(origin_line.as_bytes());
     request_bytes.extend_from_slice(&filtered_headers);
+    // Always re-frame when the client declared a body (CL or chunked TE),
+    // including empty bodies — otherwise upstreams may answer 411 or hang.
+    if reverse::should_reframe_with_content_length(header_bytes) {
+        request_bytes.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    }
     request_bytes.extend_from_slice(b"\r\n");
-
-    // Read the request body honoring Content-Length. `buffered` holds any
-    // bytes the BufReader already read past the header terminator.
-    let content_length = reverse::extract_content_length(header_bytes);
-    let body = match reverse::read_request_body(stream, content_length, buffered).await? {
-        Some(body) => body,
-        None => return Ok(()), // send_error already written (e.g. 413)
-    };
 
     // 4. Choose the upstream strategy: chain through the external/enterprise
     //    proxy when configured (unless the host is a bypass host), else
@@ -2038,7 +2157,7 @@ async fn handle_forward_http(
                      implemented; remove the auth section from the external proxy \
                      config or wait for a future release";
                 audit::log_denied(
-                    Some(&state.audit_log),
+                    state.audit_log.as_ref(),
                     audit::ProxyMode::Reverse,
                     &audit::EventContext {
                         denial_category: Some(
@@ -2080,7 +2199,7 @@ async fn handle_forward_http(
     };
 
     let audit_ctx = AuditCtx {
-        log: Some(&state.audit_log),
+        log: state.audit_log.as_ref(),
         mode: audit::ProxyMode::Reverse,
         event_ctx: audit::EventContext {
             route_id: matched_route.as_deref(),
@@ -2099,7 +2218,7 @@ async fn handle_forward_http(
         Err(e) => {
             warn!("forward-http upstream connection failed: {}", e);
             audit::log_denied(
-                Some(&state.audit_log),
+                state.audit_log.as_ref(),
                 audit::ProxyMode::Reverse,
                 &audit::EventContext {
                     denial_category: Some(
@@ -2173,6 +2292,7 @@ mod tests {
     #[tokio::test]
     async fn normalize_authority_matches_ipv6_route_upstreams() -> Result<()> {
         let routes = vec![crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "local".to_string(),
             upstream: "http://[::1]:8080/v1".to_string(),
             credential_key: Some("local".to_string()),
@@ -2275,6 +2395,7 @@ mod tests {
     /// moved back inside the guard.
     fn declarative_route(upstream: &str) -> crate::config::RouteConfig {
         crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "svc".to_string(),
             upstream: upstream.to_string(),
             credential_key: None,
@@ -2374,6 +2495,33 @@ mod tests {
             !status.contains("407") && !status.contains("401"),
             "auth must not be enforced when disabled, got: {status:?}"
         );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reverse_route_authority_does_not_widen_forward_allowlist() {
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["allowed.invalid".to_string()],
+            strict_filter: true,
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+
+        let reverse = unauthenticated_reverse_request(handle.port).await;
+        assert!(
+            reverse.contains("200"),
+            "an explicit reverse route must reach its configured upstream: {reverse:?}"
+        );
+
+        let forward = unauthenticated_forward_request(handle.port, &upstream).await;
+        assert!(
+            forward.contains("403"),
+            "the same upstream must remain unavailable as ordinary forward traffic: {forward:?}"
+        );
+        assert_eq!(handle.route_diagnostics(&config).len(), 1);
         handle.shutdown();
     }
 
@@ -2551,6 +2699,7 @@ mod tests {
             "501 upgrade response must close the connection, got: {response:?}"
         );
 
+        assert!(handle.network_audit_enabled());
         let events = handle.drain_audit_events();
         assert!(
             events.iter().any(|e| {
@@ -2558,6 +2707,178 @@ mod tests {
                     == Some(nono::undo::NetworkAuditDenialCategory::UnsupportedUpgrade)
             }),
             "expected an UnsupportedUpgrade audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_disabled_network_audit_does_not_buffer_events() {
+        let upstream = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            enable_network_audit: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        assert!(
+            !handle.network_audit_enabled(),
+            "disabled network audit must not allocate the in-memory buffer"
+        );
+
+        let response = send_raw_request(
+            handle.port,
+            b"GET /svc/ HTTP/1.1\r\n\
+              Host: 127.0.0.1\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 501"),
+            "disabling audit must not change upgrade rejection, got: {response:?}"
+        );
+        assert!(
+            handle.drain_audit_events().is_empty(),
+            "disabled network audit must not accumulate events"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Servlet-style mock origin: strips `;...` path parameters from each
+    /// segment and resolves dot-segments, the way Tomcat/Jetty/Spring route
+    /// requests. Records every raw request-target it receives.
+    async fn spawn_servlet_upstream() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hits_handle = std::sync::Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let hits_handle = std::sync::Arc::clone(&hits_handle);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let raw_target = head
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
+                    hits_handle.lock().unwrap().push(raw_target);
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("127.0.0.1:{}", addr.port()), hits)
+    }
+
+    /// Regression for GHSA-8r33-hr9m-69wh: the endpoint policy matched a
+    /// normalized path while the raw path was forwarded upstream. A segment
+    /// like `..;jsessionid=1` is an opaque literal to the normalizer but a
+    /// dot-segment to servlet upstreams (which strip `;` path parameters),
+    /// so a deny rule on `/v1/secrets/**` could be escaped via an allowed
+    /// sibling prefix. Ambiguous paths must now be denied at the proxy.
+    #[tokio::test]
+    async fn test_endpoint_policy_denies_path_parameter_traversal_end_to_end() {
+        use crate::config::{
+            EndpointPolicyConfig, EndpointPolicyDecision, EndpointPolicyDefault, EndpointPolicyRule,
+        };
+
+        let (upstream, hits) = spawn_servlet_upstream().await;
+        let mut route = declarative_route(&format!("http://{upstream}"));
+        route.endpoint_policy = Some(EndpointPolicyConfig {
+            default: EndpointPolicyDefault {
+                decision: EndpointPolicyDecision::Allow,
+                backend: None,
+                timeout_secs: None,
+            },
+            deny: vec![EndpointPolicyRule {
+                method: "*".to_string(),
+                path: "/v1/secrets/**".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+            ..EndpointPolicyConfig::default()
+        });
+        let config = ProxyConfig {
+            routes: vec![route],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        // Control 1: the deny rule works on the direct path.
+        let response = send_raw_request(
+            handle.port,
+            b"GET /svc/v1/secrets/token HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "direct denied path must get 403, got: {response:?}"
+        );
+
+        // Control 2: a clean allowed path still reaches the upstream.
+        let response = send_raw_request(
+            handle.port,
+            b"GET /svc/v1/public/info HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "clean allowed path must reach the upstream, got: {response:?}"
+        );
+
+        // The advisory PoC path and encoded relatives: each must be refused
+        // by the proxy, not forwarded for the upstream to reinterpret.
+        for exploit in [
+            "/svc/v1/public/..;jsessionid=1/secrets/token".to_string(),
+            "/svc/v1/public/%2e%2e/secrets/token".to_string(),
+            "/svc/v1/public/%252e%252e/secrets/token".to_string(),
+        ] {
+            let request = format!("GET {exploit} HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+            let response = send_raw_request(handle.port, request.as_bytes()).await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "ambiguous path {exploit} must get 403, got: {response:?}"
+            );
+        }
+
+        // The upstream must have seen only the clean allowed request.
+        let seen = hits.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec!["/v1/public/info".to_string()],
+            "no ambiguous path may reach the upstream"
+        );
+
+        // The audit log must record the ambiguity denials.
+        let events = handle.drain_audit_events();
+        assert!(
+            events.iter().any(|e| {
+                e.endpoint_policy_rule.as_deref() == Some("endpoint_policy.ambiguous_path")
+            }),
+            "expected an ambiguous_path policy denial in the audit log, got: {events:?}"
         );
 
         handle.shutdown();
@@ -2699,7 +3020,7 @@ mod tests {
             let _handle = ProxyHandle {
                 port: 12345,
                 token: Zeroizing::new("test_token".to_string()),
-                audit_log: audit::new_audit_log(),
+                audit_log: Some(audit::new_audit_log()),
                 shutdown_tx,
                 loaded_routes: std::collections::HashSet::new(),
                 no_proxy_hosts: Vec::new(),
@@ -2729,6 +3050,7 @@ mod tests {
         {
             let config = ProxyConfig {
                 routes: vec![crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "openai".to_string(),
                     upstream: "https://api.openai.com".to_string(),
                     credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -2808,6 +3130,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "alias".to_string(),
                 upstream: "https://aliased.example.com".to_string(),
                 credential_key: None,
@@ -2859,10 +3182,12 @@ mod tests {
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "access_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "refresh_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                     ],
                     request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
@@ -2894,6 +3219,7 @@ mod tests {
             .join("intercept");
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -2945,6 +3271,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "openai".to_string(),
                     upstream: "https://api.openai.com".to_string(),
                     credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -2968,6 +3295,7 @@ mod tests {
                     rate_limit: None,
                 },
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "alias".to_string(),
                     upstream: "https://aliased.example.com".to_string(),
                     credential_key: None,
@@ -3031,6 +3359,7 @@ mod tests {
             routes: vec![
                 // Credential catch-all route (no endpoint rules).
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "github_api".to_string(),
                     upstream: "https://api.github.com".to_string(),
                     credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -3055,6 +3384,7 @@ mod tests {
                 },
                 // Synthetic endpoint-authorization route for the same upstream.
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "_ep_api.github.com".to_string(),
                     upstream: "https://api.github.com".to_string(),
                     credential_key: None,
@@ -3118,6 +3448,7 @@ mod tests {
             routes: vec![
                 // Wildcard credential route.
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "github_raw".to_string(),
                     upstream: "https://*.githubusercontent.com".to_string(),
                     credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -3142,6 +3473,7 @@ mod tests {
                 },
                 // `_ep_` route on a concrete subdomain covered by the wildcard.
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "_ep_raw.githubusercontent.com".to_string(),
                     upstream: "https://raw.githubusercontent.com".to_string(),
                     credential_key: None,
@@ -3188,13 +3520,13 @@ mod tests {
         handle.shutdown();
     }
 
-    /// A credential route whose upstream is not in the host allowlist is dead
-    /// config — traffic to it would be denied by the filter regardless of the
-    /// injected credential — so it is omitted from the diagnostics entirely.
+    /// Explicit reverse routes are independent from the general forward
+    /// allowlist, so diagnostics include both configured upstreams.
     #[tokio::test]
-    async fn test_route_diagnostics_omits_unreachable_upstream() {
+    async fn test_route_diagnostics_ignore_forward_allowlist() {
         let dir = tempfile::tempdir().unwrap();
         let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: prefix.to_string(),
             upstream: upstream.to_string(),
             credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -3222,7 +3554,7 @@ mod tests {
                 route("github_api", "https://api.github.com"),
                 route("datadog", "https://api.datadoghq.com"),
             ],
-            // Only github is allow-listed; datadog's upstream is unreachable.
+            // This allowlist controls only ordinary forward traffic.
             allowed_hosts: vec!["api.github.com".to_string()],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -3230,22 +3562,20 @@ mod tests {
         let handle = start(config.clone()).await.unwrap();
         let rows = handle.route_diagnostics(&config);
 
-        assert_eq!(rows.len(), 1, "unreachable upstream must be omitted");
-        assert!(rows[0].contains("api.github.com"));
-        assert!(
-            !rows.iter().any(|s| s.contains("datadoghq.com")),
-            "non-allow-listed upstream must not be listed, got: {rows:?}"
-        );
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.contains("api.github.com")));
+        assert!(rows.iter().any(|row| row.contains("datadoghq.com")));
 
         handle.shutdown();
     }
 
-    /// Strict mode with a non-empty allowlist behaves the same: a route to a
-    /// non-allow-listed upstream is omitted, an allow-listed one is shown.
+    /// Strict forward filtering does not hide explicit routes, but the shared
+    /// deny list still makes a route unreachable and omits its diagnostic.
     #[tokio::test]
-    async fn test_route_diagnostics_respects_wildcard_allowlist() {
+    async fn test_route_diagnostics_respect_route_denies() {
         let dir = tempfile::tempdir().unwrap();
         let route = |prefix: &str, upstream: &str| crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: prefix.to_string(),
             upstream: upstream.to_string(),
             credential_key: Some("env://NONO_TEST_MISSING".to_string()),
@@ -3275,6 +3605,7 @@ mod tests {
             ],
             // Wildcard covers the githubusercontent subdomain but not evil.
             allowed_hosts: vec!["*.githubusercontent.com".to_string()],
+            denied_hosts: vec!["evil.example.com".to_string()],
             strict_filter: true,
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -3282,12 +3613,12 @@ mod tests {
         let handle = start(config.clone()).await.unwrap();
         let rows = handle.route_diagnostics(&config);
 
-        assert_eq!(rows.len(), 1, "only the wildcard-covered upstream remains");
-        assert!(rows[0].contains("raw.githubusercontent.com"));
+        assert_eq!(rows.len(), 1);
         assert!(
-            !rows.iter().any(|s| s.contains("evil.example.com")),
-            "upstream outside the wildcard must be omitted, got: {rows:?}"
+            rows.iter()
+                .any(|row| row.contains("raw.githubusercontent.com"))
         );
+        assert!(!rows.iter().any(|row| row.contains("evil.example.com")));
 
         handle.shutdown();
     }
@@ -3326,7 +3657,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("a".repeat(64)),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: vec![
@@ -3362,6 +3693,7 @@ mod tests {
     async fn test_proxy_credential_env_vars() {
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: None,
@@ -3405,7 +3737,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
@@ -3417,6 +3749,7 @@ mod tests {
         };
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("openai_api_key".to_string()),
@@ -3469,7 +3802,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: ["openai".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
@@ -3481,6 +3814,7 @@ mod tests {
         };
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("op://Development/OpenAI/credential".to_string()),
@@ -3537,7 +3871,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             // Only "openai" was loaded; "github" credential was unavailable
             loaded_routes: ["openai".to_string()].into_iter().collect(),
@@ -3551,6 +3885,7 @@ mod tests {
         let config = ProxyConfig {
             routes: vec![
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "openai".to_string(),
                     upstream: "https://api.openai.com".to_string(),
                     credential_key: Some("openai_api_key".to_string()),
@@ -3574,6 +3909,7 @@ mod tests {
                     rate_limit: None,
                 },
                 crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
                     prefix: "github".to_string(),
                     upstream: "https://api.github.com".to_string(),
                     credential_key: Some("env://GITHUB_TOKEN".to_string()),
@@ -3628,7 +3964,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("session_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: ["myapi".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
@@ -3640,6 +3976,7 @@ mod tests {
         };
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "myapi".to_string(),
                 upstream: "https://api.internal.corp".to_string(),
                 credential_key: None,
@@ -3690,7 +4027,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 58406,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
@@ -3704,6 +4041,7 @@ mod tests {
         // Test leading slash
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "/anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: None,
@@ -3743,6 +4081,7 @@ mod tests {
         // Test trailing slash
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai/".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: None,
@@ -3792,7 +4131,7 @@ mod tests {
         let handle_no_env_var = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("phantom".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx: shutdown_tx.clone(),
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
@@ -3804,6 +4143,7 @@ mod tests {
         };
         let config_no_env_var = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: None,
@@ -3842,7 +4182,7 @@ mod tests {
         let handle_fixed = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("phantom".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx: shutdown_tx2,
             loaded_routes: ["anthropic".to_string()].into_iter().collect(),
             no_proxy_hosts: Vec::new(),
@@ -3854,6 +4194,7 @@ mod tests {
         };
         let config_fixed = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "anthropic".to_string(),
                 upstream: "https://api.anthropic.com".to_string(),
                 credential_key: Some("ANTHROPIC_API_KEY".to_string()),
@@ -3893,7 +4234,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: vec![
@@ -3932,7 +4273,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
@@ -3957,7 +4298,7 @@ mod tests {
         let handle = ProxyHandle {
             port: 12345,
             token: Zeroizing::new("test_token".to_string()),
-            audit_log: audit::new_audit_log(),
+            audit_log: Some(audit::new_audit_log()),
             shutdown_tx,
             loaded_routes: std::collections::HashSet::new(),
             no_proxy_hosts: Vec::new(),
@@ -4130,6 +4471,7 @@ mod tests {
             allowed_hosts: vec!["api.openai.com".to_string()],
             direct_connect_ports: vec![443],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("openai".to_string()),
@@ -4176,6 +4518,7 @@ mod tests {
             allowed_hosts: vec!["openai.com".to_string()],
             direct_connect_ports: vec![443],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("openai".to_string()),
@@ -4246,6 +4589,7 @@ mod tests {
                 "redis".to_string(),
             ],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com/v1".to_string(),
                 credential_key: Some("openai".to_string()),
@@ -4286,6 +4630,7 @@ mod tests {
                 "redis".to_string(),
             ],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "local".to_string(),
                 upstream: "http://[::1]:8080/v1".to_string(),
                 credential_key: Some("local".to_string()),
@@ -4328,6 +4673,7 @@ mod tests {
                 "redis".to_string(),
             ],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "internal".to_string(),
                 upstream: "https://*.dev.example.net".to_string(),
                 credential_key: Some("internal".to_string()),
@@ -4527,6 +4873,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -4749,11 +5096,24 @@ mod tests {
         nonce: String,
         real: Vec<u8>,
         admitted_consumer: String,
+        credential_name: String,
     }
 
     impl crate::token::NonceResolver for TestResolver {
         fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
             if nonce == self.nonce && consumer == self.admitted_consumer {
+                Some(Zeroizing::new(self.real.clone()))
+            } else {
+                None
+            }
+        }
+
+        fn resolve_for_credentials(
+            &self,
+            nonce: &str,
+            allowed: &[String],
+        ) -> Option<Zeroizing<Vec<u8>>> {
+            if nonce == self.nonce && allowed.iter().any(|a| a == &self.credential_name) {
                 Some(Zeroizing::new(self.real.clone()))
             } else {
                 None
@@ -4772,12 +5132,13 @@ mod tests {
             nonce: nonce.clone(),
             real: b"real-secret".to_vec(),
             admitted_consumer: "proxy.headroom".to_string(),
+            credential_name: "partner-token".to_string(),
         };
         let headers = format!(
             "Host: 127.0.0.1:8787\r\nAuthorization: Bearer {nonce}\r\nProxy-Authorization: Basic abc\r\n"
         );
         let (redeemed, swapped) =
-            strip_and_redeem_proxy_headers(headers.as_bytes(), "proxy.headroom", &resolver);
+            strip_and_redeem_proxy_headers(headers.as_bytes(), "proxy.headroom", &[], &resolver);
         assert!(swapped, "a real credential was swapped in");
         let s = String::from_utf8(redeemed).unwrap();
         assert!(
@@ -4802,10 +5163,11 @@ mod tests {
             nonce: nonce.clone(),
             real: b"real-secret".to_vec(),
             admitted_consumer: "proxy.other-route".to_string(),
+            credential_name: "partner-token".to_string(),
         };
         let headers = format!("Authorization: Bearer {nonce}\r\n");
         let (redeemed, swapped) =
-            strip_and_redeem_proxy_headers(headers.as_bytes(), "proxy.headroom", &resolver);
+            strip_and_redeem_proxy_headers(headers.as_bytes(), "proxy.headroom", &[], &resolver);
         assert!(
             !swapped,
             "no credential was swapped in for an unadmitted nonce"
@@ -4817,18 +5179,163 @@ mod tests {
         );
     }
 
+    /// Two routes sharing an upstream are indistinguishable on the absolute-form
+    /// path, so only credentials both routes redeem may be honored.
+    #[tokio::test]
+    async fn shared_redeem_phantoms_intersects_routes_on_one_upstream() {
+        let mut a = declarative_route("https://api.example.com");
+        a.prefix = "svc-a".to_string();
+        a.redeem_phantoms = vec!["shared-token".to_string(), "a-only".to_string()];
+        let mut b = declarative_route("https://api.example.com");
+        b.prefix = "svc-b".to_string();
+        b.redeem_phantoms = vec!["shared-token".to_string(), "b-only".to_string()];
+        let mut solo = declarative_route("https://other.example.com");
+        solo.prefix = "svc-solo".to_string();
+        solo.redeem_phantoms = vec!["solo-token".to_string()];
+
+        let store = crate::route::RouteStore::load(&[a, b, solo]).await.unwrap();
+        assert_eq!(
+            shared_redeem_phantoms(&store, "api.example.com:443"),
+            Some(vec!["shared-token".to_string()])
+        );
+        assert_eq!(
+            shared_redeem_phantoms(&store, "other.example.com:443"),
+            Some(vec!["solo-token".to_string()])
+        );
+        assert_eq!(
+            shared_redeem_phantoms(&store, "unrelated.example.com:443"),
+            None
+        );
+    }
+
+    /// Disjoint lists must deny outright, not fall back to grant-set auth — an
+    /// empty allow-list is the grant-set sentinel, so it cannot mean "deny".
+    #[tokio::test]
+    async fn shared_redeem_phantoms_denies_when_routes_agree_on_nothing() {
+        let mut a = declarative_route("https://api.example.com");
+        a.prefix = "svc-a".to_string();
+        a.redeem_phantoms = vec!["a-only".to_string()];
+        let mut b = declarative_route("https://api.example.com");
+        b.prefix = "svc-b".to_string();
+        b.redeem_phantoms = vec!["b-only".to_string()];
+
+        let store = crate::route::RouteStore::load(&[a, b]).await.unwrap();
+        assert_eq!(shared_redeem_phantoms(&store, "api.example.com:443"), None);
+    }
+
+    /// Routes that declare nothing keep the pre-existing grant-set path.
+    #[tokio::test]
+    async fn shared_redeem_phantoms_empty_when_no_route_declares_any() {
+        let mut a = declarative_route("https://api.example.com");
+        a.prefix = "svc-a".to_string();
+        let mut b = declarative_route("https://api.example.com");
+        b.prefix = "svc-b".to_string();
+
+        let store = crate::route::RouteStore::load(&[a, b]).await.unwrap();
+        assert_eq!(
+            shared_redeem_phantoms(&store, "api.example.com:443"),
+            Some(Vec::new())
+        );
+    }
+
     #[test]
     fn strip_and_redeem_proxy_headers_leaves_headers_without_nonce_unchanged() {
         let resolver = TestResolver {
             nonce: make_nonce(),
             real: b"real-secret".to_vec(),
             admitted_consumer: "proxy.headroom".to_string(),
+            credential_name: "partner-token".to_string(),
         };
         let headers = b"Host: 127.0.0.1:8787\r\nAccept: */*\r\n";
         let (redeemed, swapped) =
-            strip_and_redeem_proxy_headers(headers, "proxy.headroom", &resolver);
+            strip_and_redeem_proxy_headers(headers, "proxy.headroom", &[], &resolver);
         assert!(!swapped);
         assert_eq!(redeemed, headers);
+    }
+
+    /// A route declaring `redeem_phantoms` redeems by credential name, so the
+    /// absolute-form path must admit a phantom the consumer grant set would not.
+    #[test]
+    fn strip_and_redeem_proxy_headers_redeems_by_value_for_declared_route() {
+        let nonce = make_nonce();
+        let resolver = TestResolver {
+            nonce: nonce.clone(),
+            real: b"real-secret".to_vec(),
+            admitted_consumer: "proxy.other-route".to_string(),
+            credential_name: "partner-token".to_string(),
+        };
+        let headers = format!("Authorization: Bearer {nonce}\r\n");
+        let allowed = vec!["partner-token".to_string()];
+        let (redeemed, swapped) = strip_and_redeem_proxy_headers(
+            headers.as_bytes(),
+            "proxy.headroom",
+            &allowed,
+            &resolver,
+        );
+        assert!(
+            swapped,
+            "declared redeem_phantoms admits the phantom by value"
+        );
+        let s = String::from_utf8(redeemed).unwrap();
+        assert!(
+            s.contains("Authorization: Bearer real-secret"),
+            "got: {s:?}"
+        );
+        assert!(
+            !s.contains(&nonce),
+            "phantom nonce must not reach upstream: {s:?}"
+        );
+    }
+
+    /// Resolver minting a templated phantom, as an OAuth-capture store does.
+    /// Keyed on the whole rendered phantom, which carries no `nono_` marker.
+    struct TemplatedResolver {
+        phantom: String,
+        template: crate::token::PhantomTemplate,
+        real: Vec<u8>,
+    }
+
+    impl crate::token::NonceResolver for TemplatedResolver {
+        fn resolve(&self, nonce: &str, _consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
+            (nonce == self.phantom).then(|| Zeroizing::new(self.real.clone()))
+        }
+
+        fn rewrite_header_value(&self, value: &str, consumer: &str) -> Option<String> {
+            crate::token::rewrite_first_phantom(
+                value,
+                std::slice::from_ref(&self.template),
+                |nonce| self.resolve(nonce, consumer),
+            )
+        }
+    }
+
+    /// The whole templated span must be replaced, or the prefix reaches
+    /// upstream glued to the real credential and the request 401s.
+    #[test]
+    fn strip_and_redeem_proxy_headers_redeems_templated_phantom() {
+        let template = crate::token::PhantomTemplate::parse("sk-ant-oat01-{}").unwrap();
+        let phantom = template.render(&"b".repeat(64));
+        let resolver = TemplatedResolver {
+            phantom: phantom.clone(),
+            template,
+            real: b"sk-ant-real".to_vec(),
+        };
+        let headers = format!("Authorization: Bearer {phantom}\r\n");
+        let (redeemed, swapped) =
+            strip_and_redeem_proxy_headers(headers.as_bytes(), "proxy.headroom", &[], &resolver);
+        assert!(
+            swapped,
+            "templated phantom must redeem on absolute-form path"
+        );
+        let s = String::from_utf8(redeemed).unwrap();
+        assert!(
+            s.contains("Authorization: Bearer sk-ant-real"),
+            "got: {s:?}"
+        );
+        assert!(
+            !s.contains("sk-ant-oat01-"),
+            "template prefix must not reach upstream: {s:?}"
+        );
     }
 
     /// Spawn a one-shot local HTTP/1.1 origin server that echoes the received
@@ -4956,6 +5463,7 @@ mod tests {
         let config = ProxyConfig {
             allowed_hosts: vec!["127.0.0.1".to_string()],
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "svc".to_string(),
                 upstream: "https://api.example.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),
@@ -5065,6 +5573,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                redeem_phantoms: Vec::new(),
                 upgrades: vec![],
             }],
             ..ProxyConfig::default()
@@ -5073,6 +5582,7 @@ mod tests {
             nonce: nonce.clone(),
             real: b"real-secret".to_vec(),
             admitted_consumer: "proxy.local".to_string(),
+            credential_name: "partner-token".to_string(),
         };
         let handle = start_with_nonce_resolver(config, None, None, Some(Arc::new(resolver)))
             .await
@@ -5162,6 +5672,7 @@ mod tests {
                 aws_auth: None,
                 spiffe: None,
                 rate_limit: None,
+                redeem_phantoms: Vec::new(),
                 upgrades: vec![],
             }],
             ..ProxyConfig::default()
@@ -5170,6 +5681,7 @@ mod tests {
             nonce: make_nonce(),
             real: b"real-secret".to_vec(),
             admitted_consumer: "proxy.local".to_string(),
+            credential_name: "partner-token".to_string(),
         };
         let handle = start_with_nonce_resolver(config, None, None, Some(Arc::new(resolver)))
             .await
@@ -5347,6 +5859,7 @@ mod tests {
         // reverse handler at all, not the forward path.
         let config = ProxyConfig {
             routes: vec![crate::config::RouteConfig {
+                redeem_phantoms: Vec::new(),
                 prefix: "openai".to_string(),
                 upstream: "https://api.openai.com".to_string(),
                 credential_key: Some("env://NONO_TEST_TOTALLY_MISSING".to_string()),

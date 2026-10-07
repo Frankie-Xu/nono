@@ -29,10 +29,10 @@ pub struct SandboxState {
     pub allowed_commands: Vec<String>,
     /// Commands explicitly blocked
     pub blocked_commands: Vec<String>,
-    /// Paths exempted from deny groups via bypass_protection (canonicalized)
-    /// ALIAS(canonical="bypass_protection_paths", introduced="v0.41.0", remove_by="v1.0.0", issue="#594")
-    #[serde(default, alias = "override_deny_paths")]
-    pub bypass_protection_paths: Vec<String>,
+    /// Applied bypasses with the access modes Seatbelt actually reopens.
+    /// Older state files without mode data default to no bypass authority.
+    #[serde(default)]
+    pub applied_bypasses: Vec<crate::policy::AppliedBypass>,
     /// Resolved filesystem deny paths enforced by the active profile.
     ///
     /// These are not filesystem capabilities: on macOS they are explicit
@@ -44,6 +44,9 @@ pub struct SandboxState {
     /// Proxy domain allowlist at sandbox creation time
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+    /// Proxy domain denylist (`network.deny_domain`) at sandbox creation time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_domains: Vec<String>,
     /// Endpoint-restricted domains with method+path rules
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_endpoints: Vec<DomainEndpointState>,
@@ -124,7 +127,7 @@ impl SandboxState {
     #[cfg(test)]
     pub fn from_caps(
         caps: &CapabilitySet,
-        bypass_protection_paths: &[PathBuf],
+        bypass_protection_paths: &[crate::policy::AppliedBypass],
         allowed_domains: &[String],
         domain_endpoints: &[DomainEndpointState],
     ) -> Self {
@@ -133,6 +136,7 @@ impl SandboxState {
             bypass_protection_paths,
             &[],
             allowed_domains,
+            &[],
             domain_endpoints,
         )
     }
@@ -140,9 +144,10 @@ impl SandboxState {
     /// Create sandbox state including explicit filesystem deny paths.
     pub fn from_caps_with_denies(
         caps: &CapabilitySet,
-        bypass_protection_paths: &[PathBuf],
+        bypass_protection_paths: &[crate::policy::AppliedBypass],
         deny_paths: &[PathBuf],
         allowed_domains: &[String],
+        denied_domains: &[String],
         domain_endpoints: &[DomainEndpointState],
     ) -> Self {
         Self {
@@ -169,23 +174,13 @@ impl SandboxState {
             net_blocked: caps.is_network_blocked(),
             allowed_commands: caps.allowed_commands().to_vec(),
             blocked_commands: caps.blocked_commands().to_vec(),
-            bypass_protection_paths: bypass_protection_paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect(),
+            applied_bypasses: bypass_protection_paths.to_vec(),
             deny_paths: deny_paths.iter().map(|p| p.display().to_string()).collect(),
             allowed_domains: allowed_domains.to_vec(),
+            denied_domains: denied_domains.to_vec(),
             domain_endpoints: domain_endpoints.to_vec(),
             resource_limits: caps.resource_limits().copied(),
         }
-    }
-
-    /// Get bypass_protection paths as PathBufs for query use
-    pub fn bypass_protection_as_paths(&self) -> Vec<PathBuf> {
-        self.bypass_protection_paths
-            .iter()
-            .map(PathBuf::from)
-            .collect()
     }
 
     /// Get resolved filesystem deny paths for query use.
@@ -198,8 +193,10 @@ impl SandboxState {
     /// Paths are re-validated through the standard constructors whenever
     /// possible. On macOS, exact-file grants for missing leaf paths are
     /// reconstructed with the same future-file logic used at profile load time.
-    /// In all cases, the reconstructed canonical path must match the path
-    /// serialized in the state file.
+    /// On Linux, paths or direct symlinks that resolve to or via /proc/self/*
+    /// are ignored since these are process specific (e.g. /dev/stdin ->
+    /// /proc/self/fd/0 -> /dev/pts/7). In all cases, the reconstructed
+    /// canonical path must match the path serialized in the state file.
     ///
     /// Returns an error if a stored grant fails validation or if the current
     /// filesystem state no longer matches the serialized grant.
@@ -314,7 +311,50 @@ fn parse_capability_source(source: Option<&str>) -> Result<CapabilitySource> {
     }
 }
 
+/// `/proc/self` prefix under which any path is PID-relative
+#[cfg(target_os = "linux")]
+const PROC_SELF_PREFIX: &str = "/proc/self";
+
+/// A grant's `original` path is PID-relative — and so legitimately
+/// re-resolves to a different concrete path in every reading process — if
+/// it is `/proc/self` (or anything under it), or if it is itself a symlink
+/// whose immediate target (e.g. /dev/stdin -> /proc/self/fd/0) lands under
+/// `/proc/self`. Several of the Linux platform grants resolve via /proc/self,
+/// and these are expected to vary from process to process since these reflect
+/// the process state, and not the sandbox state.
+#[cfg(target_os = "linux")]
+fn is_volatile_alias(original: &str) -> bool {
+    let path = Path::new(original);
+
+    if path.starts_with(PROC_SELF_PREFIX) {
+        return true;
+    }
+
+    // The paths in the policies only ever at most have a single hop in the
+    // symlink to reach a location in /proc/self, so let's just check the
+    // first symlink.
+    match std::fs::read_link(path) {
+        Ok(target) => target.starts_with(PROC_SELF_PREFIX),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_volatile_alias(_original: &str) -> bool {
+    false
+}
+
 fn validate_restored_path(fs_cap: &FsCapState, actual: &Path) -> Result<()> {
+    if is_volatile_alias(&fs_cap.original) {
+        debug!(
+            original = %fs_cap.original,
+            serialized = %fs_cap.path,
+            actual = %actual.display(),
+            "skipping path-drift check for volatile /proc/self alias"
+        );
+        return Ok(());
+    }
+
     let serialized = Path::new(&fs_cap.path);
     if actual != serialized {
         return Err(NonoError::ConfigParse(format!(
@@ -655,12 +695,40 @@ mod tests {
     fn test_sandbox_state_roundtrip_preserves_deny_paths() {
         let caps = CapabilitySet::new();
         let deny_paths = vec![PathBuf::from("/workspace/blocked.txt")];
-        let state = SandboxState::from_caps_with_denies(&caps, &[], &deny_paths, &[], &[]);
+        let state = SandboxState::from_caps_with_denies(&caps, &[], &deny_paths, &[], &[], &[]);
 
         let json = serde_json::to_string(&state).expect("serialize state");
         let restored: SandboxState = serde_json::from_str(&json).expect("deserialize state");
 
         assert_eq!(restored.deny_paths_as_paths(), deny_paths);
+    }
+
+    #[test]
+    fn test_sandbox_state_roundtrip_preserves_bypass_access() {
+        let bypass = crate::policy::AppliedBypass {
+            path: PathBuf::from("/workspace/blocked.txt"),
+            access: AccessMode::Read,
+            is_file: true,
+            removed_denies: vec![PathBuf::from("/workspace/blocked.txt")],
+        };
+        let state = SandboxState::from_caps_with_denies(
+            &CapabilitySet::new(),
+            std::slice::from_ref(&bypass),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let json = serde_json::to_string(&state).expect("serialize state");
+        let restored: SandboxState = serde_json::from_str(&json).expect("deserialize state");
+        assert_eq!(restored.applied_bypasses.len(), 1);
+        assert_eq!(restored.applied_bypasses[0].access, AccessMode::Read);
+        assert!(restored.applied_bypasses[0].is_file);
+        assert_eq!(
+            restored.applied_bypasses[0].removed_denies,
+            bypass.removed_denies
+        );
     }
 
     #[test]
@@ -868,9 +936,10 @@ mod tests {
             net_blocked: false,
             allowed_commands: vec![],
             blocked_commands: vec![],
-            bypass_protection_paths: vec![],
+            applied_bypasses: vec![],
             deny_paths: vec![],
             allowed_domains: vec![],
+            denied_domains: vec![],
             domain_endpoints: vec![],
             resource_limits: None,
         };
@@ -882,6 +951,237 @@ mod tests {
             format!("{err}").contains("sandbox state path drifted"),
             "error should mention path drift"
         );
+    }
+
+    #[test]
+    fn test_validate_restored_path_rejects_drift_for_ordinary_paths() {
+        let fs_cap = FsCapState {
+            original: "/some/real/file".to_string(),
+            path: "/dev/pts/6".to_string(),
+            access: "read".to_string(),
+            is_file: true,
+            source: None,
+            dev: None,
+            ino: None,
+        };
+
+        let err = validate_restored_path(&fs_cap, Path::new("/dev/null"))
+            .expect_err("non-aliased path drift must still be rejected");
+        assert!(format!("{err}").contains("sandbox state path drifted"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_validate_restored_path_tolerates_stdio_alias_drift_to_dev_null() {
+        // Mirrors https://github.com/nolabs-ai/nono/issues/1647: a grant
+        // recorded via a `/dev/stdin`-style alias resolved to the PTY slave
+        // at launch (`/dev/pts/6`), but a later `nono why --self` invocation
+        // has its own stdin on `/dev/null`. Built with a real on-disk
+        // symlink (rather than relying on the host's actual `/dev/stdin`)
+        // so the test is hermetic and exercises the same symlink-chasing
+        // `is_volatile_alias` uses for real aliases.
+        let dir = tempdir().expect("tempdir");
+        let alias = dir.path().join("stdin_alias");
+        std::os::unix::fs::symlink("/proc/self/fd/0", &alias).expect("create symlink");
+
+        let fs_cap = FsCapState {
+            original: alias.display().to_string(),
+            path: "/dev/pts/6".to_string(),
+            access: "read".to_string(),
+            is_file: true,
+            source: Some("system".to_string()),
+            dev: None,
+            ino: None,
+        };
+
+        validate_restored_path(&fs_cap, Path::new("/dev/null"))
+            .expect("symlink into /proc/self must not be treated as drift");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_validate_restored_path_tolerates_stdio_alias_drift_between_ptys() {
+        // Each `nono`-launched sandbox opens its own PTY, so two processes
+        // consulting the same capability state file can legitimately see
+        // two different pts slave numbers for the same alias.
+        let dir = tempdir().expect("tempdir");
+        let alias = dir.path().join("tty_alias");
+        std::os::unix::fs::symlink("/proc/self/fd/0", &alias).expect("create symlink");
+
+        let fs_cap = FsCapState {
+            original: alias.display().to_string(),
+            path: "/dev/pts/6".to_string(),
+            access: "readwrite".to_string(),
+            is_file: true,
+            source: Some("system".to_string()),
+            dev: None,
+            ino: None,
+        };
+
+        validate_restored_path(&fs_cap, Path::new("/dev/pts/11"))
+            .expect("volatile alias must tolerate a different pts number");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_validate_restored_path_tolerates_dev_fd_alias_drift_across_pids() {
+        // `/dev/fd` resolves through `/proc/self`, which always follows the
+        // *current* PID, so it necessarily differs between the launching
+        // process and a later reader. Built with a real on-disk symlink
+        // (mirroring the system-provided `/dev/fd -> /proc/self/fd`) rather
+        // than relying on the host's actual `/dev/fd`.
+        let dir = tempdir().expect("tempdir");
+        let alias = dir.path().join("fd_alias");
+        std::os::unix::fs::symlink("/proc/self/fd", &alias).expect("create symlink");
+
+        let fs_cap = FsCapState {
+            original: alias.display().to_string(),
+            path: "/proc/1234/fd".to_string(),
+            access: "read".to_string(),
+            is_file: false,
+            source: Some("system".to_string()),
+            dev: None,
+            ino: None,
+        };
+
+        validate_restored_path(&fs_cap, Path::new("/proc/5678/fd"))
+            .expect("volatile alias must tolerate a different pid");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_validate_restored_path_rejects_drift_for_symlink_not_into_proc_self() {
+        // A symlink that happens to point somewhere else entirely (not
+        // `/proc/self`) must not be swept up as volatile just because it's
+        // a symlink — only chains that actually land under `/proc/self`
+        // are PID-relative.
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("target-file");
+        std::fs::write(&target, b"x").expect("write target");
+        let alias = dir.path().join("unrelated_alias");
+        std::os::unix::fs::symlink(&target, &alias).expect("create symlink");
+
+        let fs_cap = FsCapState {
+            original: alias.display().to_string(),
+            path: "/dev/pts/6".to_string(),
+            access: "read".to_string(),
+            is_file: true,
+            source: None,
+            dev: None,
+            ino: None,
+        };
+
+        let err = validate_restored_path(&fs_cap, Path::new("/dev/null"))
+            .expect_err("a symlink not resolving into /proc/self must not be volatile");
+        assert!(format!("{err}").contains("sandbox state path drifted"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_validate_restored_path_rejects_drift_for_relative_symlink_into_proc_self_lookalike() {
+        // A relative symlink target never matches the absolute
+        // `/proc/self` prefix (an absolute and a relative path can never
+        // be path-prefixes of one another), so it is correctly treated as
+        // not volatile.
+        let dir = tempdir().expect("tempdir");
+        let alias = dir.path().join("relative_alias");
+        std::os::unix::fs::symlink("proc/self/fd/0", &alias).expect("create symlink");
+
+        let fs_cap = FsCapState {
+            original: alias.display().to_string(),
+            path: "/dev/pts/6".to_string(),
+            access: "read".to_string(),
+            is_file: true,
+            source: None,
+            dev: None,
+            ino: None,
+        };
+
+        let err = validate_restored_path(&fs_cap, Path::new("/dev/null"))
+            .expect_err("a relative symlink target must not be treated as volatile");
+        assert!(format!("{err}").contains("sandbox state path drifted"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_validate_restored_path_tolerates_bare_proc_self_alias_drift_across_pids() {
+        // Regression test: a grant recorded via the bare `/proc/self` alias
+        // (distinct from `/proc/self/fd`) canonicalizes straight to
+        // `/proc/<pid>`, so it drifts across PIDs the same way `/dev/fd`
+        // does: "serialized resolved=/proc/58225, actual resolved=/proc/58241".
+        let fs_cap = FsCapState {
+            original: "/proc/self".to_string(),
+            path: "/proc/58225".to_string(),
+            access: "read".to_string(),
+            is_file: false,
+            source: Some("system".to_string()),
+            dev: None,
+            ino: None,
+        };
+
+        validate_restored_path(&fs_cap, Path::new("/proc/58241"))
+            .expect("bare /proc/self alias must tolerate a different pid");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_validate_restored_path_tolerates_any_proc_self_subpath_drift_across_pids() {
+        // Any path under /proc/self (not just /proc/self/fd) is PID-relative,
+        // e.g. /proc/self/exe, /proc/self/status, /proc/self/cwd.
+        let fs_cap = FsCapState {
+            original: "/proc/self/exe".to_string(),
+            path: "/proc/58225/exe".to_string(),
+            access: "read".to_string(),
+            is_file: true,
+            source: Some("system".to_string()),
+            dev: None,
+            ino: None,
+        };
+
+        validate_restored_path(&fs_cap, Path::new("/proc/58241/exe"))
+            .expect("any /proc/self subpath must tolerate a different pid");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_validate_restored_path_rejects_drift_for_proc_self_lookalike() {
+        // `/proc/selfish` is not a descendant of `/proc/self` by path
+        // components, so it must not be swept up by the prefix match.
+        let fs_cap = FsCapState {
+            original: "/proc/selfish".to_string(),
+            path: "/proc/58225".to_string(),
+            access: "read".to_string(),
+            is_file: false,
+            source: None,
+            dev: None,
+            ino: None,
+        };
+
+        let err = validate_restored_path(&fs_cap, Path::new("/proc/58241"))
+            .expect_err("a /proc/self lookalike must not be treated as a volatile alias");
+        assert!(format!("{err}").contains("sandbox state path drifted"));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn test_validate_restored_path_rejects_stdio_alias_drift_on_non_linux() {
+        // On non-Linux platforms `is_volatile_alias` is unconditionally
+        // `false` (these process-relative aliases are never granted there —
+        // see the doc comment on `is_volatile_alias`), so the same drift
+        // that Linux tolerates for `--self` must still be rejected here.
+        let fs_cap = FsCapState {
+            original: "/dev/stdin".to_string(),
+            path: "/dev/pts/6".to_string(),
+            access: "read".to_string(),
+            is_file: true,
+            source: Some("system".to_string()),
+            dev: None,
+            ino: None,
+        };
+
+        let err = validate_restored_path(&fs_cap, Path::new("/dev/null"))
+            .expect_err("stdio alias drift must still be rejected on non-Linux platforms");
+        assert!(format!("{err}").contains("sandbox state path drifted"));
     }
 }
 
