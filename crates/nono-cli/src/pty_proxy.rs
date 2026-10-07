@@ -18,6 +18,8 @@
 use nix::libc;
 use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::signal::{self, SigHandler, Signal};
+use nix::sys::termios::{LocalFlags, SpecialCharacterIndices, Termios, tcgetattr};
+use nix::unistd::{Pid, tcgetpgrp};
 use nono::{NonoError, Result};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -191,6 +193,28 @@ impl AttachedClient {
     }
 }
 
+struct PtySignalChars {
+    interrupt: Option<u8>,
+    quit: Option<u8>,
+}
+
+impl PtySignalChars {
+    fn from_termios(termios: &Termios) -> Option<Self> {
+        if !termios.local_flags.contains(LocalFlags::ISIG) {
+            return None;
+        }
+        Some(Self {
+            interrupt: enabled_control_char(termios, SpecialCharacterIndices::VINTR),
+            quit: enabled_control_char(termios, SpecialCharacterIndices::VQUIT),
+        })
+    }
+}
+
+fn enabled_control_char(termios: &Termios, index: SpecialCharacterIndices) -> Option<u8> {
+    let byte = termios.control_chars[index as usize];
+    (byte != libc::_POSIX_VDISABLE).then_some(byte)
+}
+
 struct ScreenState {
     parser: vt100::Parser,
 }
@@ -265,6 +289,12 @@ pub struct PtyProxy {
     detach_requested: bool,
     /// Ctrl-Z suspension requested from a terminal client.
     suspension_requested: bool,
+    /// The pty's foreground process group as of an interrupt byte its line
+    /// discipline will act on..
+    interrupt_requested: Option<Pid>,
+    /// A quit byte, recorded and forwarded on exactly the same terms as
+    /// `interrupt_requested`.
+    quit_requested: Option<Pid>,
 }
 
 /// Open a PTY pair, inheriting the current terminal's window size.
@@ -394,6 +424,8 @@ impl PtyProxy {
             pending_detach_escape: Vec::new(),
             detach_requested: false,
             suspension_requested: false,
+            interrupt_requested: None,
+            quit_requested: None,
         })
     }
 
@@ -888,6 +920,15 @@ impl PtyProxy {
         std::mem::take(&mut self.suspension_requested)
     }
 
+    /// The process group to relay a seen interrupt to, once.
+    pub fn take_interrupt_request(&mut self) -> Option<Pid> {
+        std::mem::take(&mut self.interrupt_requested)
+    }
+
+    pub fn take_quit_request(&mut self) -> Option<Pid> {
+        std::mem::take(&mut self.quit_requested)
+    }
+
     /// Temporarily restore the local terminal so the parent can prompt.
     ///
     /// Child output must be relayed before the parent writes its prompt; otherwise
@@ -1224,7 +1265,28 @@ impl PtyProxy {
 
             forwarded.push(byte);
         }
+        // Recorded and then forwarded.
+        if let Some(chars) = self.pty_signal_chars() {
+            let interrupt = chars
+                .interrupt
+                .is_some_and(|byte| forwarded.contains(&byte));
+            let quit = chars.quit.is_some_and(|byte| forwarded.contains(&byte));
+            if interrupt || quit {
+                let pgid = tcgetpgrp(&self.master).ok();
+                if interrupt {
+                    self.interrupt_requested = self.interrupt_requested.or(pgid);
+                }
+                if quit {
+                    self.quit_requested = self.quit_requested.or(pgid);
+                }
+            }
+        }
         forwarded
+    }
+
+    /// The interrupt and quit bytes the pty will act on.
+    fn pty_signal_chars(&self) -> Option<PtySignalChars> {
+        PtySignalChars::from_termios(&tcgetattr(&self.master).ok()?)
     }
 
     fn should_start_enhanced_detach_match(&self, byte: u8) -> bool {
@@ -1445,14 +1507,39 @@ fn control_key_candidates(expected_key: u8) -> Option<[u32; 2]> {
     }
 }
 
-/// Reset terminal input-reporting modes after a terminal-native attach client.
+/// Restore the screen and input modes after a remote terminal attachment.
 ///
 /// A hosted application may enable kitty CSI-u keyboard reporting, mouse
 /// tracking, or bracketed paste. Termios restoration alone does not disable
 /// those terminal-emulator modes, so a returning shell would otherwise receive
 /// encoded input such as `\x1b[99;5u` for Ctrl-C.
-pub(crate) fn restore_terminal_modes_after_attach() {
-    let _ = write_all_fd(libc::STDOUT_FILENO, TERMINAL_RESTORE_NORMAL);
+pub(crate) fn restore_terminal_modes_after_attach(in_alt_screen: bool, rows: u16) {
+    let _ = write_all_fd(
+        libc::STDOUT_FILENO,
+        &remote_terminal_restore_escape(in_alt_screen, rows),
+    );
+    drain_terminal_output(libc::STDOUT_FILENO);
+}
+
+fn remote_terminal_restore_escape(in_alt_screen: bool, rows: u16) -> Vec<u8> {
+    // End synchronized rendering and reset drawing attributes/margins before
+    // restoring the shell. A normal-screen TUI may leave a coloured background
+    // or a restricted scroll region behind.
+    let mut bytes = b"\x1b[?2026l\x1b[0m\x1b[r\x1b[?6l".to_vec();
+    bytes.extend_from_slice(TERMINAL_RESTORE_NORMAL);
+    if in_alt_screen {
+        // Return to the shell buffer before cleaning the viewport. Replay and
+        // remote cursor-save sequences can leave its restored cursor above the
+        // connection banner, so that cursor is not a safe place for a notice.
+        bytes.extend_from_slice(EXIT_ALT_SCREEN.as_bytes());
+    }
+    // Reset again after switching buffers: restoring the saved cursor can
+    // restore attributes too. Move the old viewport into native scrollback,
+    // explicitly erase the visible display, and place the shell at its top.
+    // ED 2 leaves scrollback intact; never send ED 3 here.
+    bytes.extend_from_slice(b"\x1b[0m\x1b[r\x1b[?6l");
+    bytes.extend_from_slice(format!("\x1b[{}S\x1b[2J\x1b[H", rows.max(1)).as_bytes());
+    bytes
 }
 
 fn compose_replay_body(
@@ -1683,8 +1770,8 @@ fn set_nonblocking(fd: RawFd) -> bool {
 /// protocol) keeps the change self-contained and also copes with the case
 /// where the socket closes unexpectedly.
 #[derive(Default)]
-struct AltScreenTracker {
-    in_alt_screen: bool,
+pub(crate) struct AltScreenTracker {
+    pub(crate) in_alt_screen: bool,
     /// Trailing bytes retained from the previous chunk so a 7-byte escape
     /// split across two reads is still matched.
     tail: Vec<u8>,
@@ -1694,7 +1781,7 @@ const ALT_SCREEN_ENTER_SEQ: &[u8] = ENTER_ALT_SCREEN.as_bytes();
 const ALT_SCREEN_EXIT_SEQ: &[u8] = EXIT_ALT_SCREEN.as_bytes();
 
 impl AltScreenTracker {
-    fn observe(&mut self, bytes: &[u8]) {
+    pub(crate) fn observe(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
@@ -2671,6 +2758,7 @@ fn run_attach_loop(
 
 #[cfg(test)]
 mod tests {
+    use super::remote_terminal_restore_escape;
     use super::{
         ATTACH_HANDSHAKE_MAGIC, ATTACH_REQUEST_ATTACH, ATTACH_SCREEN_ENTER_ESCAPE,
         AltScreenTracker, AttachedClient, CprReplyParse, DEFAULT_DETACH_SEQUENCE,
@@ -2680,6 +2768,8 @@ mod tests {
     };
     use nix::libc;
     use nix::pty::{OpenptyResult, Winsize, openpty};
+    use nix::sys::termios::{LocalFlags, SpecialCharacterIndices, Termios, tcgetattr};
+    use nix::unistd::tcgetpgrp;
     use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -2837,6 +2927,8 @@ mod tests {
             pending_detach_escape: Vec::new(),
             detach_requested: false,
             suspension_requested: false,
+            interrupt_requested: None,
+            quit_requested: None,
         }
     }
 
@@ -2854,6 +2946,69 @@ mod tests {
             libc::STDOUT_FILENO,
         ));
         proxy
+    }
+
+    /// A proxy over a real pty.
+    fn build_test_proxy_over_pty(sequence: &[u8]) -> (PtyProxy, OwnedFd) {
+        let OpenptyResult { master, slave } = openpty(None, None).expect("openpty");
+        (build_test_proxy_with_master(master, sequence), slave)
+    }
+
+    fn build_test_proxy_over_pty_with_terminal(sequence: &[u8]) -> (PtyProxy, OwnedFd) {
+        let (mut proxy, slave) = build_test_proxy_over_pty(sequence);
+        proxy.client = Some(AttachedClient::terminal(
+            libc::STDIN_FILENO,
+            libc::STDOUT_FILENO,
+        ));
+        (proxy, slave)
+    }
+
+    /// The peer end is dropped.
+    fn attach_socket_client(proxy: &mut PtyProxy) {
+        let (client, _) = UnixStream::pair().expect("socketpair");
+        proxy.client = Some(AttachedClient::socket(OwnedFd::from(client)));
+    }
+
+    fn edit_slave_termios(slave: &OwnedFd, edit: impl FnOnce(&mut Termios)) {
+        let mut attrs = tcgetattr(slave).expect("tcgetattr slave");
+        edit(&mut attrs);
+        nix::sys::termios::tcsetattr(slave, nix::sys::termios::SetArg::TCSANOW, &attrs)
+            .expect("tcsetattr slave");
+    }
+
+    #[test]
+    fn remote_restore_clears_normal_viewport_and_retains_scrollback() {
+        let mut parser = vt100::Parser::new(6, 30, 30);
+        parser.process(b"foo\r\nbar\x1b[41m\x1b[2;4r\x1b[?6h");
+        parser.process(&remote_terminal_restore_escape(false, 6));
+        assert_eq!(parser.screen().contents(), "");
+        assert_eq!(parser.screen().cursor_position(), (0, 0));
+        assert!(!parser.screen().alternate_screen());
+        parser.process(b"Detached\r\n$ ");
+        assert_eq!(parser.screen().contents(), "Detached\n$ ");
+        parser.screen_mut().set_scrollback(6);
+        assert!(parser.screen().contents().contains("foo"));
+        assert!(parser.screen().contents().contains("bar"));
+    }
+
+    #[test]
+    fn remote_restore_moves_saved_banner_out_of_the_prompt_area() {
+        let mut parser = vt100::Parser::new(6, 30, 30);
+        parser.process(b"$ nono connect\r\nconnected\r\ndetach keys\r\n");
+        // Reproduce a saved cursor above the connection banner. Restoring only
+        // the alternate buffer would put the next prompt over that banner.
+        parser.process(b"\x1b[H");
+        parser.process(b"\x1b[?1049h\x1b[2J\x1b[Hfoo\r\nbar");
+        parser.process(&remote_terminal_restore_escape(true, 6));
+        assert!(!parser.screen().alternate_screen());
+        assert_eq!(parser.screen().contents(), "");
+        assert_eq!(parser.screen().cursor_position(), (0, 0));
+        parser.process(b"Detached\r\n$ ");
+        assert_eq!(parser.screen().contents(), "Detached\n$ ");
+        parser.screen_mut().set_scrollback(6);
+        assert!(parser.screen().contents().contains("$ nono connect"));
+        assert!(parser.screen().contents().contains("connected"));
+        assert!(parser.screen().contents().contains("detach keys"));
     }
 
     #[test]
@@ -3380,6 +3535,121 @@ mod tests {
 
         assert!(!proxy.resume_terminal_after_prompt());
         assert!(proxy.saved_termios.is_none());
+    }
+
+    #[test]
+    fn filter_client_input_raw_ctrl_c_from_terminal_sets_interrupt_and_forwards() {
+        let (mut proxy, _slave) = build_test_proxy_over_pty_with_terminal(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x03");
+        assert_eq!(
+            forwarded, b"\x03",
+            "the byte must still reach the pty, whose line discipline raises SIGINT \
+             on the foreground job"
+        );
+        assert!(proxy.take_interrupt_request().is_some());
+    }
+
+    #[test]
+    fn filter_client_input_records_the_signalled_pgroup_with_the_interrupt() {
+        let (mut proxy, _slave) = build_test_proxy_over_pty_with_terminal(&DEFAULT_DETACH_SEQUENCE);
+        // Off the master: the slave is not this process's controlling terminal,
+        // so tcgetpgrp on it fails with ENOTTY.
+        let foreground = tcgetpgrp(&proxy.master).expect("tcgetpgrp");
+
+        proxy.filter_client_input(b"\x03");
+
+        assert_eq!(
+            proxy.take_interrupt_request(),
+            Some(foreground),
+            "the relay must target the job the line discipline signalled, not whichever \
+             job holds the terminal by the time the supervisor gets round to relaying"
+        );
+    }
+
+    #[test]
+    fn filter_client_input_ctrl_c_from_socket_client_sets_interrupt() {
+        let (mut proxy, _slave) = build_test_proxy_over_pty(&DEFAULT_DETACH_SEQUENCE);
+        attach_socket_client(&mut proxy);
+        let forwarded = proxy.filter_client_input(b"\x03");
+        assert_eq!(forwarded, b"\x03");
+        assert!(
+            proxy.take_interrupt_request().is_some(),
+            "a reattached client's interrupt reaches the same line discipline the local \
+             terminal's does, so it kills the foreground job and must be relayed too"
+        );
+    }
+
+    #[test]
+    fn filter_client_input_raw_ctrl_backslash_from_terminal_sets_quit_and_forwards() {
+        let (mut proxy, _slave) = build_test_proxy_over_pty_with_terminal(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1c");
+        assert_eq!(
+            forwarded, b"\x1c",
+            "the byte must still reach the pty, whose line discipline raises SIGQUIT \
+             on the foreground job"
+        );
+        assert!(proxy.take_quit_request().is_some());
+    }
+
+    #[test]
+    fn filter_client_input_requests_nothing_while_the_pty_has_isig_off() {
+        let (mut proxy, slave) = build_test_proxy_over_pty_with_terminal(&DEFAULT_DETACH_SEQUENCE);
+        edit_slave_termios(&slave, |attrs| attrs.local_flags.remove(LocalFlags::ISIG));
+
+        let forwarded = proxy.filter_client_input(b"\x03\x1c");
+
+        assert_eq!(forwarded, b"\x03\x1c");
+        assert!(
+            proxy.take_interrupt_request().is_none() && proxy.take_quit_request().is_none(),
+            "with ISIG off the line discipline raises nothing for either byte, so a relay \
+             would signal mediated children the kernel signalled nothing for"
+        );
+    }
+
+    #[test]
+    fn filter_client_input_follows_a_remapped_interrupt_char() {
+        let (mut proxy, slave) = build_test_proxy_over_pty_with_terminal(&DEFAULT_DETACH_SEQUENCE);
+        edit_slave_termios(&slave, |attrs| {
+            attrs.control_chars[SpecialCharacterIndices::VINTR as usize] = 0x07;
+        });
+
+        assert!(
+            !proxy.filter_client_input(b"\x03").is_empty()
+                && proxy.take_interrupt_request().is_none(),
+            "0x03 is ordinary input once VINTR points elsewhere"
+        );
+        proxy.filter_client_input(b"\x07");
+        assert!(
+            proxy.take_interrupt_request().is_some(),
+            "the byte the line discipline actually raises SIGINT for must be the one relayed"
+        );
+    }
+
+    #[test]
+    fn filter_client_input_requests_no_interrupt_when_the_intr_char_is_disabled() {
+        let (mut proxy, slave) = build_test_proxy_over_pty_with_terminal(&DEFAULT_DETACH_SEQUENCE);
+        edit_slave_termios(&slave, |attrs| {
+            attrs.control_chars[SpecialCharacterIndices::VINTR as usize] = libc::_POSIX_VDISABLE;
+        });
+
+        proxy.filter_client_input(&[0x03, libc::_POSIX_VDISABLE]);
+
+        assert!(
+            proxy.take_interrupt_request().is_none(),
+            "a disabled VINTR raises no SIGINT, and its sentinel value is not itself a key"
+        );
+    }
+
+    #[test]
+    fn filter_client_input_ctrl_c_consumed_by_the_detach_sequence_requests_no_interrupt() {
+        let (mut proxy, _slave) = build_test_proxy_over_pty_with_terminal(b"\x03");
+        let forwarded = proxy.filter_client_input(b"\x03");
+        assert!(forwarded.is_empty(), "the detach match swallows the byte");
+        assert!(proxy.take_detach_request());
+        assert!(
+            proxy.take_interrupt_request().is_none(),
+            "a byte the pty never sees raises no SIGINT there, so it must relay none"
+        );
     }
 
     // --- Ctrl-Z suspension detection ---

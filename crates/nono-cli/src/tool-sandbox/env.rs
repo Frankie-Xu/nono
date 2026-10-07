@@ -1,8 +1,5 @@
 use crate::command_policy::{CommandSandboxConfig, ResolvedCommandBinary};
-use crate::tool_sandbox::protocol::{
-    TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_SHIM_DIR_ENV, TOOL_SANDBOX_SOCKET_ENV,
-    TOOL_SANDBOX_URL_SOCKET_ENV, ToolSandboxShimRequest,
-};
+use crate::tool_sandbox::protocol::ToolSandboxShimRequest;
 use nono::{NonoError, Result};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -32,6 +29,20 @@ const DEFAULT_ENV_ALLOW: &[&str] = &[
     "GIT_SSL_CAINFO",
 ];
 
+const PROXY_CONTROL_ENV: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "NONO_NO_PROXY",
+    "NONO_PROXY_TOKEN",
+    "NODE_USE_ENV_PROXY",
+];
+
 pub(crate) fn default_env_allow_patterns() -> Vec<String> {
     DEFAULT_ENV_ALLOW
         .iter()
@@ -51,7 +62,7 @@ pub(crate) fn effective_argv_for_binary(
 ) -> Result<Vec<Vec<u8>>> {
     if request.argv.is_empty() {
         return Err(NonoError::SandboxInit(
-            "tool-sandbox request had empty argv".to_string(),
+            "command-mediation request had empty argv".to_string(),
         ));
     }
     let mut argv =
@@ -64,7 +75,7 @@ pub(crate) fn effective_argv_for_binary(
     for arg in extra_args {
         if arg.contains(&0) {
             return Err(NonoError::ConfigParse(
-                "tool-sandbox exec helper arg contains NUL".to_string(),
+                "command-policy exec helper argument contains NUL".to_string(),
             ));
         }
         argv.push(arg.clone());
@@ -72,7 +83,7 @@ pub(crate) fn effective_argv_for_binary(
     for arg in &policy.argv_prepend {
         if arg.as_bytes().contains(&0) {
             return Err(NonoError::ConfigParse(
-                "tool-sandbox policy argv_prepend contains NUL".to_string(),
+                "command sandbox policy argv_prepend contains NUL".to_string(),
             ));
         }
         argv.push(arg.as_bytes().to_vec());
@@ -98,12 +109,12 @@ pub(crate) fn apply_environment_set_vars(
             || value.as_bytes().contains(&0)
         {
             return Err(NonoError::ConfigParse(format!(
-                "invalid tool-sandbox environment.set_vars entry '{name}'"
+                "invalid command-mediation environment.set_vars entry '{name}'"
             )));
         }
         if crate::exec_strategy::env_sanitization::is_dangerous_env_var(name) {
             return Err(NonoError::ConfigParse(format!(
-                "tool-sandbox environment.set_vars rejects dangerous key '{name}'"
+                "command-mediation environment.set_vars rejects dangerous key '{name}'"
             )));
         }
         let prefix = format!("{name}=");
@@ -139,7 +150,7 @@ pub(crate) fn apply_export_env(
         if key_str == "PATH" || key_str.starts_with("NONO_") {
             continue;
         }
-        if !crate::exec_strategy::matches_env_var_patterns(key_str, export_patterns) {
+        if !crate::exec_strategy::matches_env_var_patterns(key_str, export_patterns, false) {
             continue;
         }
         if crate::exec_strategy::env_sanitization::is_forbidden_secret_env_var(key_str) {
@@ -159,33 +170,40 @@ pub(crate) fn apply_export_env(
     }
 }
 
-pub(crate) fn inject_chaining_control_env(
-    env: &mut Vec<Vec<u8>>,
-    socket_path: &Path,
-    shim_dir: &Path,
-) {
-    let socket_prefix = format!("{TOOL_SANDBOX_SOCKET_ENV}=");
-    let shim_dir_prefix = format!("{TOOL_SANDBOX_SHIM_DIR_ENV}=");
-    let launch_spec_prefix = format!("{TOOL_SANDBOX_LAUNCH_SPEC_ENV}=");
+/// Replace proxy settings with supervisor-owned values immediately before a
+/// mediated command is launched. The child must not retain the session proxy
+/// credential: it has broader authority than a command-scoped proxy policy.
+///
+/// **Replace, never append.** `env` is a raw `KEY=VALUE` vector handed straight
+/// to `execve`; it does not collapse duplicate keys, and libc `getenv` (plus
+/// CPython's `os.environ`, i.e. botocore) resolves a duplicate to the *first*
+/// entry. An appended override is therefore dead whenever the same name was
+/// already forwarded from the session env, so every name in `vars` is stripped
+/// before it is set. That is wider than `PROXY_CONTROL_ENV`: `vars` comes from
+/// `ProxyHandle::env_vars()`, which also carries the TLS-intercept CA vars
+/// (`SSL_CERT_FILE`, `AWS_CA_BUNDLE`, ...). Deriving the strip set from `vars`
+/// keeps this self-maintaining as `intercept_ca_env_vars` (or a profile's
+/// `tls_intercept.ca_env_vars`) grows. `PROXY_CONTROL_ENV` is still stripped
+/// unconditionally so a session proxy credential cannot survive in a name the
+/// scoped proxy happens not to set.
+pub(crate) fn override_proxy_env(env: &mut Vec<Vec<u8>>, vars: &[(String, String)]) {
     env.retain(|entry| {
-        !entry.starts_with(socket_prefix.as_bytes())
-            && !entry.starts_with(shim_dir_prefix.as_bytes())
-            && !entry.starts_with(launch_spec_prefix.as_bytes())
+        let Some((name, _)) = split_env_entry(entry) else {
+            return true;
+        };
+        !PROXY_CONTROL_ENV
+            .iter()
+            .any(|control| control.as_bytes() == name)
+            && !vars.iter().any(|(set, _)| set.as_bytes() == name)
     });
-    env.push(format!("{TOOL_SANDBOX_SOCKET_ENV}={}", socket_path.display()).into_bytes());
-    env.push(format!("{TOOL_SANDBOX_SHIM_DIR_ENV}={}", shim_dir.display()).into_bytes());
+    for (name, value) in vars {
+        env.push(format!("{name}={value}").into_bytes());
+    }
 }
 
-/// Inject the URL-open socket env var and `BROWSER` for a brokered child whose
-/// command declares `open_urls` or `allow_launch_services`.
-///
-/// Both vars are stripped first (a child cannot smuggle its own) then set to
-/// the runtime's URL socket and the open shim path. Needed for
-/// `allow_launch_services` too: the shim only recognizes itself as the
-/// URL-open relay when this env var is present, and a bare `open` in the
-/// child's $PATH always resolves to the shim, never straight to
-/// `/usr/bin/open`, once any command in the profile needs the shim. No-op
-/// when URL opening is not enabled for this command.
+/// Point `BROWSER` at the session's open shim for a child whose policy allows
+/// URL opening. The shim discovers the URL socket from its executable path;
+/// the broker resolves the caller and enforces its URL policy on each request.
 pub(crate) fn inject_url_open_env(
     env: &mut Vec<Vec<u8>>,
     policy: &CommandSandboxConfig,
@@ -195,15 +213,9 @@ pub(crate) fn inject_url_open_env(
     if policy.open_urls.is_none() && !policy.allow_launch_services {
         return;
     }
-    let (Some(url_socket_path), Some(shim_path)) = (url_socket_path, url_open_shim_path) else {
+    let (Some(_), Some(shim_path)) = (url_socket_path, url_open_shim_path) else {
         return;
     };
-
-    let socket_prefix = format!("{TOOL_SANDBOX_URL_SOCKET_ENV}=").into_bytes();
-    env.retain(|entry| !entry.starts_with(&socket_prefix));
-    let mut socket_entry = socket_prefix;
-    socket_entry.extend_from_slice(url_socket_path.as_os_str().as_bytes());
-    env.push(socket_entry);
 
     // Point BROWSER at the open shim so libraries that honour it route through
     // the runtime instead of attempting a (denied) direct browser launch.
@@ -637,6 +649,20 @@ mod tests {
     }
 
     #[test]
+    fn export_env_infix_pattern_matches() {
+        let request = request_with(
+            &["AWS_SESSION_TOKEN=eu", "AWS_SESSION_SECRET=x", "TZ=UTC"],
+            "/work",
+        );
+        let mut env: Vec<Vec<u8>> = Vec::new();
+        apply_export_env(&mut env, &request, &patterns(&["AWS_*_TOKEN"]));
+        let out = rendered(&env);
+        assert!(out.contains(&"AWS_SESSION_TOKEN=eu".to_string()));
+        assert!(!out.iter().any(|e| e.starts_with("AWS_SESSION_SECRET=")));
+        assert!(!out.iter().any(|e| e.starts_with("TZ=")));
+    }
+
+    #[test]
     fn export_env_star_excludes_path_and_nono() {
         // A bare `*` forwards everything EXCEPT nono-managed PATH and NONO_*.
         let request = request_with(
@@ -716,7 +742,126 @@ mod tests {
         ] {
             assert!(
                 is_env_var_allowed(var, &patterns),
-                "{var} must be allowed so tool-sandbox children can verify TLS through the intercept proxy"
+                "{var} must be allowed so command sandboxes can verify TLS through the intercept proxy"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_proxy_env_replaces_outer_proxy_authority() {
+        let mut env = vec![
+            b"HTTP_PROXY=http://outer-token@127.0.0.1:1000".to_vec(),
+            b"HTTPS_PROXY=http://outer-token@127.0.0.1:1000".to_vec(),
+            b"NO_PROXY=*".to_vec(),
+            b"http_proxy=http://outer-token@127.0.0.1:1000".to_vec(),
+            b"https_proxy=http://outer-token@127.0.0.1:1000".to_vec(),
+            b"no_proxy=*".to_vec(),
+            b"ALL_PROXY=socks5://outer.invalid:1080".to_vec(),
+            b"all_proxy=socks5://outer.invalid:1080".to_vec(),
+            b"NONO_PROXY_TOKEN=outer-token".to_vec(),
+            b"PATH=/usr/bin".to_vec(),
+        ];
+        let scoped = vec![
+            (
+                "HTTP_PROXY".to_string(),
+                "http://scoped-token@127.0.0.1:2000".to_string(),
+            ),
+            (
+                "HTTPS_PROXY".to_string(),
+                "http://scoped-token@127.0.0.1:2000".to_string(),
+            ),
+            ("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string()),
+            (
+                "http_proxy".to_string(),
+                "http://scoped-token@127.0.0.1:2000".to_string(),
+            ),
+            (
+                "https_proxy".to_string(),
+                "http://scoped-token@127.0.0.1:2000".to_string(),
+            ),
+            ("no_proxy".to_string(), "localhost,127.0.0.1".to_string()),
+            ("NONO_PROXY_TOKEN".to_string(), "scoped-token".to_string()),
+        ];
+
+        override_proxy_env(&mut env, &scoped);
+
+        let rendered = rendered(&env);
+        assert!(rendered.contains(&"PATH=/usr/bin".to_string()));
+        assert!(rendered.contains(&"NO_PROXY=localhost,127.0.0.1".to_string()));
+        assert!(
+            rendered
+                .iter()
+                .filter(|entry| entry.starts_with("HTTP_PROXY="))
+                .all(|entry| entry.contains("scoped-token@127.0.0.1:2000"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .filter(|entry| entry.starts_with("HTTPS_PROXY="))
+                .all(|entry| entry.contains("scoped-token@127.0.0.1:2000"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .filter(|entry| entry.starts_with("http_proxy="))
+                .all(|entry| entry.contains("scoped-token@127.0.0.1:2000"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .filter(|entry| entry.starts_with("https_proxy="))
+                .all(|entry| entry.contains("scoped-token@127.0.0.1:2000"))
+        );
+        assert!(!rendered.iter().any(|entry| entry.contains("outer-token")));
+        assert!(!rendered.iter().any(|entry| entry.starts_with("ALL_PROXY=")));
+        assert!(!rendered.iter().any(|entry| entry.starts_with("all_proxy=")));
+    }
+
+    #[test]
+    fn scoped_proxy_env_replaces_forwarded_intercept_ca_vars() {
+        // Regression: the scoped CA vars used to be APPENDED after the
+        // session-forwarded ones. `env` goes straight to `execve`, which keeps
+        // duplicates, and libc `getenv` / CPython `os.environ` resolve to the
+        // FIRST entry — so `aws` (botocore) validated TLS against the session
+        // bundle and failed with "SSL validation failed ... [Errno 1]".
+        // A `contains`-style assertion passes even with the bug: the count and
+        // the value together are what matter.
+        const SESSION_CA: &str = "/Users/dev/.local/prisma_certificates.pem";
+        const SCOPED_CA: &str = "/private/tmp/nono-scoped-intercept-1-2-scope-0/intercept-ca.pem";
+        let ca_vars = nono_proxy::config::default_intercept_ca_env_vars();
+        assert!(
+            ca_vars.iter().any(|name| name == "AWS_CA_BUNDLE"),
+            "AWS_CA_BUNDLE must be an intercept-CA var: botocore prefers it over SSL_CERT_FILE"
+        );
+
+        let mut env: Vec<Vec<u8>> = ca_vars
+            .iter()
+            .map(|name| format!("{name}={SESSION_CA}").into_bytes())
+            .collect();
+        env.push(b"PATH=/usr/bin".to_vec());
+        let scoped: Vec<(String, String)> = ca_vars
+            .iter()
+            .map(|name| (name.clone(), SCOPED_CA.to_string()))
+            .collect();
+
+        override_proxy_env(&mut env, &scoped);
+
+        let rendered = rendered(&env);
+        assert!(rendered.contains(&"PATH=/usr/bin".to_string()));
+        assert!(
+            !rendered.iter().any(|entry| entry.contains(SESSION_CA)),
+            "session CA must not survive: {rendered:?}"
+        );
+        for name in &ca_vars {
+            let prefix = format!("{name}=");
+            let matches: Vec<&String> = rendered
+                .iter()
+                .filter(|entry| entry.starts_with(&prefix))
+                .collect();
+            assert_eq!(
+                matches,
+                vec![&format!("{name}={SCOPED_CA}")],
+                "{name} must appear exactly once, set to the scoped CA"
             );
         }
     }
@@ -735,12 +880,7 @@ mod tests {
             Some(Path::new("/tmp/shims/open")),
         );
 
-        let socket_prefix = format!("{TOOL_SANDBOX_URL_SOCKET_ENV}=").into_bytes();
-        assert!(
-            env.iter().any(|e| e.starts_with(&socket_prefix)),
-            "allow_launch_services must get the URL socket env var, since the shim only \
-             recognizes itself as the URL-open relay when it's present"
-        );
+        assert!(env.iter().all(|entry| !entry.starts_with(b"NONO_")));
         assert!(
             env.iter().any(|e| e.starts_with(b"BROWSER=")),
             "allow_launch_services must get BROWSER pointed at the shim too"

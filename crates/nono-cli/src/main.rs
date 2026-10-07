@@ -23,8 +23,6 @@ mod config;
 #[cfg(unix)]
 mod connect_client;
 mod credential_runtime;
-mod deprecated_policy;
-mod deprecated_schema;
 mod deprecation_warnings;
 mod diagnostic;
 mod exec_strategy;
@@ -34,7 +32,6 @@ mod hook_runtime;
 mod instruction_deny;
 mod jsonc;
 mod launch_runtime;
-mod legacy_cleanup;
 #[cfg(target_os = "linux")]
 mod lineage_cgroup;
 #[cfg(target_os = "macos")]
@@ -43,6 +40,7 @@ mod migration;
 mod network_policy;
 mod open_url_runtime;
 mod output;
+mod owned_children;
 mod pack_update_hint;
 mod package;
 mod package_cmd;
@@ -61,6 +59,8 @@ mod pty_proxy;
 mod pull_ui;
 mod query_ext;
 mod registry_client;
+#[cfg(unix)]
+mod remote_run;
 #[cfg(target_os = "linux")]
 mod resource_cgroup;
 mod rollback_commands;
@@ -78,7 +78,9 @@ mod startup_prompt;
 mod startup_runtime;
 mod state_paths;
 mod supervised_runtime;
+mod temp_keepalive;
 mod terminal_approval;
+mod terminal_prompt;
 mod theme;
 mod timeouts;
 #[path = "tool-sandbox/mod.rs"]
@@ -96,12 +98,11 @@ mod wiring;
 mod test_env;
 
 use app_runtime::run as run_cli;
+#[cfg(test)]
 use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use cli::Cli;
-use cli_bootstrap::{
-    collect_legacy_network_warnings, init_theme, init_tracing, normalize_legacy_flag_env_vars,
-    print_legacy_network_warnings,
-};
+use cli_bootstrap::{init_theme, init_tracing};
 use command_blocking_deprecation::{
     collect_cli_warnings, print_warnings as print_deprecation_warnings,
 };
@@ -119,21 +120,16 @@ fn main() {
     }
     tool_sandbox::record_main_start();
 
-    let os_args: Vec<_> = std::env::args_os().collect();
-
-    let legacy_network_warnings = collect_legacy_network_warnings(&os_args);
-    normalize_legacy_flag_env_vars();
-    // Emit one deprecation warning per distinct legacy long flag before clap
-    // parses. clap's `alias` rebinds `--override-deny` to `--bypass-protection`
-    // silently; without this scan the user would never see a removal notice.
-    deprecated_schema::warn_for_deprecated_flags(&os_args);
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     init_tracing(&cli);
     init_theme(&cli);
-    print_legacy_network_warnings(&legacy_network_warnings, cli.silent);
     let command_blocking_warnings = collect_cli_warnings(&cli);
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 
+    #[cfg(unix)]
+    let cli_result = remote_run::validate_matches(&matches).and_then(|()| run_cli(cli));
+    #[cfg(not(unix))]
     let cli_result = run_cli(cli);
     tool_sandbox::log_main_total();
     #[cfg(unix)]
@@ -331,8 +327,12 @@ mod tests {
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
+            redaction_extra_env_vars: Vec::new(),
+            network_denial_audit: Default::default(),
+            redaction_derived_env_vars: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            case_insensitive_env_vars: false,
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
@@ -406,8 +406,12 @@ mod tests {
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
             suppressed_system_service_operations: Vec::new(),
+            redaction_extra_env_vars: Vec::new(),
+            network_denial_audit: Default::default(),
+            redaction_derived_env_vars: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            case_insensitive_env_vars: false,
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,

@@ -30,7 +30,9 @@ enum InitialCapabilityMatch<'a> {
 /// Token-bucket rate limiter for supervisor expansion requests.
 ///
 /// Prevents a compromised agent from flooding the terminal with approval prompts.
-/// Defaults to 10 requests/second with a burst of 5.
+/// Defaults to 10 requests/second with a burst of 5. It must only gate
+/// decisions that can reach an interactive prompt: applying it to fixed policy
+/// decisions makes allowed operations fail under bursty load.
 pub(super) struct RateLimiter {
     /// Maximum tokens (burst capacity)
     capacity: u32,
@@ -75,6 +77,43 @@ impl RateLimiter {
         } else {
             false
         }
+    }
+}
+
+/// Bounds the bookkeeping a flood of policy-denied network syscalls can create.
+///
+/// This never influences enforcement: a denied syscall is always denied with
+/// `EACCES`, and an allowed syscall never consumes budget. It only decides
+/// whether a denial is recorded individually (audit event and AF_UNIX
+/// diagnostics, both of which grow memory). Denials past the budget are
+/// counted and reported as a single summary audit event, so suppression is
+/// itself observable.
+pub(super) struct NetworkDenialThrottle {
+    limiter: RateLimiter,
+    suppressed: u64,
+}
+
+impl NetworkDenialThrottle {
+    pub(super) fn new(limits: crate::profile::NetworkDenialAuditLimits) -> Self {
+        Self {
+            limiter: RateLimiter::new(limits.rate_per_sec, limits.burst),
+            suppressed: 0,
+        }
+    }
+
+    /// Returns true if this denial should be recorded individually. Otherwise
+    /// it is counted as suppressed.
+    fn admit(&mut self) -> bool {
+        if self.limiter.try_acquire() {
+            true
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            false
+        }
+    }
+
+    fn take_suppressed(&mut self) -> u64 {
+        std::mem::take(&mut self.suppressed)
     }
 }
 
@@ -188,10 +227,22 @@ pub(super) fn handle_seccomp_notification(
     initial_caps: &[InitialCapability],
     state: SeccompNotificationState<'_>,
 ) -> Result<()> {
+    let notif = nono::sandbox::recv_notif(notify_fd)?;
+    handle_received_filesystem_notification(notify_fd, child, config, initial_caps, state, notif)
+}
+
+fn handle_received_filesystem_notification(
+    notify_fd: std::os::fd::RawFd,
+    child: Pid,
+    config: &SupervisorConfig<'_>,
+    initial_caps: &[InitialCapability],
+    state: SeccompNotificationState<'_>,
+    notif: nono::sandbox::SeccompNotif,
+) -> Result<()> {
     use nono::sandbox::{
         SYS_OPENAT, SYS_OPENAT2, classify_access_from_flags, continue_notif, deny_notif, inject_fd,
-        notif_id_valid, read_notif_path, read_open_how, recv_notif, resolve_notif_path,
-        respond_notif_errno, validate_openat2_size,
+        notif_id_valid, read_notif_path, read_open_how, resolve_notif_path, respond_notif_errno,
+        validate_openat2_size,
     };
     let SeccompNotificationState {
         rate_limiter,
@@ -201,7 +252,6 @@ pub(super) fn handle_seccomp_notification(
     } = state;
 
     // 1. Receive the notification
-    let notif = recv_notif(notify_fd)?;
 
     // 2. Read the path from the child's memory (args[1] = pathname for openat/openat2)
     //    Then resolve dirfd-relative paths using /proc/PID/fd/DIRFD or /proc/PID/cwd.
@@ -668,6 +718,35 @@ pub(super) enum NetworkDecision {
     Deny,
 }
 
+/// Whether a trapped network syscall on address `family` carries no policy
+/// decision under `policy`, so the supervisor must resume it untouched.
+///
+/// The network BPF filter traps `connect`/`bind`/`sendto`/`sendmsg`/`sendmmsg`
+/// by syscall number and cannot see the address family, so every mode
+/// receives sockaddrs it does not mediate:
+///
+/// - **AF_UNIX-only mode** (`linux.af_unix_mediation = "pathname"`, no
+///   proxy): TCP/UDP is Landlock's job, so non-`AF_UNIX` passes through.
+/// - **Proxy-only mode without AF_UNIX mediation** (`network.allow_domain`
+///   etc.): the filter exists to force TCP through the proxy. Unix-domain IPC
+///   is out of scope and stays governed by Landlock filesystem rules exactly
+///   as it is without a proxy, so `AF_UNIX` passes through. Denying it here
+///   broke JVM attach, Mockito, and every other local-IPC user the moment a
+///   domain allowlist was configured (issue #1901).
+/// - **Combined mode** (proxy + AF_UNIX mediation): everything is in scope.
+///
+/// Callers use this both for the policy decision (`Allow`) and to skip the
+/// rate limiter, so high-volume out-of-scope traffic cannot starve the
+/// decisions that matter.
+pub(super) fn network_notification_out_of_scope(policy: SeccompPolicy, family: u16) -> bool {
+    let is_unix = family == libc::AF_UNIX as u16;
+    match (policy.proxy_fallback, policy.af_unix_mediation) {
+        (false, true) => !is_unix,
+        (true, false) => is_unix,
+        _ => false,
+    }
+}
+
 /// Pure policy function: given a trapped syscall and the sockaddr the child
 /// passed in, decide whether the supervisor should allow or deny it.
 ///
@@ -676,42 +755,28 @@ pub(super) enum NetworkDecision {
 ///
 /// Policy:
 ///
-/// 1. **Pathname `AF_UNIX` is allowlist-mediated.** Filesystem-backed Unix
-///    sockets like `/tmp/test.sock` are IPC bound to a real path, so the
+/// 0. **Out-of-scope families pass through** (see
+///    [`network_notification_out_of_scope`]). In proxy-only mode without
+///    `linux.af_unix_mediation`, every `AF_UNIX` operation is allowed; in
+///    AF_UNIX-only mode, every non-`AF_UNIX` operation is allowed.
+///
+/// 1. **Pathname `AF_UNIX` is allowlist-mediated** when
+///    `linux.af_unix_mediation = "pathname"` is enabled. Filesystem-backed
+///    Unix sockets like `/tmp/test.sock` are IPC bound to a real path, so the
 ///    supervisor canonicalizes that path and checks it against explicit
 ///    [`UnixSocketCapability`] grants.
 ///
-///    **Abstract and unnamed `AF_UNIX` are denied.** The abstract namespace
-///    (`sun_path[0] == '\0'`) lives outside the filesystem, so pathname
-///    capabilities cannot mediate it. Unnamed sockets (addrlen == 2) have
-///    no path to check.
+///    **Abstract and unnamed `AF_UNIX` are denied** in that mode. The
+///    abstract namespace (`sun_path[0] == '\0'`) lives outside the
+///    filesystem, so pathname capabilities cannot mediate it. Unnamed sockets
+///    (addrlen == 2) have no path to check.
 ///
-/// 2. For `AF_INET`/`AF_INET6`:
-///    - `connect()`/`sendto()`/`sendmsg()`/`sendmmsg()` to loopback are allowed on
-///      `proxy_port`, `proxy_bind_ports`, or within `proxy_bind_port_ranges`
-///      (mirrors macOS ProxyOnly `open_port` outbound rules; issue #1652).
-///    - `bind()` is allowed on `proxy_bind_ports` or within `proxy_bind_port_ranges`
-///      regardless of bind address (Landlock also filters bind by port only).
-///      The proxy listener port is connect-only. Servers typically bind
-///      `0.0.0.0`/`::`, which is not loopback.
-///    - `connect()` to non-loopback destinations is denied.
-pub(super) fn is_allowed_loopback_tcp_bind_port(port: u16, config: &SupervisorConfig<'_>) -> bool {
-    if config.proxy_bind_ports.contains(&port) {
-        return true;
-    }
-    config
-        .proxy_bind_port_ranges
-        .iter()
-        .any(|&(start, end)| port >= start && port <= end)
-}
-
-pub(super) fn is_allowed_loopback_tcp_connect_port(
-    port: u16,
-    config: &SupervisorConfig<'_>,
-) -> bool {
-    port == config.proxy_port || is_allowed_loopback_tcp_bind_port(port, config)
-}
-
+/// 2. For `AF_INET`/`AF_INET6` in proxy-only mode:
+///    - `connect()` is allowed to `127.0.0.1:proxy_port` (the nono proxy) or
+///      to an explicitly granted localhost IPC port.
+///    - `bind()` is allowed on ports in `proxy_bind_ports` or explicitly
+///      granted localhost IPC ports and ranges.
+///    - Everything else is denied.
 pub(super) fn decide_network_notification(
     child_pid: u32,
     syscall: i32,
@@ -722,9 +787,21 @@ pub(super) fn decide_network_notification(
         SYS_BIND, SYS_CONNECT, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO, UnixSocketKind,
     };
 
-    // AF_UNIX: allow only filesystem-backed (pathname) sockets that match an
-    // explicit socket capability. Abstract/unnamed sockets bypass pathname
-    // mediation, so deny them.
+    if network_notification_out_of_scope(config.seccomp_policy, sockaddr.family) {
+        debug!(
+            "Seccomp network mediation: family={} is out of scope for this mode \
+             (proxy_fallback={}, af_unix_mediation={}); allowing syscall nr={}",
+            sockaddr.family,
+            config.seccomp_policy.proxy_fallback,
+            config.seccomp_policy.af_unix_mediation,
+            syscall
+        );
+        return NetworkDecision::Allow;
+    }
+
+    // AF_UNIX with mediation enabled: allow only filesystem-backed (pathname)
+    // sockets that match an explicit socket capability. Abstract/unnamed
+    // sockets bypass pathname mediation, so deny them.
     if sockaddr.family == libc::AF_UNIX as u16 {
         match sockaddr.unix_kind {
             Some(UnixSocketKind::Pathname) => {
@@ -748,19 +825,20 @@ pub(super) fn decide_network_notification(
         }
     }
 
-    if config.seccomp_policy.af_unix_mediation {
-        debug!(
-            "AF_UNIX-only seccomp mediation: allowing non-AF_UNIX syscall family={} nr={}",
-            sockaddr.family, syscall
-        );
-        return NetworkDecision::Allow;
-    }
-
     match syscall {
         SYS_CONNECT | SYS_SENDTO | SYS_SENDMSG | SYS_SENDMMSG => {
+            // Allow connect/sendto/sendmsg/sendmmsg only to loopback + proxy port
+            // or an explicit bidirectional localhost IPC grant (`--open-port`).
             // sendto/sendmsg/sendmmsg with a destination address is semantically
             // equivalent to connect for network reach-out (issue #1089).
-            if sockaddr.is_loopback && is_allowed_loopback_tcp_connect_port(sockaddr.port, config) {
+            let allowed_port = sockaddr.port == config.proxy_port
+                || config.caps.localhost_ports().contains(&sockaddr.port)
+                || config
+                    .caps
+                    .localhost_port_ranges()
+                    .iter()
+                    .any(|&(start, end)| sockaddr.port >= start && sockaddr.port <= end);
+            if sockaddr.is_loopback && allowed_port {
                 debug!(
                     "Proxy seccomp: allowing network syscall nr={} to loopback:{}",
                     syscall, sockaddr.port
@@ -776,7 +854,17 @@ pub(super) fn decide_network_notification(
         }
         SYS_BIND => {
             let port = sockaddr.port;
-            let allowed = is_allowed_loopback_tcp_bind_port(port, config);
+            let allowed = config.proxy_bind_ports.contains(&port)
+                || config.caps.localhost_ports().contains(&port)
+                || config
+                    .caps
+                    .localhost_port_ranges()
+                    .iter()
+                    .any(|&(start, end)| port >= start && port <= end)
+                || config
+                    .proxy_bind_port_ranges
+                    .iter()
+                    .any(|&(s, e)| port >= s && port <= e);
             if allowed {
                 debug!("Proxy seccomp: allowing bind on port {}", port);
                 NetworkDecision::Allow
@@ -953,20 +1041,74 @@ fn canonicalize_unix_socket_bind_path(
 /// `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, which preserves platform compatibility
 /// but carries the documented userspace-pointer TOCTOU limitation described
 /// by `read_notif_sockaddr`.
+pub(super) fn handle_combined_notification(
+    notify_fd: std::os::fd::RawFd,
+    child: Pid,
+    config: &SupervisorConfig<'_>,
+    initial_caps: &[InitialCapability],
+    state: SeccompNotificationState<'_>,
+    network_throttle: &mut NetworkDenialThrottle,
+    ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
+) -> Result<()> {
+    let notif = nono::sandbox::recv_notif(notify_fd)?;
+    if matches!(
+        notif.data.nr,
+        nono::sandbox::SYS_OPENAT | nono::sandbox::SYS_OPENAT2
+    ) {
+        if !config.seccomp_policy.needs_openat_notify() {
+            return nono::sandbox::deny_notif(notify_fd, notif.id);
+        }
+        handle_received_filesystem_notification(
+            notify_fd,
+            child,
+            config,
+            initial_caps,
+            state,
+            notif,
+        )
+    } else {
+        handle_received_network_notification(
+            notify_fd,
+            config,
+            network_throttle,
+            state.denials,
+            ipc_denials,
+            notif,
+        )
+    }
+}
+
 pub(super) fn handle_network_notification(
     notify_fd: std::os::fd::RawFd,
     config: &SupervisorConfig<'_>,
-    rate_limiter: &mut RateLimiter,
+    network_throttle: &mut NetworkDenialThrottle,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
 ) -> nono::error::Result<()> {
+    let notif = nono::sandbox::recv_notif(notify_fd)?;
+    handle_received_network_notification(
+        notify_fd,
+        config,
+        network_throttle,
+        denials,
+        ipc_denials,
+        notif,
+    )
+}
+
+fn handle_received_network_notification(
+    notify_fd: std::os::fd::RawFd,
+    config: &SupervisorConfig<'_>,
+    network_throttle: &mut NetworkDenialThrottle,
+    denials: &mut Vec<DenialRecord>,
+    ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
+    notif: nono::sandbox::SeccompNotif,
+) -> nono::error::Result<()> {
     use nono::sandbox::{
         SYS_BIND, SYS_CONNECT, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO, continue_notif, deny_notif,
-        notif_id_valid, read_mmsghdr_dests, read_msghdr_dest, read_notif_sockaddr, recv_notif,
+        notif_id_valid, read_mmsghdr_dests, read_msghdr_dest, read_notif_sockaddr,
         respond_notif_errno,
     };
-
-    let notif = recv_notif(notify_fd)?;
 
     // Read sockaddr from child's memory. The location depends on the syscall:
     //   connect(fd, sockaddr*, addrlen):   args[1] = sockaddr*, args[2] = addrlen
@@ -1102,29 +1244,20 @@ pub(super) fn handle_network_notification(
         }
     };
 
-    // In AfUnixOnly mode the BPF filter traps by syscall number and cannot
-    // distinguish address families, so TCP/UDP calls arrive here too. They
-    // carry no policy decision — pass them through without consuming a
-    // rate-limiter token, which would otherwise starve legitimate network
-    // traffic once the burst is exhausted.
-    if config.seccomp_policy.af_unix_mediation
-        && sockaddrs.iter().all(|s| s.family != libc::AF_UNIX as u16)
+    // The BPF filter traps by syscall number and cannot distinguish address
+    // families, so every mode receives sockaddrs it does not mediate: TCP/UDP
+    // in AF_UNIX-only mode, and AF_UNIX in proxy-only mode without
+    // `linux.af_unix_mediation`. Those carry no policy decision — pass them
+    // through without consuming a rate-limiter token, which would otherwise
+    // starve legitimate traffic once the burst is exhausted.
+    if sockaddrs
+        .iter()
+        .all(|s| network_notification_out_of_scope(config.seccomp_policy, s.family))
     {
         if let Err(e) = continue_notif(notify_fd, notif.id) {
-            debug!(
-                "continue_notif failed for non-AF_UNIX pass-through (AfUnixOnly): {}",
-                e
-            );
+            debug!("continue_notif failed for out-of-scope pass-through: {}", e);
             return deny_notif(notify_fd, notif.id);
         }
-        return Ok(());
-    }
-
-    // Rate limit: guard AF_UNIX mediation decisions and proxy-mode decisions
-    // against notification flooding from a compromised child.
-    if !rate_limiter.try_acquire() {
-        debug!("Rate limited network seccomp notification, denying");
-        let _ = deny_notif(notify_fd, notif.id);
         return Ok(());
     }
 
@@ -1138,9 +1271,23 @@ pub(super) fn handle_network_notification(
         match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
             NetworkDecision::Allow => {}
             NetworkDecision::Deny => {
-                record_af_unix_ipc_denial(sockaddr, notif.pid, notif.data.nr, denials, ipc_denials);
+                // Enforcement is unconditional: the throttle only bounds how
+                // much bookkeeping this denial may create.
+                let record = network_throttle.admit();
+                if record {
+                    flush_suppressed_network_denials(config, network_throttle);
+                    record_af_unix_ipc_denial(
+                        sockaddr,
+                        notif.pid,
+                        notif.data.nr,
+                        denials,
+                        ipc_denials,
+                    );
+                }
                 respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
-                if let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr) {
+                if record
+                    && let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr)
+                {
                     warn!("Failed to record network denial audit event: {}", err);
                 }
                 return Ok(());
@@ -1273,7 +1420,46 @@ fn record_network_audit_denial(
 ) -> nono::Result<()> {
     let target = network_audit_target(sockaddr);
     let reason = network_audit_denial_reason(sockaddr, syscall);
-    let event = nono::undo::NetworkAuditEvent {
+    let port = if sockaddr.port == 0 {
+        None
+    } else {
+        Some(sockaddr.port)
+    };
+    push_network_audit_event(config, network_denial_event(target, port, reason))
+}
+
+/// Emit one summary event for denials that were enforced but not recorded
+/// individually, then reset the counter. Failures are logged, never fatal.
+pub(super) fn flush_suppressed_network_denials(
+    config: &SupervisorConfig<'_>,
+    throttle: &mut NetworkDenialThrottle,
+) {
+    let count = throttle.take_suppressed();
+    if count == 0 {
+        return;
+    }
+    let event = network_denial_event(
+        "network syscalls (suppressed)".to_string(),
+        None,
+        format!(
+            "{count} network syscall denials were enforced but not individually recorded \
+             (audit rate limit exceeded)"
+        ),
+    );
+    if let Err(err) = push_network_audit_event(config, event) {
+        warn!(
+            "Failed to record suppressed network denial summary: {}",
+            err
+        );
+    }
+}
+
+fn network_denial_event(
+    target: String,
+    port: Option<u16>,
+    reason: String,
+) -> nono::undo::NetworkAuditEvent {
+    nono::undo::NetworkAuditEvent {
         timestamp_unix_ms: current_unix_millis(),
         mode: nono::undo::NetworkAuditMode::Connect,
         decision: nono::undo::NetworkAuditDecision::Deny,
@@ -1302,17 +1488,18 @@ fn record_network_audit_denial(
         spiffe_context: None,
         target,
         upstream: None,
-        port: if sockaddr.port == 0 {
-            None
-        } else {
-            Some(sockaddr.port)
-        },
+        port,
         method: None,
         path: None,
         status: None,
         reason: Some(reason),
-    };
+    }
+}
 
+fn push_network_audit_event(
+    config: &SupervisorConfig<'_>,
+    event: nono::undo::NetworkAuditEvent,
+) -> nono::Result<()> {
     if let Some(events_mutex) = config.network_audit_events {
         let mut events = events_mutex
             .lock()
@@ -1469,6 +1656,32 @@ mod tests {
     }
 
     #[test]
+    fn test_network_denial_throttle_records_burst_then_counts_suppressed() {
+        let mut throttle =
+            NetworkDenialThrottle::new(crate::profile::NetworkDenialAuditLimits::default());
+        for _ in 0..crate::profile::NETWORK_DENIAL_AUDIT_DEFAULT_BURST {
+            assert!(throttle.admit());
+        }
+        assert!(!throttle.admit());
+        assert!(!throttle.admit());
+        assert!(!throttle.admit());
+        assert_eq!(throttle.take_suppressed(), 3);
+        assert_eq!(throttle.take_suppressed(), 0, "counter resets after take");
+    }
+
+    #[test]
+    fn test_network_denial_throttle_admits_again_after_refill() {
+        let mut throttle =
+            NetworkDenialThrottle::new(crate::profile::NetworkDenialAuditLimits::default());
+        for _ in 0..crate::profile::NETWORK_DENIAL_AUDIT_DEFAULT_BURST {
+            assert!(throttle.admit());
+        }
+        assert!(!throttle.admit());
+        throttle.limiter.last_refill -= std::time::Duration::from_millis(200);
+        assert!(throttle.admit());
+    }
+
+    #[test]
     fn test_file_capability_exact_match_only() {
         let caps = vec![InitialCapability {
             path: PathBuf::from("/home/user/config.json"),
@@ -1622,15 +1835,21 @@ mod tests {
         ));
     }
 
-    // --- decide_network_notification tests (issue #685) ---------------------
+    // --- decide_network_notification tests (issue #685, #1901) --------------
     //
-    // These exercise the proxy-only seccomp fallback path that runs on
-    // Landlock < V4 kernels. The key invariant: pathname `AF_UNIX` must be
-    // checked against the explicit Unix-socket allowlist instead of being
-    // decided by TCP proxy ports.
+    // These exercise the seccomp network supervisor. Key invariants:
+    // - With `linux.af_unix_mediation = "pathname"`, pathname `AF_UNIX` is
+    //   checked against the explicit Unix-socket allowlist instead of being
+    //   decided by TCP proxy ports (#685).
+    // - In proxy-only mode (`network.allow_domain`) without AF_UNIX mediation,
+    //   `AF_UNIX` is out of scope and passes through; only TCP is forced to
+    //   the proxy (#1901).
 
     mod network_decision {
-        use super::super::{NetworkDecision, SupervisorConfig, decide_network_notification};
+        use super::super::{
+            NetworkDecision, SupervisorConfig, decide_network_notification,
+            network_notification_out_of_scope,
+        };
         use nix::libc;
         use nono::sandbox::{
             SYS_BIND, SYS_CONNECT, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO, SockaddrInfo,
@@ -1690,20 +1909,81 @@ mod tests {
                 open_url_allow_localhost: false,
                 audit_recorder: None,
                 network_audit_events: None,
+                proxy_handle: None,
                 redaction_policy: &REDACTION_POLICY,
                 allow_launch_services_active: false,
                 proxy_port,
                 proxy_bind_ports,
                 proxy_bind_port_ranges,
+                network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
                 unix_socket_allowlist,
+                // Combined mode: proxy-only TCP enforcement plus pathname
+                // AF_UNIX mediation. AF_UNIX allowlist checks only apply
+                // when `af_unix_mediation` is on; see
+                // `make_proxy_only_config` for the mediation-off variant.
                 seccomp_policy: super::super::SeccompPolicy {
                     capability_elevation: false,
                     proxy_fallback: true,
-                    af_unix_mediation: false,
+                    af_unix_mediation: true,
                     proc_comm_notify: false,
                 },
                 tool_sandbox_runtime: None,
             }
+        }
+
+        /// Proxy-only mode as selected by `network.allow_domain` on a profile
+        /// that leaves `linux.af_unix_mediation` at its default (off).
+        fn make_proxy_only_config<'a>(
+            backend: &'a DenyAllBackend,
+            proxy_port: u16,
+            proxy_bind_ports: Vec<u16>,
+        ) -> SupervisorConfig<'a> {
+            let mut config = make_config(backend, proxy_port, proxy_bind_ports, &[]);
+            config.seccomp_policy = super::super::SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback: true,
+                af_unix_mediation: false,
+                proc_comm_notify: false,
+            };
+            config
+        }
+
+        #[test]
+        fn flush_suppressed_network_denials_emits_one_summary_event_and_resets() {
+            let backend = DenyAllBackend;
+            let events = std::sync::Mutex::new(Vec::new());
+            let mut config = make_proxy_only_config(&backend, 8080, vec![]);
+            config.network_audit_events = Some(&events);
+
+            let mut throttle = super::super::NetworkDenialThrottle::new(
+                crate::profile::NetworkDenialAuditLimits::default(),
+            );
+
+            // Nothing suppressed: no event.
+            super::super::flush_suppressed_network_denials(&config, &mut throttle);
+            assert!(events.lock().expect("lock").is_empty());
+
+            // Exhaust the budget, then suppress 4 more denials.
+            while throttle.admit() {}
+            for _ in 0..3 {
+                assert!(!throttle.admit());
+            }
+
+            super::super::flush_suppressed_network_denials(&config, &mut throttle);
+            {
+                let recorded = events.lock().expect("lock");
+                assert_eq!(recorded.len(), 1, "exactly one summary event");
+                assert!(matches!(
+                    recorded[0].decision,
+                    nono::undo::NetworkAuditDecision::Deny
+                ));
+                let reason = recorded[0].reason.as_deref().unwrap_or_default();
+                assert!(reason.starts_with("4 network syscall denials"), "{reason}");
+            }
+
+            // Counter was reset: a second flush adds nothing.
+            super::super::flush_suppressed_network_denials(&config, &mut throttle);
+            assert_eq!(events.lock().expect("lock").len(), 1);
         }
 
         fn unix_pathname(path: &Path) -> SockaddrInfo {
@@ -1915,9 +2195,9 @@ mod tests {
             );
         }
 
-        /// Scope-limit test: abstract-namespace AF_UNIX (`sun_path[0] == 0`)
-        /// is not covered by pathname socket capabilities, so it stays
-        /// denied.
+        /// Scope-limit test: with AF_UNIX mediation enabled, abstract-namespace
+        /// AF_UNIX (`sun_path[0] == 0`) is not covered by pathname socket
+        /// capabilities, so it stays denied.
         #[test]
         fn af_unix_abstract_is_denied() {
             let backend = DenyAllBackend;
@@ -1933,8 +2213,9 @@ mod tests {
             );
         }
 
-        /// Unnamed AF_UNIX (`addrlen == 2`) has no path to check, so fail
-        /// closed — consistent with abstract handling.
+        /// With AF_UNIX mediation enabled, unnamed AF_UNIX (`addrlen == 2`)
+        /// has no path to check, so fail closed — consistent with abstract
+        /// handling.
         #[test]
         fn af_unix_unnamed_is_denied() {
             let backend = DenyAllBackend;
@@ -1943,6 +2224,203 @@ mod tests {
                 decide_network_notification(test_pid(), SYS_BIND, &unix_unnamed(), &config),
                 NetworkDecision::Deny
             );
+        }
+
+        // --- issue #1901: proxy-only mode must not mediate AF_UNIX ----------
+
+        /// Regression for #1901: `network.allow_domain` alone (proxy-only,
+        /// `af_unix_mediation` off) must not deny pathname `bind(AF_UNIX)`,
+        /// even with no socket grant. This is what broke JVM attach / Mockito.
+        #[test]
+        fn proxy_only_without_af_unix_mediation_allows_pathname_bind_without_grant() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "p.sock");
+            let config = make_proxy_only_config(&backend, 8080, Vec::new());
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &unix_pathname(&path), &config),
+                NetworkDecision::Allow,
+                "AF_UNIX is out of scope for proxy-only enforcement (#1901)"
+            );
+        }
+
+        /// Same for connect/sendto/sendmsg/sendmmsg on an unlisted pathname socket.
+        #[test]
+        fn proxy_only_without_af_unix_mediation_allows_pathname_connect_and_send() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "p.sock");
+            let _listener = UnixListener::bind(&path).expect("bind unix listener");
+            let config = make_proxy_only_config(&backend, 8080, Vec::new());
+            for syscall in [SYS_CONNECT, SYS_SENDTO, SYS_SENDMSG, SYS_SENDMMSG] {
+                assert_eq!(
+                    decide_network_notification(
+                        test_pid(),
+                        syscall,
+                        &unix_pathname(&path),
+                        &config
+                    ),
+                    NetworkDecision::Allow,
+                    "syscall {syscall} on an unlisted AF_UNIX path must pass through"
+                );
+            }
+        }
+
+        /// Abstract and unnamed AF_UNIX are only denied when mediation is on.
+        /// The #1901 reporter saw abstract binds fail too, which is what
+        /// proved the denial was not a filesystem grant issue.
+        #[test]
+        fn proxy_only_without_af_unix_mediation_allows_abstract_and_unnamed() {
+            let backend = DenyAllBackend;
+            let config = make_proxy_only_config(&backend, 8080, Vec::new());
+            for syscall in [SYS_BIND, SYS_CONNECT, SYS_SENDTO] {
+                assert_eq!(
+                    decide_network_notification(test_pid(), syscall, &unix_abstract(), &config),
+                    NetworkDecision::Allow,
+                    "abstract AF_UNIX syscall {syscall} must pass through"
+                );
+            }
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &unix_unnamed(), &config),
+                NetworkDecision::Allow
+            );
+        }
+
+        /// Security-critical: the #1901 pass-through is family-scoped. In the
+        /// same proxy-only config, TCP must still be forced to the proxy.
+        #[test]
+        fn proxy_only_without_af_unix_mediation_still_enforces_tcp() {
+            let backend = DenyAllBackend;
+            let config = make_proxy_only_config(&backend, 8080, vec![3000]);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(8080), &config),
+                NetworkDecision::Deny,
+                "external TCP connect must still be denied"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(9999), &config),
+                NetworkDecision::Deny,
+                "loopback TCP connect to a non-proxy port must still be denied"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(8080), &config),
+                NetworkDecision::Allow,
+                "loopback TCP connect to the proxy port is allowed"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(3001), &config),
+                NetworkDecision::Deny,
+                "TCP bind outside proxy_bind_ports must still be denied"
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(3000), &config),
+                NetworkDecision::Allow
+            );
+        }
+
+        /// Regression test for issue #2020: seccomp proxy fallback must preserve
+        /// bidirectional localhost grants that Landlock already honors.
+        #[test]
+        fn proxy_only_allows_explicit_localhost_ports_and_ranges() {
+            let backend = DenyAllBackend;
+            let mut caps = nono::CapabilitySet::default();
+            caps.add_localhost_port(3001);
+            caps.add_localhost_port_range(4000, 4002)
+                .expect("valid localhost port range");
+            let mut config = make_proxy_only_config(&backend, 8080, Vec::new());
+            config.caps = &caps;
+
+            for port in [3001, 4000, 4002] {
+                assert_eq!(
+                    decide_network_notification(
+                        test_pid(),
+                        SYS_CONNECT,
+                        &inet_loopback(port),
+                        &config
+                    ),
+                    NetworkDecision::Allow,
+                    "loopback connect to explicitly open port {port} must be allowed"
+                );
+                assert_eq!(
+                    decide_network_notification(
+                        test_pid(),
+                        SYS_BIND,
+                        &inet_loopback(port),
+                        &config
+                    ),
+                    NetworkDecision::Allow,
+                    "bind to explicitly open port {port} must be allowed"
+                );
+                assert_eq!(
+                    decide_network_notification(
+                        test_pid(),
+                        SYS_CONNECT,
+                        &inet_external(port),
+                        &config
+                    ),
+                    NetworkDecision::Deny,
+                    "open-port must not authorize an external destination on port {port}"
+                );
+            }
+
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(4003), &config),
+                NetworkDecision::Deny,
+                "a port outside the explicit range must remain denied"
+            );
+        }
+
+        /// Full truth table for the scope predicate shared by the policy
+        /// decision and the rate-limiter bypass.
+        #[test]
+        fn network_notification_out_of_scope_truth_table() {
+            use super::super::SeccompPolicy;
+            let policy = |proxy_fallback, af_unix_mediation| SeccompPolicy {
+                capability_elevation: false,
+                proxy_fallback,
+                af_unix_mediation,
+                proc_comm_notify: false,
+            };
+            let unix = libc::AF_UNIX as u16;
+            let inet = libc::AF_INET as u16;
+            let inet6 = libc::AF_INET6 as u16;
+
+            // Proxy-only, mediation off: AF_UNIX out of scope, TCP in scope.
+            assert!(network_notification_out_of_scope(policy(true, false), unix));
+            assert!(!network_notification_out_of_scope(
+                policy(true, false),
+                inet
+            ));
+            assert!(!network_notification_out_of_scope(
+                policy(true, false),
+                inet6
+            ));
+
+            // AF_UNIX-only: TCP out of scope, AF_UNIX in scope.
+            assert!(!network_notification_out_of_scope(
+                policy(false, true),
+                unix
+            ));
+            assert!(network_notification_out_of_scope(policy(false, true), inet));
+            assert!(network_notification_out_of_scope(
+                policy(false, true),
+                inet6
+            ));
+
+            // Combined: everything in scope.
+            assert!(!network_notification_out_of_scope(policy(true, true), unix));
+            assert!(!network_notification_out_of_scope(policy(true, true), inet));
+
+            // Neither: no network notify fd is installed, but fail closed
+            // (nothing is declared out of scope) if one somehow arrives.
+            assert!(!network_notification_out_of_scope(
+                policy(false, false),
+                unix
+            ));
+            assert!(!network_notification_out_of_scope(
+                policy(false, false),
+                inet
+            ));
         }
 
         /// Security-critical: the `AF_UNIX → Allow` short-circuit must not
@@ -2230,7 +2708,11 @@ mod tests {
         #[test]
         fn af_inet_connect_to_open_port_localhost_allowed() {
             let backend = DenyAllBackend;
-            let config = make_config_with_ranges(&backend, 8080, vec![], vec![(8250, 8255)], &[]);
+            let caps = CapabilitySet::new()
+                .allow_localhost_port_range(8250, 8255)
+                .expect("valid localhost range");
+            let mut config = make_config(&backend, 8080, vec![], &[]);
+            config.caps = &caps;
             for port in [8250u16, 8253, 8255] {
                 assert_eq!(
                     decide_network_notification(
@@ -2251,24 +2733,34 @@ mod tests {
         }
 
         #[test]
-        fn af_inet_connect_to_proxy_bind_port_allowed() {
+        fn af_inet_connect_to_bind_only_grants_denied() {
             let backend = DenyAllBackend;
-            let config = make_config(&backend, 8080, vec![9000], &[]);
-            assert_eq!(
-                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(9000), &config),
-                NetworkDecision::Allow,
-                "connect to listen_port bind grant must be allowed"
-            );
-            assert_eq!(
-                decide_network_notification(test_pid(), SYS_CONNECT, &inet_loopback(9001), &config),
-                NetworkDecision::Deny
-            );
+            let config =
+                make_config_with_ranges(&backend, 8080, vec![9000], vec![(9100, 9102)], &[]);
+            for port in [9000, 9001, 9100, 9101, 9102] {
+                for syscall in [SYS_CONNECT, SYS_SENDTO, SYS_SENDMSG, SYS_SENDMMSG] {
+                    assert_eq!(
+                        decide_network_notification(
+                            test_pid(),
+                            syscall,
+                            &inet_loopback(port),
+                            &config
+                        ),
+                        NetworkDecision::Deny,
+                        "listen-only grant must not allow outbound syscall {syscall} to port {port}"
+                    );
+                }
+            }
         }
 
         #[test]
         fn af_inet_connect_to_non_loopback_declared_port_denied() {
             let backend = DenyAllBackend;
-            let config = make_config_with_ranges(&backend, 8080, vec![], vec![(8250, 8255)], &[]);
+            let caps = CapabilitySet::new()
+                .allow_localhost_port_range(8250, 8255)
+                .expect("valid localhost range");
+            let mut config = make_config(&backend, 8080, vec![], &[]);
+            config.caps = &caps;
             assert_eq!(
                 decide_network_notification(test_pid(), SYS_CONNECT, &inet_external(8250), &config,),
                 NetworkDecision::Deny,

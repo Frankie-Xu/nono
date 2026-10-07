@@ -318,6 +318,20 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     } else {
         plain_domain_strs
     };
+    // Expand `deny_domain` the same way for `nono why --self`.
+    let denied_domain_strs: Vec<String> = domain_filter
+        .map(|d| d.deny_domain.as_slice())
+        .map(|deny_domain| {
+            let policy_json = config::embedded::embedded_network_policy_json();
+            match network_policy::load_network_policy(policy_json) {
+                Ok(net_policy) => network_policy::expand_proxy_deny(&net_policy, deny_domain),
+                Err(e) => {
+                    warn!("failed to load network policy for sandbox state: {e}");
+                    deny_domain.to_vec()
+                }
+            }
+        })
+        .unwrap_or_default();
     let domain_endpoints: Vec<sandbox_state::DomainEndpointState> = all_domain_entries
         .iter()
         .filter_map(|e| match e {
@@ -343,6 +357,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         &flags.bypass_protection_paths,
         &deny_paths,
         &allowed_domain_strs,
+        &denied_domain_strs,
         &domain_endpoints,
         flags.silent,
     );
@@ -363,7 +378,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let strategy = flags.strategy;
     if tool_sandbox_active && !matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
         return Err(NonoError::ConfigParse(
-            "tool-sandbox command_policies require supervised execution".to_string(),
+            "command policies require supervised execution".to_string(),
         ));
     }
 
@@ -382,9 +397,17 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         None,
     )?;
     let proxy_env_vars = active_proxy.env_vars;
-    let tool_sandbox_proxy_credential_env_vars = active_proxy.tool_sandbox_credential_env_vars;
+    let tool_sandbox_proxy_credentials = active_proxy.tool_sandbox_proxy_credentials;
+    let scoped_proxy_env_vars = active_proxy.scoped_proxy_env_vars;
     let tool_sandbox_trust_bundle_paths = active_proxy.tool_sandbox_trust_bundle_paths;
+    let reserved_proxy_ports: std::collections::BTreeSet<u16> = active_proxy
+        .handle
+        .iter()
+        .chain(active_proxy.scoped_handles.iter())
+        .map(|handle| handle.port)
+        .collect();
     let proxy_handle = active_proxy.handle;
+    let scoped_proxy_handles = active_proxy.scoped_handles;
 
     let requested_workdir =
         flags
@@ -416,6 +439,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
                 config: command_policies,
+                initial_program: &resolved_program,
                 resolved_command_binaries: flags.resolved_command_binaries.as_ref(),
                 audit_context: crate::tool_sandbox::ToolSandboxAuditContext::new(
                     flags.profile_display_name.clone(),
@@ -426,7 +450,9 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 outer_caps: &caps,
                 deny_paths: &deny_paths,
                 policy_root: &requested_workdir,
-                proxy_credential_env_vars: &tool_sandbox_proxy_credential_env_vars,
+                proxy_credentials: &tool_sandbox_proxy_credentials,
+                reserved_proxy_ports: &reserved_proxy_ports,
+                scoped_proxy_env_vars: &scoped_proxy_env_vars,
                 proxy_trust_bundle_paths: &tool_sandbox_trust_bundle_paths,
                 shared_broker: Some(shared_broker.clone()),
             },
@@ -454,8 +480,11 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 blocked_commands: caps.blocked_commands(),
                 outer_caps: &caps,
                 deny_paths: &deny_paths,
+                bypass_protection_paths: &flags.bypass_protection_paths,
                 policy_root: &requested_workdir,
-                proxy_credential_env_vars: &tool_sandbox_proxy_credential_env_vars,
+                proxy_credentials: &tool_sandbox_proxy_credentials,
+                reserved_proxy_ports: &reserved_proxy_ports,
+                scoped_proxy_env_vars: &scoped_proxy_env_vars,
                 proxy_trust_bundle_paths: &tool_sandbox_trust_bundle_paths,
                 shared_broker: Some(shared_broker),
             },
@@ -719,6 +748,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         sandbox_policy: flags.sandbox_policy,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
+        case_insensitive_env_vars: flags.case_insensitive_env_vars,
         set_vars: flags.set_vars.unwrap_or_default(),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         tool_sandbox_runtime: tool_sandbox_runtime.as_ref(),
@@ -737,7 +767,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             // Look up the approval backend for supervised file/capability
             // prompts. It lives under the profile `security` section, kept
             // separate from `command_policies` so it does not switch on
-            // tool-sandbox. Fail closed: if a backend is configured but cannot
+            // command mediation. Fail closed: if a backend is configured but cannot
             // be built or picked, error out — never quietly drop back to the
             // terminal prompt. Nothing configured returns `None`, keeping the
             // prompt.
@@ -761,6 +791,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 audit_signer: audit_signer.as_ref(),
                 redaction_policy: &flags.redaction_policy,
                 approval_backend,
+                #[cfg(target_os = "linux")]
+                network_denial_audit: flags.network_denial_audit,
                 silent: flags.silent,
             });
 
@@ -794,6 +826,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             // session directory under `~/.nono/sessions/`. Without this
             // every supervised-mode session leaks a file + directory.
             drop(proxy_handle);
+            drop(scoped_proxy_handles);
             crate::tool_sandbox::log_main_total();
             std::process::exit(exit_code);
         }
@@ -809,16 +842,17 @@ fn validate_command_policy_execution_support() -> Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(NonoError::UnsupportedPlatform(
-            "tool-sandbox command_policies are only supported on Linux and macOS".to_string(),
+            "command policies are only supported on Linux and macOS".to_string(),
         ))
     }
 }
 
 fn write_capability_state_file(
     caps: &CapabilitySet,
-    bypass_protection_paths: &[std::path::PathBuf],
+    bypass_protection_paths: &[crate::policy::AppliedBypass],
     deny_paths: &[std::path::PathBuf],
     allowed_domains: &[String],
+    denied_domains: &[String],
     domain_endpoints: &[sandbox_state::DomainEndpointState],
     silent: bool,
 ) -> Option<std::path::PathBuf> {
@@ -827,6 +861,7 @@ fn write_capability_state_file(
         bypass_protection_paths,
         deny_paths,
         allowed_domains,
+        denied_domains,
         domain_endpoints,
     );
 

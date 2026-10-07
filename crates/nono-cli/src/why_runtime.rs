@@ -9,9 +9,9 @@ use nono::{AccessMode, CapabilitySet, NonoError, Result};
 
 struct WhyContext {
     caps: CapabilitySet,
-    deny_paths: Vec<std::path::PathBuf>,
-    overridden_paths: Vec<std::path::PathBuf>,
+    deny_policy: policy::EffectiveDenyPolicy,
     allowed_domains: Vec<String>,
+    denied_domains: Vec<String>,
     domain_endpoints: Vec<sandbox_state::DomainEndpointState>,
     command_policies: Option<CommandPoliciesConfig>,
 }
@@ -50,6 +50,41 @@ fn resolve_allowed_domains(profile: &profile::Profile) -> Result<Vec<String>> {
         &plain_entries,
     ));
 
+    Ok(domains)
+}
+
+/// Resolve the proxy domain denylist from a profile's network config.
+fn resolve_denied_domains(profile: &profile::Profile) -> Result<Vec<String>> {
+    let policy_json = crate::config::embedded::embedded_network_policy_json();
+    let net_policy = network_policy::load_network_policy(policy_json)?;
+    Ok(network_policy::expand_proxy_deny(
+        &net_policy,
+        &profile.network.deny_domain,
+    ))
+}
+
+/// Merge `--allow-domain` overrides into a resolved allowlist.
+fn merge_cli_allow_domains(
+    mut domains: Vec<String>,
+    cli_entries: &[String],
+) -> Result<Vec<String>> {
+    if cli_entries.is_empty() {
+        return Ok(domains);
+    }
+    let policy_json = crate::config::embedded::embedded_network_policy_json();
+    let net_policy = network_policy::load_network_policy(policy_json)?;
+    domains.extend(network_policy::expand_proxy_allow(&net_policy, cli_entries));
+    Ok(domains)
+}
+
+/// Merge `--deny-domain` overrides into a resolved denylist.
+fn merge_cli_deny_domains(mut domains: Vec<String>, cli_entries: &[String]) -> Result<Vec<String>> {
+    if cli_entries.is_empty() {
+        return Ok(domains);
+    }
+    let policy_json = crate::config::embedded::embedded_network_policy_json();
+    let net_policy = network_policy::load_network_policy(policy_json)?;
+    domains.extend(network_policy::expand_proxy_deny(&net_policy, cli_entries));
     Ok(domains)
 }
 
@@ -104,16 +139,42 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         .map(detect_stale_file_grants)
         .unwrap_or_default();
 
+    if args.lexical_profile_path {
+        let profile_name = args.profile.as_deref().ok_or_else(|| {
+            NonoError::ConfigParse("--lexical-profile-path requires --profile".into())
+        })?;
+        let path = args.path.as_deref().ok_or_else(|| {
+            NonoError::ConfigParse("--lexical-profile-path requires --path".into())
+        })?;
+        let profile = profile::load_profile_with_extends(profile_name, &args.extends)?;
+        let requested = match args.op {
+            Some(WhyOp::Read) | None => AccessMode::Read,
+            Some(WhyOp::Write) => AccessMode::Write,
+            Some(WhyOp::ReadWrite) => AccessMode::ReadWrite,
+        };
+        let result = query_profile_path_lexically(path, requested, &profile);
+        if args.json {
+            let json = serde_json::to_string_pretty(&result)
+                .map_err(|e| NonoError::ConfigParse(format!("JSON serialization failed: {e}")))?;
+            println!("{json}");
+        } else {
+            print_result(&result);
+        }
+        return Ok(());
+    }
+
     let ctx: WhyContext = if args.self_query {
         match sandbox_state {
             Some(state) => {
-                let paths = state.bypass_protection_as_paths();
                 let domain_endpoints = state.domain_endpoints.clone();
                 WhyContext {
                     caps: state.to_caps()?,
-                    deny_paths: state.deny_paths_as_paths(),
-                    overridden_paths: paths,
+                    deny_policy: policy::EffectiveDenyPolicy::from_applied_bypasses(
+                        &state.deny_paths_as_paths(),
+                        &state.applied_bypasses,
+                    ),
                     allowed_domains: state.allowed_domains.clone(),
+                    denied_domains: state.denied_domains.clone(),
                     domain_endpoints,
                     command_policies: None,
                 }
@@ -153,19 +214,10 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             ..SandboxArgs::default()
         };
 
-        let mut override_paths = Vec::new();
-        for tmpl in &profile.filesystem.bypass_protection {
-            let expanded = profile::expand_vars(tmpl, &workdir)?;
-            if expanded.exists() {
-                if let Ok(canonical) = expanded.canonicalize() {
-                    override_paths.push(canonical);
-                }
-            } else {
-                override_paths.push(expanded);
-            }
-        }
-
-        let allowed_domains = resolve_allowed_domains(&profile)?;
+        let allowed_domains =
+            merge_cli_allow_domains(resolve_allowed_domains(&profile)?, &args.allow_proxy)?;
+        let denied_domains =
+            merge_cli_deny_domains(resolve_denied_domains(&profile)?, &args.deny_proxy)?;
         let domain_endpoints = resolve_domain_endpoints(&profile);
         let command_policies = profile.command_policies.clone();
 
@@ -176,9 +228,12 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         }
         WhyContext {
             caps,
-            deny_paths: prepared.deny_paths,
-            overridden_paths: override_paths,
+            deny_policy: policy::EffectiveDenyPolicy::from_applied_bypasses(
+                &prepared.deny_paths,
+                &prepared.applied_bypass_paths,
+            ),
             allowed_domains,
+            denied_domains,
             domain_endpoints,
             command_policies,
         }
@@ -202,9 +257,12 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         }
         WhyContext {
             caps,
-            deny_paths: prepared.deny_paths,
-            overridden_paths: vec![],
-            allowed_domains: vec![],
+            deny_policy: policy::EffectiveDenyPolicy::from_applied_bypasses(
+                &prepared.deny_paths,
+                &[],
+            ),
+            allowed_domains: merge_cli_allow_domains(Vec::new(), &args.allow_proxy)?,
+            denied_domains: merge_cli_deny_domains(Vec::new(), &args.deny_proxy)?,
             domain_endpoints: vec![],
             command_policies: None,
         }
@@ -224,7 +282,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             Some(WhyOp::ReadWrite) => AccessMode::ReadWrite,
             None => AccessMode::Read,
         };
-        let result = match matching_deny_path(path, &ctx.deny_paths) {
+        let result = match ctx.deny_policy.matching_deny_for_access(path, op) {
             Some(deny_path) => QueryResult::Denied {
                 reason: "filesystem_deny".to_string(),
                 details: Some(format!(
@@ -236,14 +294,14 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
                 suggested_flag: None,
                 endpoint_rules: None,
             },
-            None => query_path(path, op, &ctx.caps, &ctx.overridden_paths)?,
+            None => query_path(path, op, &ctx.caps, ctx.deny_policy.bypass_paths())?,
         };
         apply_file_grant_staleness(
             result,
             path,
             op,
             &ctx.caps,
-            &ctx.overridden_paths,
+            ctx.deny_policy.bypass_paths(),
             &stale_file_grants,
         )?
     } else if let Some(ref host) = args.host {
@@ -252,6 +310,7 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
             args.port,
             &ctx.caps,
             &ctx.allowed_domains,
+            &ctx.denied_domains,
             &ctx.domain_endpoints,
         )
     } else if let Some(ref scope) = args.scope {
@@ -273,24 +332,223 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
     Ok(())
 }
 
-/// Return the most specific deny path that covers a query path.
-///
-/// Deny paths are retained separately from allow capabilities because macOS
-/// Seatbelt deny rules take precedence over a broader allow rule. Resolve the
-/// query through existing ancestors so missing leaf paths (the common
-/// create-file case) compare the same way as the rules installed at launch.
-fn matching_deny_path<'a>(
+/// Evaluate literal filesystem rules without resolving any path on this host.
+/// Profiles whose matching grant needs environment expansion, globs, or policy
+/// group grants remain undecided. Literal group denials are still applied.
+fn query_profile_path_lexically(
     path: &std::path::Path,
-    deny_paths: &'a [std::path::PathBuf],
-) -> Option<&'a std::path::PathBuf> {
-    let resolved = nono::try_canonicalize(path);
-    deny_paths
+    requested: AccessMode,
+    profile: &profile::Profile,
+) -> query_ext::QueryResult {
+    use query_ext::QueryResult;
+
+    let Some(path) = normalize_absolute_literal(path) else {
+        return lexical_path_pending("the requested path is not an absolute literal path");
+    };
+    let fs = &profile.filesystem;
+    let bypass_paths = match normalize_rule_paths(&fs.bypass_protection) {
+        Some(paths) => paths,
+        None => return lexical_path_pending("a filesystem bypass rule needs path expansion"),
+    };
+    let overridden = bypass_paths.iter().any(|entry| path.starts_with(entry));
+    if !overridden {
+        let policy = match crate::policy::load_embedded_policy() {
+            Ok(policy) => policy,
+            Err(_) => return lexical_path_pending("embedded path policy could not be loaded"),
+        };
+        let mut deny_rules = fs.deny.clone();
+        for group_name in &profile.groups.include {
+            let Some(group) = policy.groups.get(group_name) else {
+                return lexical_path_pending("a profile policy group could not be resolved");
+            };
+            if crate::policy::group_matches_platform(group)
+                && let Some(deny) = &group.deny
+            {
+                deny_rules.extend(deny.access.iter().cloned());
+            }
+        }
+        for rule in &deny_rules {
+            match policy_rule_may_cover(rule, &path) {
+                Some(true) => {
+                    return QueryResult::Denied {
+                        reason: "filesystem_deny".into(),
+                        details: Some(format!("Path is covered by filesystem deny rule: {rule}")),
+                        policy_source: Some("filesystem.deny".into()),
+                        matching_capability: None,
+                        suggested_flag: None,
+                        endpoint_rules: None,
+                    };
+                }
+                Some(false) => {}
+                None => {
+                    return lexical_path_pending(
+                        "a filesystem deny rule needs unsupported path expansion",
+                    );
+                }
+            }
+        }
+        match crate::config::check_sensitive_path(&path.to_string_lossy()) {
+            Ok(Some(matched)) => {
+                return QueryResult::Denied {
+                    reason: "sensitive_path".into(),
+                    details: Some(format!(
+                        "Blocked by policy group '{}': {}",
+                        matched.group_name, matched.description
+                    )),
+                    policy_source: Some(format!("group:{}", matched.group_name)),
+                    matching_capability: None,
+                    suggested_flag: None,
+                    endpoint_rules: None,
+                };
+            }
+            Ok(None) => {}
+            Err(_) => return lexical_path_pending("sensitive path policy could not be loaded"),
+        }
+    }
+
+    let rw_dirs = &fs.allow;
+    let read_dirs = &fs.read;
+    let write_dirs = &fs.write;
+    let rw_files = &fs.allow_file;
+    let read_files = &fs.read_file;
+    let write_files = &fs.write_file;
+    let rw = path_rule_matches(path.as_path(), rw_dirs, false)
+        || path_rule_matches(path.as_path(), rw_files, true);
+    let read = rw
+        || path_rule_matches(path.as_path(), read_dirs, false)
+        || path_rule_matches(path.as_path(), read_files, true);
+    let write = rw
+        || path_rule_matches(path.as_path(), write_dirs, false)
+        || path_rule_matches(path.as_path(), write_files, true);
+    let allowed = match requested {
+        AccessMode::Read => read,
+        AccessMode::Write => write,
+        AccessMode::ReadWrite => read && write,
+    };
+    if allowed {
+        QueryResult::Allowed {
+            reason: "granted_path".into(),
+            granted_path: Some(path.display().to_string()),
+            access: Some(requested.to_string()),
+            source: Some("profile".into()),
+            endpoint_rules: None,
+            warning: None,
+        }
+    } else {
+        QueryResult::Denied {
+            reason: "path_not_granted".into(),
+            details: Some(format!(
+                "No literal filesystem rule in the profile grants {} access to {}",
+                requested,
+                path.display()
+            )),
+            policy_source: None,
+            matching_capability: None,
+            suggested_flag: None,
+            endpoint_rules: None,
+        }
+    }
+}
+
+fn lexical_path_pending(reason: &str) -> query_ext::QueryResult {
+    query_ext::QueryResult::ApprovalRequired {
+        reason: "lexical_path_context_unavailable".into(),
+        details: Some(reason.into()),
+        policy_source: None,
+    }
+}
+
+fn normalize_rule_paths(paths: &[String]) -> Option<Vec<std::path::PathBuf>> {
+    paths
         .iter()
-        .filter(|deny| {
-            let resolved_deny = nono::try_canonicalize(deny);
-            resolved.starts_with(&resolved_deny)
+        .map(|path| normalize_absolute_literal(std::path::Path::new(path)))
+        .collect()
+}
+
+/// Determine whether a literal or home-relative deny rule can cover `path`
+/// without consulting the evaluator host's filesystem or HOME value.
+///
+/// `Some(true)` means the rule definitely covers the path, `Some(false)` that
+/// it definitely does not, and `None` that the answer depends on context this
+/// evaluation deliberately does not have. Only a rule that is already an
+/// absolute literal can produce `Some(true)`.
+///
+/// A home-relative rule cannot: without `$HOME`, finding the rule's components
+/// somewhere in the path proves nothing about *which* directory they sit under.
+/// `~/downloads` and `/var/tmp/downloads/foo` share a `downloads` component
+/// while describing unrelated locations, so treating that as a match reports a
+/// confident `Denied` for a path the rule never covers. The absence of those
+/// components is still conclusive, because every expansion of `~/downloads`
+/// ends in `downloads` — so a path without it cannot be beneath the rule for
+/// any value of `$HOME`. That asymmetry is why a match yields `None` and a
+/// non-match yields `Some(false)`.
+fn policy_rule_may_cover(rule: &str, path: &std::path::Path) -> Option<bool> {
+    if let Some(normalized) = normalize_absolute_literal(std::path::Path::new(rule)) {
+        return Some(path.starts_with(normalized));
+    }
+    let suffix = rule
+        .strip_prefix("~/")
+        .or_else(|| rule.strip_prefix("$HOME/"))
+        .or_else(|| rule.strip_prefix("${HOME}/"))?;
+    let suffix_path = std::path::Path::new(suffix);
+    if suffix_path
+        .to_string_lossy()
+        .chars()
+        .any(|c| matches!(c, '*' | '?' | '$' | '~'))
+    {
+        return None;
+    }
+    let suffix_components: Vec<_> = suffix_path.components().collect();
+    if suffix_components.is_empty() {
+        // A bare `~/` denies the whole home directory. Whether this path lies
+        // inside it is precisely the question `$HOME` would answer.
+        return None;
+    }
+    let path_components: Vec<_> = path.components().collect();
+    if path_components
+        .windows(suffix_components.len())
+        .any(|window| window == suffix_components)
+    {
+        return None;
+    }
+    Some(false)
+}
+
+fn normalize_absolute_literal(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+    if !path.is_absolute()
+        || path
+            .to_string_lossy()
+            .chars()
+            .any(|c| matches!(c, '*' | '?' | '$' | '~'))
+    {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(_) => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
+}
+
+fn path_rule_matches(path: &std::path::Path, rules: &[String], exact: bool) -> bool {
+    rules.iter().any(|rule| {
+        normalize_absolute_literal(std::path::Path::new(rule)).is_some_and(|rule| {
+            if exact {
+                path == rule
+            } else {
+                path.starts_with(rule)
+            }
         })
-        .max_by_key(|deny| deny.as_os_str().len())
+    })
 }
 
 /// A file-level grant whose Landlock rule no longer matches the file at the
@@ -540,7 +798,7 @@ fn query_command_policy(
         Ok(WhyInvocationPolicyOutcome::Deny { reason }) => query_ext::QueryResult::Denied {
             reason,
             details: Some(format!(
-                "Command '{command}' from '{caller}' with argv [{}] is denied by invocation_policy. This is an Tool Sandbox  command/argument policy denial, not a filesystem path denial.{endpoint_note}",
+                "Command '{command}' from '{caller}' with argv [{}] is denied by invocation_policy. This is a command-policy denial, not a filesystem-policy denial.{endpoint_note}",
                 crate::command_display::format_command_line(command_args)
             )),
             policy_source: Some(format!(
@@ -627,7 +885,7 @@ fn evaluate_invocation_policy_for_why(
     _argv: &[Vec<u8>],
 ) -> Result<WhyInvocationPolicyOutcome> {
     Err(NonoError::ConfigParse(
-        "tool-sandbox command-policy queries are only available on Linux and macOS".to_string(),
+        "command-policy queries are only available on Linux and macOS".to_string(),
     ))
 }
 
@@ -684,6 +942,7 @@ mod tests {
             443,
             &caps,
             &resolve_allowed_domains(&profile).expect("resolve allowlist"),
+            &resolve_denied_domains(&profile).expect("resolve denylist"),
             &resolve_domain_endpoints(&profile),
         )
     }
@@ -747,9 +1006,136 @@ mod tests {
         let denied = dir.path().join("blocked");
         let query = denied.join("future.txt");
 
-        assert_eq!(
-            matching_deny_path(&query, std::slice::from_ref(&denied)),
-            Some(&denied)
+        let policy = policy::EffectiveDenyPolicy::new(std::slice::from_ref(&denied), &[]);
+
+        assert_eq!(policy.matching_deny(&query), Some(&denied));
+    }
+
+    /// Builds the deny policy the way `run_why --profile` does, through
+    /// `from_profile`, so the bypasses under test are the ones the sandbox
+    /// would actually have applied.
+    fn deny_policy_for_profile(
+        json: &str,
+        workdir: &std::path::Path,
+    ) -> policy::EffectiveDenyPolicy {
+        let profile = profile_from_json(json);
+        let prepared = CapabilitySet::from_profile(
+            &profile,
+            workdir,
+            &SandboxArgs {
+                workdir: Some(workdir.to_path_buf()),
+                ..SandboxArgs::default()
+            },
+        )
+        .expect("prepare caps");
+        policy::EffectiveDenyPolicy::from_applied_bypasses(
+            &prepared.deny_paths,
+            &prepared.applied_bypass_paths,
+        )
+    }
+
+    #[test]
+    fn profile_bypass_reopens_deny_for_path_query() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let denied = dir.path().join("blocked");
+        std::fs::create_dir_all(&denied).expect("mkdir");
+        let bypassed = denied.join("secret");
+        std::fs::write(&bypassed, b"x").expect("write");
+
+        let policy = deny_policy_for_profile(
+            &format!(
+                r#"{{"filesystem":{{"deny":["{denied}"],"read_file":["{bypassed}"],"bypass_protection":["{bypassed}"]}}}}"#,
+                denied = denied.display(),
+                bypassed = bypassed.display()
+            ),
+            dir.path(),
+        );
+
+        assert!(
+            policy
+                .matching_deny_for_access(&bypassed, AccessMode::Read)
+                .is_none()
+        );
+        assert!(
+            policy
+                .matching_deny_for_access(&bypassed, AccessMode::Write)
+                .is_some(),
+            "a read-only bypass must leave writes denied"
+        );
+        assert!(policy.matching_deny(&denied.join("other")).is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_only_bypass_does_not_expose_group_write_grant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let denied = dir.path().join("Keychains");
+        std::fs::create_dir_all(&denied).expect("mkdir");
+        let db = denied.join("login.keychain-db");
+        std::fs::write(&db, b"x").expect("write");
+
+        let policy = deny_policy_for_profile(
+            &format!(
+                r#"{{"filesystem":{{"deny":["{denied}"],"read_file":["{db}"],"bypass_protection":["{db}"]}}}}"#,
+                denied = denied.display(),
+                db = db.display()
+            ),
+            dir.path(),
+        );
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(nono::FsCapability {
+            original: denied.clone(),
+            resolved: denied,
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: nono::CapabilitySource::Group("claude_code_macos".to_string()),
+        });
+        caps.add_fs(crate::test_env::keychain_file_cap(
+            &db,
+            AccessMode::Read,
+            nono::CapabilitySource::Profile,
+        ));
+
+        assert!(
+            policy
+                .matching_deny_for_access(&db, AccessMode::Read)
+                .is_none()
+        );
+        assert!(matches!(
+            query_ext::query_path(&db, AccessMode::Read, &caps, policy.bypass_paths())
+                .expect("read query"),
+            query_ext::QueryResult::Allowed { .. }
+        ));
+        assert!(
+            policy
+                .matching_deny_for_access(&db, AccessMode::Write)
+                .is_some(),
+            "the group's broad write grant must not make a read-only bypass writable"
+        );
+    }
+
+    /// A bypass naming a path that does not exist here is dropped with a
+    /// warning when the sandbox is built, so `why` must not report it as
+    /// lifting the deny — the running sandbox still enforces it.
+    #[test]
+    fn profile_bypass_for_missing_path_does_not_reopen_deny() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let denied = dir.path().join("blocked");
+        std::fs::create_dir_all(&denied).expect("mkdir");
+        let absent = denied.join("never-created");
+
+        let policy = deny_policy_for_profile(
+            &format!(
+                r#"{{"filesystem":{{"deny":["{denied}"],"read_file":["{absent}"],"bypass_protection":["{absent}"]}}}}"#,
+                denied = denied.display(),
+                absent = absent.display()
+            ),
+            dir.path(),
+        );
+
+        assert!(
+            policy.matching_deny(&absent).is_some(),
+            "a bypass the sandbox dropped must not reopen the deny in `why`"
         );
     }
 
@@ -767,6 +1153,58 @@ mod tests {
         assert_eq!(reason_of(&result), "network_allowed");
     }
 
+    /// #1742: deny_domain must win over allow_domain for the same host.
+    #[test]
+    fn profile_deny_domain_beats_allow_domain() {
+        let config =
+            r#"{"network":{"allow_domain":["pypi.org","example.com"],"deny_domain":["pypi.org"]}}"#;
+        assert_eq!(
+            reason_of(&why_profile_host(config, "pypi.org")),
+            "domain_deny"
+        );
+        // Control: a host in allow_domain but not deny_domain stays allowed.
+        assert_eq!(
+            reason_of(&why_profile_host(config, "example.com")),
+            "proxy_allowed"
+        );
+    }
+
+    /// deny_domain also wins under a `network_profile` allowlist.
+    #[test]
+    fn profile_deny_domain_beats_network_profile() {
+        let config =
+            r#"{"network":{"network_profile":"claude-code","deny_domain":["api.anthropic.com"]}}"#;
+        assert_eq!(
+            reason_of(&why_profile_host(config, "api.anthropic.com")),
+            "domain_deny"
+        );
+    }
+
+    /// deny_domain alone (no allowlist) still denies its listed hosts.
+    #[test]
+    fn profile_deny_domain_alone_still_denies() {
+        let config = r#"{"network":{"deny_domain":["evil.example.com"]}}"#;
+        assert_eq!(
+            reason_of(&why_profile_host(config, "evil.example.com")),
+            "domain_deny"
+        );
+        assert_eq!(
+            reason_of(&why_profile_host(config, "anything-else.example.com")),
+            "proxy_allowed"
+        );
+    }
+
+    /// Wildcard deny_domain entries are enforced too.
+    #[test]
+    fn profile_wildcard_deny_domain_matches_subdomains() {
+        let config =
+            r#"{"network":{"allow_domain":["*.npmjs.org"],"deny_domain":["*.npmjs.org"]}}"#;
+        assert_eq!(
+            reason_of(&why_profile_host(config, "registry.npmjs.org")),
+            "domain_deny"
+        );
+    }
+
     #[test]
     fn profile_proxy_denies_cloud_metadata() {
         let result = why_profile_host(
@@ -782,7 +1220,9 @@ mod tests {
         let denied = dir.path().join("blocked");
         let sibling = dir.path().join("blocked-backup");
 
-        assert!(matching_deny_path(&sibling, &[denied]).is_none());
+        let policy = policy::EffectiveDenyPolicy::new(&[denied], &[]);
+
+        assert!(policy.matching_deny(&sibling).is_none());
     }
 
     fn gh_policy() -> CommandPoliciesConfig {
@@ -857,7 +1297,7 @@ mod tests {
                 assert!(
                     details
                         .as_deref()
-                        .is_some_and(|value| value.contains("not a filesystem path denial"))
+                        .is_some_and(|value| value.contains("not a filesystem-policy denial"))
                 );
                 assert_eq!(
                     policy_source.as_deref(),
@@ -1069,5 +1509,78 @@ mod tests {
                 ..
             } if reason == "invocation_policy_allowed"
         ));
+    }
+
+    #[test]
+    fn absolute_literal_rules_still_decide_both_ways() {
+        let covered = std::path::Path::new("/etc/ssh/sshd_config");
+        assert_eq!(policy_rule_may_cover("/etc/ssh", covered), Some(true));
+        assert_eq!(policy_rule_may_cover("/etc/shadow", covered), Some(false));
+        // Component comparison, not string prefix: /etc must not cover /etcetera.
+        assert_eq!(
+            policy_rule_may_cover("/etc", std::path::Path::new("/etcetera/config")),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn home_relative_rule_does_not_deny_a_coincidental_component_match() {
+        // `~/downloads` and `/var/tmp/downloads/foo` share a `downloads`
+        // component but describe unrelated locations. Without $HOME this is
+        // unknowable, so it must not report a confident denial.
+        assert_eq!(
+            policy_rule_may_cover(
+                "~/downloads",
+                std::path::Path::new("/var/tmp/downloads/foo")
+            ),
+            None
+        );
+        for rule in ["~/.ssh", "$HOME/.ssh", "${HOME}/.ssh"] {
+            assert_eq!(
+                policy_rule_may_cover(rule, std::path::Path::new("/srv/backup/.ssh/id_rsa")),
+                None,
+                "{rule} must not decide without $HOME"
+            );
+        }
+    }
+
+    #[test]
+    fn home_relative_rule_still_rules_out_paths_lacking_its_components() {
+        // Conclusive in the negative: every expansion of `~/downloads` ends in
+        // a `downloads` component, so a path without one cannot be beneath it
+        // for any value of $HOME.
+        assert_eq!(
+            policy_rule_may_cover("~/downloads", std::path::Path::new("/var/tmp/uploads/foo")),
+            Some(false)
+        );
+        assert_eq!(
+            policy_rule_may_cover("~/.ssh/id_rsa", std::path::Path::new("/etc/passwd")),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn bare_home_rule_is_undecidable_without_home() {
+        // `~/` denies the whole home directory; whether an arbitrary path lies
+        // inside it is exactly what $HOME would tell us.
+        for rule in ["~/", "$HOME/", "${HOME}/"] {
+            assert_eq!(
+                policy_rule_may_cover(rule, std::path::Path::new("/var/tmp/foo")),
+                None,
+                "{rule} must not deny an arbitrary path"
+            );
+        }
+    }
+
+    #[test]
+    fn rules_needing_expansion_remain_undecidable() {
+        assert_eq!(
+            policy_rule_may_cover("~/*.pem", std::path::Path::new("/home/someone/key.pem")),
+            None
+        );
+        assert_eq!(
+            policy_rule_may_cover("relative/rule", std::path::Path::new("/tmp/x")),
+            None
+        );
     }
 }

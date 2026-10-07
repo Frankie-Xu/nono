@@ -250,9 +250,8 @@ nono run --profile nolabs-ai/claude \
 ```
 
 For persistent behavior, put the same path in
-`filesystem.suppress_save_prompt` in a user profile. The older
-`--ignore-denied` spelling is accepted as an alias, but the suppress wording is
-preferred because this flag never turns a denial into an allow rule.
+`filesystem.suppress_save_prompt` in a user profile. The suppress wording is
+used deliberately because this flag never turns a denial into an allow rule.
 
 When nono offers to save denied paths after a run, choosing `suppress` writes
 all listed path suggestions to `filesystem.suppress_save_prompt` instead of
@@ -283,7 +282,9 @@ nono run --block-net --allow-unix-socket /tmp/.s.PGSQL.5432 -- psql
 Allow `connect(2)` and `bind(2)` on an AF_UNIX socket at this path. Use when
 the sandboxed program creates the socket itself. If the path doesn't exist
 yet (the typical `bind(2)` case), the CLI auto-grants write on the parent
-directory so the kernel can create the socket file.
+directory so the kernel can create the socket file. If that parent is covered
+by a filesystem deny, bypass the parent directory rather than only the future
+socket path; creating a new directory entry is a parent-directory operation.
 
 ```bash
 # Server that binds its own IPC socket
@@ -421,10 +422,12 @@ Incompatible with `--allow-net` (which bypasses the proxy entirely, making deny 
 
 #### `--credential`
 
-Enable credential injection for a named service via the reverse proxy. The service must be either a preset service (`openai`, `anthropic`, `gemini`, `google-ai`) or defined as a custom credential in your profile. Credentials are loaded from the system keyring under the `nono` service name, from 1Password when `credential_key` is an `op://` URI, from Apple Passwords on macOS when `credential_key` is an `apple-password://` URI, from a file when `credential_key` is a `file://` URI, or from the host environment when `credential_key` is an `env://` URI.
+Enable credential injection for a named service via the reverse proxy. The service must be either a preset service (`openai`, `anthropic`, `gemini`, `google-ai`, `github`, `gitlab`) or defined as a custom credential in your profile. Credentials are loaded from the system keyring under the `nono` service name, from 1Password when `credential_key` is an `op://` URI, from Apple Passwords on macOS when `credential_key` is an `apple-password://` URI, from a file when `credential_key` is a `file://` URI, or from the host environment when `credential_key` is an `env://` URI.
+
+See [built-in credential sources](/cli/features/credential-injection#storing-credentials) for each service's configured source. `--credential openai` uses keyring account `openai` under service `nono`; `--env-credential openai_api_key` loads a different account and injects its secret directly as `OPENAI_API_KEY` in the child environment.
 
 ```bash
-# Inject OpenAI credentials (loads from keyring account "openai_api_key")
+# Inject OpenAI credentials (loads from keyring account "openai")
 nono run --allow-cwd --network-profile claude-code --credential openai -- my-agent
 
 # Multiple credentials
@@ -588,6 +591,16 @@ On Linux with Landlock ABI v4+, per-port filtering is enforced and only the spec
 `--listen-port` only has effect in proxy mode (when `--network-profile` or `--allow-domain` is active). Without proxy mode, network operations use the default OS-level allow/deny and bind is not restricted.
 </Note>
 
+#### `--listen-port-range`
+
+Allow TCP bind/listen on an inclusive range of ports. Repeat the flag for multiple ranges; the same range can be declared in a profile with `network.listen_port_range`.
+
+```bash
+nono run --allow-cwd --network-profile developer --listen-port-range 8000:8100 -- npm run dev
+```
+
+Both endpoints must be between 1 and 65535, with the start no greater than the end. This flag grants bind/listen only; it does not authorize outbound connections to those ports. It adds bind exceptions in proxy or blocked modes and has no effect on otherwise unrestricted network access. Linux with Landlock ABI v4+ enforces the specified ports. On macOS, Seatbelt permits binding and accepting inbound connections on any port, as with `--listen-port`.
+
 #### `--open-port`
 
 Allow bidirectional localhost TCP on a specific port. The sandboxed process can both **connect to** and **bind/listen on** `127.0.0.1:<PORT>`. Use this for IPC between sandboxed processes (e.g., MCP servers, dev tools, AI agents running in separate sandboxes).
@@ -616,6 +629,16 @@ Can be specified multiple times for multiple ports.
 
 **Linux limitation:** Landlock ABI v4+ enforces connect and bind by port but **cannot filter by destination or bind address**. `--open-port 3000` permits connecting to port 3000 on any IP, not just localhost, and permits binding port 3000 on any local interface. `--block-net` blocks other ports but does not narrow the granted port to loopback. Use proxy mode when destination-host enforcement is required. On kernels without Landlock V4, port exceptions fail closed.
 </Warning>
+
+#### `--open-port-range`
+
+Allow bidirectional TCP IPC on an inclusive range of ports. Repeat the flag for multiple ranges; it matches the profile field `network.open_port_range`.
+
+```bash
+nono run --allow-cwd --network-profile developer --open-port-range 49152:49200 -- my-agent
+```
+
+Both endpoints must be between 1 and 65535, with the start no greater than the end. In proxy mode, direct outbound connections on these ports are restricted to loopback. The platform limitations of `--open-port` also apply: Linux Landlock alone filters by port rather than address, and macOS bind/inbound permission is broader than the declared range. On macOS, combined open ranges are limited to 16,384 unique ports.
 
 ### Resource Limits
 
@@ -685,8 +708,7 @@ nono run --allow-cwd --allow-command rm --allow-command mv -- my-script.sh
 </Note>
 
 Commands can also be allowed temporarily via the deprecated `commands.allow`
-field (the older `security` placement is also accepted with a deprecation
-warning, see issue #594):
+field:
 
 ```json
 {
@@ -716,7 +738,10 @@ nono run --allow-cwd --block-command my-dangerous-tool -- my-script.sh
 
 Bypass a deny group rule for a specific path. Required groups like `deny_credentials` block access to paths such as `~/.aws`, `~/.config/gcloud`, etc. This flag punches a targeted hole through the deny without removing the entire group.
 
-The bypass path must also be explicitly granted via `--allow`, `--read`, `--write`, or their file equivalents. `--bypass-protection` only removes the deny rule — it does not implicitly grant access.
+The bypass path must also have a matching filesystem or Unix socket grant.
+`--bypass-protection` only removes the deny rule — it does not implicitly
+grant access. The `--allow-unix-socket*` flags provide their required
+filesystem grant automatically.
 
 ```bash
 # Allow an AWS agent to access credentials
@@ -725,6 +750,13 @@ nono run --bypass-protection ~/.aws --allow ~/.aws -- my-aws-agent
 # Allow read-only access to GCP config
 nono run --bypass-protection ~/.config/gcloud --read ~/.config/gcloud -- gcloud-agent
 
+# Given the deny-private.json profile below, allow one existing socket while
+# the rest of its denied parent directory stays inaccessible
+nono run --profile ./deny-private.json --block-net \
+  --allow-unix-socket ~/.private/agent.sock \
+  --bypass-protection ~/.private/agent.sock \
+  -- my-agent
+
 # Multiple bypasses
 nono run \
   --bypass-protection ~/.aws \
@@ -732,6 +764,16 @@ nono run \
   --allow ~/.aws \
   --read ~/.config/gcloud \
   -- multi-cloud-agent
+```
+
+```json deny-private.json
+{
+  "meta": { "name": "deny-private" },
+  "workdir": { "access": "readwrite" },
+  "filesystem": {
+    "deny": ["$HOME/.private"]
+  }
+}
 ```
 
 Can be specified multiple times.
@@ -744,11 +786,9 @@ Can be specified multiple times.
 </Warning>
 
 <Note>
-  `--bypass-protection` without a matching grant (`--allow`, `--read`, `--write`, etc.) is a hard error. This prevents silent no-ops on Linux and unintended implicit grants on macOS.
-</Note>
-
-<Note>
-  **Renamed in issue #594.** This flag was renamed from its former deny-override name. The legacy name is still accepted as a deprecated alias and emits a warning on use; it will be removed in v1.0.0.
+  `--bypass-protection` without a matching filesystem or Unix socket grant is
+  a hard error. This prevents silent no-ops on Linux and unintended implicit
+  grants on macOS.
 </Note>
 
 ### Credential Options
@@ -1157,6 +1197,21 @@ NONO_STARTUP_TIMEOUT=10 nono run --allow-cwd -- opencode
 
 No timeout is applied by default. When a known built-in profile exists for the binary (e.g. `opencode`, `claude`), the warning message also suggests the recommended profile.
 
+#### `--network-denial-audit-rate` and `--network-denial-audit-burst`
+
+Set how many denied network syscalls nono records individually in the audit trail and diagnostics, for this run only. `--network-denial-audit-rate` is the sustained number per second (default `20`, maximum `1000`). `--network-denial-audit-burst` is how many may be recorded at once (default `50`, maximum `10000`). Both must be at least `1`.
+
+Denials past the budget are still denied. They are counted and reported in a single summary audit event, so nothing is dropped silently. Allowed connections never consume the budget. This only affects Linux seccomp network mediation (proxy mode and pathname AF_UNIX mediation).
+
+Each flag overrides the matching `diagnostics.network_denial_audit` profile field, and the other field keeps its profile value. See [Tuning How Many Network Denials Are Recorded](/cli/features/profile-authoring#tuning-how-many-network-denials-are-recorded).
+
+```bash
+# Record every denial from a noisy run
+nono run --network-denial-audit-burst 5000 --allow-domain example.com -- ./agent
+```
+
+Applies to `nono run`.
+
 #### `--no-diagnostics`
 
 Suppress the diagnostic footer when the command exits non-zero. Useful for scripts that parse stderr and need stable output.
@@ -1293,7 +1348,7 @@ The `why` command checks why filesystem, network, scope, or command access would
 
 ### `--command`
 
-Tool-sandbox command name to check against Tool Sandbox  command policy. Pass the command arguments after `--`.
+Command name to check against command policy. Pass the command arguments after `--`.
 
 ```bash
 nono why --profile gh --command gh -- issue comment 1052

@@ -588,20 +588,6 @@ impl CredentialStore {
         })
     }
 
-    /// Deprecated wrapper around [`Self::load_with_diagnostics`].
-    #[deprecated(
-        since = "0.64.0",
-        note = "Use `load_with_diagnostics` instead. Will be removed in 1.0.0."
-    )]
-    pub async fn load(
-        routes: &[RouteConfig],
-        tls_connector: &TlsConnector,
-    ) -> Result<CredentialStore> {
-        Self::load_with_diagnostics(routes, tls_connector, None)
-            .await
-            .map(|outcome| outcome.store)
-    }
-
     /// Create an empty credential store (no credential injection).
     #[must_use]
     pub fn empty() -> Self {
@@ -971,6 +957,7 @@ mod tests {
         use crate::config::OAuth2Config;
 
         RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: prefix.to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: None,
@@ -1006,6 +993,7 @@ mod tests {
     async fn test_load_missing_env_credential_records_credential_not_found() {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "preview-missing".to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("env://NONO_PROXY_TEST_MISSING_CRED".to_string()),
@@ -1128,6 +1116,7 @@ mod tests {
     async fn test_load_no_credential_routes() {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "/test".to_string(),
             upstream: "https://example.com".to_string(),
             credential_key: None,
@@ -1172,6 +1161,7 @@ mod tests {
     async fn test_load_cmd_uri_registers_lazy_route() {
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "/github".to_string(),
             upstream: "https://api.github.com".to_string(),
             credential_key: Some("cmd://github".to_string()),
@@ -1211,7 +1201,7 @@ mod tests {
     #[test]
     fn test_is_empty_false_with_only_oauth2_routes() {
         // Simulate a store with only OAuth2 routes by constructing directly.
-        // We can't call load() with a real OAuth2 config (no token server),
+        // We cannot load a real OAuth2 route here (there is no token server),
         // so we build the struct manually to test the is_empty/len logic.
         use std::time::Duration;
 
@@ -1278,6 +1268,7 @@ mod tests {
         };
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "litellm".to_string(),
             upstream: "https://litellm".to_string(),
             credential_key: Some("env://NONO_PROXY_TEST_LITELLM_TOKEN".to_string()),
@@ -1317,6 +1308,7 @@ mod tests {
         };
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "api".to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: Some("env://NONO_PROXY_TEST_API_KEY".to_string()),
@@ -1360,6 +1352,7 @@ mod tests {
         };
         let tls = test_tls_connector();
         let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
             prefix: "my-api".to_string(),
             upstream: "https://api.example.com".to_string(),
             credential_key: None,
@@ -1394,7 +1387,7 @@ mod tests {
 
         let outcome = CredentialStore::load_with_diagnostics(&routes, &tls, None).await;
 
-        // load() should succeed (route skipped, not hard error)
+        // The load should succeed (route skipped, not hard error).
         assert!(
             outcome.is_ok(),
             "load should not fail on unreachable OAuth2 endpoint"

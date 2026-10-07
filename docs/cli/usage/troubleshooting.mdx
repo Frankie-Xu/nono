@@ -410,11 +410,28 @@ This reports the detected kernel version, Landlock ABI, WSL2 detection status, a
 
 ---
 
+## Running Inside Docker/Podman
+
+### Proxy notification bootstrap failures
+
+On Linux kernels without Landlock V4 networking, the CLI transfers the proxy
+notification listener through a short `CLONE_FILES` bootstrap. This handoff
+does not use `pidfd_getfd` or require `CAP_SYS_PTRACE`. An error mentioning
+`pidfd_getfd failed` comes from the older handoff; update nono to use the new one.
+
+A `CLONE_FILES bootstrap` error means startup failed before the listener handoff
+completed. Check that the container's syscall policy permits seccomp user
+notifications, `clone` with `CLONE_FILES`, and descriptor-table detachment through
+either `close_range` with `CLOSE_RANGE_UNSHARE` or `unshare(CLONE_FILES)`. The
+supervisor also needs access to the child's procfs entries for notification
+mediation. If these requirements cannot be met, nono aborts startup instead of
+running the command without its restrictions.
+
 ## Getting Help
 
 If you're still stuck:
 
-1. **Search existing issues**: [GitHub Issues](https://github.com/always-further/nono/issues)
+1. **Search existing issues**: [GitHub Issues](https://github.com/nolabs-ai/nono/issues)
 2. **Open a new issue** with:
    - nono version (`nono --version`)
    - OS and kernel version

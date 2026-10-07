@@ -956,12 +956,16 @@ pub struct CapabilitySet {
     unix_sockets: Vec<UnixSocketCapability>,
     /// Network access mode (default: AllowAll)
     network_mode: NetworkMode,
+    /// Omit the implicit macOS resolver grants in restricted network modes.
+    dns_blocked: bool,
     /// Per-port TCP connect allowlist (Linux Landlock V4+ only).
     /// Adding any entry implies Blocked base with specific port exceptions.
     tcp_connect_ports: Vec<u16>,
     /// Per-port TCP bind allowlist (Linux Landlock V4+ only).
     tcp_bind_ports: Vec<u16>,
     /// Inclusive TCP bind-only port ranges (listen/bind, no outbound connect).
+    /// Apply in restricted network modes or alongside an explicit raw TCP
+    /// allowlist; otherwise [`NetworkMode::AllowAll`] remains unrestricted.
     ///
     /// Linux Landlock V4+ expands each port to a BindTcp rule. macOS Seatbelt
     /// cannot filter bind by port, so a non-empty set enables blanket
@@ -1108,9 +1112,38 @@ impl CapabilitySet {
     /// Block network access (builder pattern)
     ///
     /// By default, network access is allowed. Call this to block all network.
+    /// On macOS, the host DNS resolver remains accessible unless
+    /// [`block_dns()`](Self::block_dns) is also called. Explicit socket and
+    /// port grants still apply.
     #[must_use]
     pub fn block_network(mut self) -> Self {
         self.network_mode = NetworkMode::Blocked;
+        self
+    }
+
+    /// Omit the implicit macOS DNS resolver exceptions (builder pattern).
+    ///
+    /// In [`NetworkMode::Blocked`] and [`NetworkMode::ProxyOnly`], this omits
+    /// the Seatbelt grants for the `mDNSResponder` Unix socket. For example,
+    /// Nix dynamic derivations need to prevent host DNS queries as well as
+    /// direct network connections:
+    ///
+    /// ```
+    /// use nono::CapabilitySet;
+    ///
+    /// let caps = CapabilitySet::new().block_network().block_dns();
+    /// assert!(!caps.dns_enabled());
+    /// ```
+    ///
+    /// This does not change the network mode or revoke explicit Unix socket,
+    /// localhost, proxy, or platform-rule grants. It has no enforcement effect
+    /// in [`NetworkMode::AllowAll`] or on Linux, and is not a general DNS
+    /// filter. Callers requiring strict isolation must also avoid granting
+    /// other paths to a resolver. The setting survives network-mode changes
+    /// and [`crate::SandboxState`] round trips.
+    #[must_use]
+    pub fn block_dns(mut self) -> Self {
+        self.dns_blocked = true;
         self
     }
 
@@ -1190,9 +1223,11 @@ impl CapabilitySet {
     }
 
     /// Allow an inclusive TCP bind-only port range (listen/bind, no connect).
+    /// Apply in restricted modes or alongside a raw TCP allowlist; this does
+    /// not restrict an otherwise unrestricted [`NetworkMode::AllowAll`].
     ///
-    /// Returns an error if `start` is 0 (port 0 has no defined meaning in a
-    /// range). See [`tcp_bind_port_ranges`](Self::tcp_bind_port_ranges) for
+    /// Returns an error if either endpoint is 0 or `end < start`.
+    /// See [`tcp_bind_port_ranges`](Self::tcp_bind_port_ranges) for
     /// platform-specific enforcement.
     pub fn allow_tcp_bind_port_range(mut self, start: u16, end: u16) -> Result<Self> {
         self.add_tcp_bind_port_range(start, end)?;
@@ -1215,8 +1250,9 @@ impl CapabilitySet {
 
     /// Allow an inclusive range of localhost ports for bidirectional IPC.
     ///
-    /// Returns an error if `start` is 0 (port 0 has no defined meaning in a
-    /// range; use `allow_localhost_port(0)` for the macOS `localhost:*` wildcard).
+    /// Returns an error if `start` is 0 or `end` is 0 (port 0 has no defined
+    /// meaning in a range; use `allow_localhost_port(0)` for the macOS
+    /// `localhost:*` wildcard), or if `end < start`.
     ///
     /// See [`localhost_port_ranges`](Self::localhost_port_ranges) for
     /// platform-specific behaviour and expansion limits.
@@ -1226,6 +1262,17 @@ impl CapabilitySet {
                 "port range starting at 0 is invalid; port 0 has no defined meaning in a range"
                     .to_string(),
             ));
+        }
+        if end == 0 {
+            return Err(NonoError::ConfigParse(
+                "port range ending at 0 is invalid; port 0 has no defined meaning in a range"
+                    .to_string(),
+            ));
+        }
+        if end < start {
+            return Err(NonoError::ConfigParse(format!(
+                "port range end {end} is less than start {start}"
+            )));
         }
         self.localhost_port_ranges.push((start, end));
         Ok(self)
@@ -1399,13 +1446,24 @@ impl CapabilitySet {
 
     /// Add an inclusive TCP bind-only port range (mutable).
     ///
-    /// Returns an error if `start` is 0 (port 0 has no defined meaning in a range).
+    /// Returns an error if either endpoint is 0 or `end < start`.
     pub fn add_tcp_bind_port_range(&mut self, start: u16, end: u16) -> Result<()> {
         if start == 0 {
             return Err(NonoError::ConfigParse(
                 "port range starting at 0 is invalid; port 0 has no defined meaning in a range"
                     .to_string(),
             ));
+        }
+        if end == 0 {
+            return Err(NonoError::ConfigParse(
+                "port range ending at 0 is invalid; port 0 has no defined meaning in a range"
+                    .to_string(),
+            ));
+        }
+        if end < start {
+            return Err(NonoError::ConfigParse(format!(
+                "port range end {end} is less than start {start}"
+            )));
         }
         self.tcp_bind_port_ranges.push((start, end));
         Ok(())
@@ -1418,13 +1476,25 @@ impl CapabilitySet {
 
     /// Add an inclusive localhost port range for bidirectional IPC (mutable).
     ///
-    /// Returns an error if `start` is 0 (port 0 has no defined meaning in a range).
+    /// Returns an error if `start` is 0, `end` is 0, or `end < start` (port 0
+    /// has no defined meaning in a range).
     pub fn add_localhost_port_range(&mut self, start: u16, end: u16) -> Result<()> {
         if start == 0 {
             return Err(NonoError::ConfigParse(
                 "port range starting at 0 is invalid; port 0 has no defined meaning in a range"
                     .to_string(),
             ));
+        }
+        if end == 0 {
+            return Err(NonoError::ConfigParse(
+                "port range ending at 0 is invalid; port 0 has no defined meaning in a range"
+                    .to_string(),
+            ));
+        }
+        if end < start {
+            return Err(NonoError::ConfigParse(format!(
+                "port range end {end} is less than start {start}"
+            )));
         }
         self.localhost_port_ranges.push((start, end));
         Ok(())
@@ -1654,6 +1724,16 @@ impl CapabilitySet {
     #[must_use]
     pub fn network_mode(&self) -> &NetworkMode {
         &self.network_mode
+    }
+
+    /// Whether restricted macOS network modes include implicit resolver grants.
+    ///
+    /// Defaults to `true`. This reports the configuration, not whether DNS is
+    /// reachable through other grants or on another platform. See
+    /// [`block_dns()`](Self::block_dns).
+    #[must_use]
+    pub fn dns_enabled(&self) -> bool {
+        !self.dns_blocked
     }
 
     /// Get per-port TCP connect allowlist
@@ -3011,6 +3091,35 @@ mod tests {
     }
 
     #[test]
+    fn test_dns_exceptions_enabled_by_default() {
+        assert!(CapabilitySet::default().dns_enabled());
+        assert!(CapabilitySet::new().block_network().dns_enabled());
+        assert!(CapabilitySet::new().proxy_only(8080).dns_enabled());
+    }
+
+    #[test]
+    fn test_block_dns_is_independent_of_network_mode() {
+        let caps = CapabilitySet::new().block_dns();
+        assert_eq!(*caps.network_mode(), NetworkMode::AllowAll);
+        assert!(!caps.dns_enabled());
+
+        let caps = caps.clone().block_network();
+        assert_eq!(*caps.network_mode(), NetworkMode::Blocked);
+        assert!(!caps.dns_enabled());
+        assert!(
+            !CapabilitySet::new()
+                .block_network()
+                .block_dns()
+                .dns_enabled()
+        );
+
+        let caps = caps.proxy_only(8080);
+        assert!(!caps.dns_enabled());
+        let caps = caps.set_network_mode(NetworkMode::AllowAll);
+        assert!(!caps.dns_enabled());
+    }
+
+    #[test]
     fn test_proxy_only_mode() {
         let caps = CapabilitySet::new().proxy_only(8080);
         assert_eq!(
@@ -3103,6 +3212,22 @@ mod tests {
     }
 
     #[test]
+    fn test_tcp_bind_port_range_rejects_invalid_bounds() {
+        for (start, end) in [(0, 100), (100, 0), (8100, 8000)] {
+            assert!(
+                CapabilitySet::new()
+                    .allow_tcp_bind_port_range(start, end)
+                    .is_err()
+            );
+            let mut caps = CapabilitySet::new();
+            caps.add_tcp_bind_port_range(9000, 9001)
+                .expect("valid range");
+            assert!(caps.add_tcp_bind_port_range(start, end).is_err());
+            assert_eq!(caps.tcp_bind_port_ranges(), &[(9000, 9001)]);
+        }
+    }
+
+    #[test]
     fn test_allow_https_convenience() {
         let caps = CapabilitySet::new().allow_https();
         assert_eq!(caps.tcp_connect_ports(), &[443, 8443]);
@@ -3184,6 +3309,57 @@ mod tests {
             .allow_localhost_port(0)
             .allow_localhost_port(8080);
         assert_eq!(caps.merged_localhost_port_ranges(), vec![(8080, 8080)]);
+    }
+
+    #[test]
+    fn test_localhost_port_range_rejects_zero_end() {
+        assert!(
+            CapabilitySet::new()
+                .allow_localhost_port_range(100, 0)
+                .is_err()
+        );
+        let mut caps = CapabilitySet::new();
+        assert!(caps.add_localhost_port_range(100, 0).is_err());
+    }
+
+    #[test]
+    fn test_localhost_port_range_rejects_inverted() {
+        assert!(
+            CapabilitySet::new()
+                .allow_localhost_port_range(5000, 4000)
+                .is_err()
+        );
+        assert!(
+            CapabilitySet::new()
+                .allow_localhost_port_range(8080, 8000)
+                .is_err()
+        );
+        let mut caps = CapabilitySet::new();
+        assert!(caps.add_localhost_port_range(5000, 4000).is_err());
+    }
+
+    #[test]
+    fn test_localhost_port_range_accepts_single_port_range() {
+        // start == end is valid (single port expressed as range)
+        let caps = CapabilitySet::new()
+            .allow_localhost_port_range(3000, 3000)
+            .expect("single-port range should be valid");
+        assert_eq!(caps.localhost_port_ranges(), &[(3000, 3000)]);
+    }
+
+    #[test]
+    fn test_localhost_port_range_accepts_valid_ranges() {
+        let caps = CapabilitySet::new()
+            .allow_localhost_port_range(1, 1024)
+            .expect("valid")
+            .allow_localhost_port_range(5000, 5000)
+            .expect("valid")
+            .allow_localhost_port_range(49152, 65535)
+            .expect("valid");
+        assert_eq!(
+            caps.localhost_port_ranges(),
+            &[(1, 1024), (5000, 5000), (49152, 65535)]
+        );
     }
 
     #[test]

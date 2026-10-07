@@ -1157,9 +1157,19 @@ fn load_single_secret(_service: &str, account: &str) -> Result<Zeroizing<String>
 /// Build a `Command` for a bare-name host-side broker binary (`op`, `bw`,
 /// `security`), with PATH stripped of any sandbox-writable directory when
 /// `outer_caps` is provided. See [`load_secret_by_ref`] for why this matters.
-fn broker_command(program: &str, outer_caps: Option<&CapabilitySet>) -> Command {
-    let ambient_path = std::env::var("PATH").unwrap_or_default();
-    broker_command_with_path(program, &ambient_path, outer_caps)
+fn broker_command(program: &str, outer_caps: Option<&CapabilitySet>) -> Result<Command> {
+    broker_command_with_path(program, &broker_ambient_path(), outer_caps)
+}
+
+/// PATH [`broker_command`] will sanitize (or inherit). Tests can override this
+/// per-thread without mutating the process environment, which other parallel
+/// tests use when they spawn `op`/`bw`/`security` by bare name.
+fn broker_ambient_path() -> String {
+    #[cfg(test)]
+    if let Some(path) = TEST_BROKER_PATH.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
+    std::env::var("PATH").unwrap_or_default()
 }
 
 /// Core of [`broker_command`], taking the PATH value as a parameter rather
@@ -1170,14 +1180,62 @@ fn broker_command_with_path(
     program: &str,
     ambient_path: &str,
     outer_caps: Option<&CapabilitySet>,
-) -> Command {
+) -> Result<Command> {
     let mut command = Command::new(program);
     if let Some(caps) = outer_caps {
-        let safe_path =
-            crate::broker_path::sanitize_broker_path_for_binary(ambient_path, program, caps);
+        let safe_path = crate::broker_path::safe_broker_path_for_binary(
+            ambient_path,
+            program,
+            caps,
+        )
+        .ok_or_else(|| {
+            NonoError::KeystoreAccess(format!(
+                "cannot resolve '{program}': no remaining PATH entry is safe for this sandbox"
+            ))
+        })?;
         command.env("PATH", safe_path);
     }
-    command
+    // When a test has installed a thread-local PATH, apply it even if
+    // `outer_caps` is `None`. Otherwise `Command::new("op")` would look
+    // up the (unpoisoned) process PATH and the sanitizer test would pass
+    // vacuously.
+    #[cfg(test)]
+    if outer_caps.is_none() && TEST_BROKER_PATH.with(|slot| slot.borrow().is_some()) {
+        command.env("PATH", ambient_path);
+    }
+    Ok(command)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BROKER_PATH: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install a thread-local PATH for [`broker_command`] until the guard drops.
+///
+/// Must not mutate process `PATH`: `test_load_secret_by_ref_dispatches_op`
+/// (and the `bw`/`security` dispatch tests) spawn those binaries by bare name
+/// against the process PATH, and would execute a trojan planted there.
+#[cfg(test)]
+#[must_use]
+fn override_broker_path(path: String) -> TestBrokerPathGuard {
+    TEST_BROKER_PATH.with(|slot| {
+        *slot.borrow_mut() = Some(path);
+    });
+    TestBrokerPathGuard
+}
+
+#[cfg(test)]
+struct TestBrokerPathGuard;
+
+#[cfg(test)]
+impl Drop for TestBrokerPathGuard {
+    fn drop(&mut self) {
+        TEST_BROKER_PATH.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
 }
 
 /// Load a secret from 1Password using the `op` CLI.
@@ -1197,7 +1255,7 @@ fn load_from_op(uri: &str, outer_caps: Option<&CapabilitySet>) -> Result<Zeroizi
 
     tracing::debug!("Loading secret from 1Password: {}", redact_op_uri(uri));
 
-    let mut child = broker_command("op", outer_caps)
+    let mut child = broker_command("op", outer_caps)?
         .args(["read", "--", uri])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1283,7 +1341,7 @@ fn load_from_bw(uri: &str, outer_caps: Option<&CapabilitySet>) -> Result<Zeroizi
     } else {
         "password"
     };
-    let mut child = broker_command("bw", outer_caps)
+    let mut child = broker_command("bw", outer_caps)?
         .args(["get", bw_object, "--", item_id])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1462,7 +1520,7 @@ fn load_from_apple_password(
             redact_apple_password_uri(uri)
         );
 
-        let mut child = broker_command("security", outer_caps)
+        let mut child = broker_command("security", outer_caps)?
             .args(["find-internet-password", "-s", server, "-a", account, "-w"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2126,6 +2184,7 @@ mod tests {
 
         let ambient_path = format!("{}:{}", writable_bin.display(), real_bin.display());
         let status = broker_command_with_path("op", &ambient_path, Some(&caps))
+            .expect("sanitized PATH still has a safe directory")
             .status()
             .expect("spawn op via sanitized PATH");
         assert!(status.success());
@@ -2137,6 +2196,38 @@ mod tests {
         assert!(
             real_marker.exists(),
             "real binary on the non-writable directory should have run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_command_errors_when_sanitized_path_is_empty() {
+        use crate::capability::{AccessMode, CapabilitySource, FsCapability};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let writable_bin = root.path().join("bin");
+        std::fs::create_dir_all(&writable_bin).expect("mkdir");
+        let cwd_op = root.path().join("op");
+        std::fs::write(&cwd_op, "#!/bin/sh\nexit 0\n").expect("write cwd op");
+        let mut perms = std::fs::metadata(&cwd_op).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&cwd_op, perms).expect("chmod");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: writable_bin.clone(),
+            resolved: crate::path::try_canonicalize(&writable_bin),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let err = broker_command_with_path("op", &writable_bin.display().to_string(), Some(&caps))
+            .expect_err("empty sanitized PATH must not spawn");
+        assert!(
+            err.to_string().contains("no remaining PATH entry is safe"),
+            "unexpected error: {err}"
         );
     }
 
@@ -2177,38 +2268,24 @@ mod tests {
             source: CapabilitySource::User,
         });
 
-        // broker_command_with_path (exercised via load_secrets -> load_secret_by_ref)
-        // reads PATH from the process environment directly, so this test needs
-        // a real (locked, restored) mutation rather than passing PATH as a
-        // parameter.
-        static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        struct PathGuard(Option<String>);
-        impl Drop for PathGuard {
-            fn drop(&mut self) {
-                // SAFETY: serialized via PATH_LOCK, held for the guard's lifetime.
-                match &self.0 {
-                    Some(v) => unsafe { std::env::set_var("PATH", v) },
-                    None => unsafe { std::env::remove_var("PATH") },
-                }
-            }
-        }
-
-        let _guard = match PATH_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        let real_path = std::env::var("PATH").ok();
-        let poisoned_path = format!(
-            "{}:{}",
-            writable_dir.display(),
-            real_path.clone().unwrap_or_default()
-        );
-        // SAFETY: serialized via PATH_LOCK, restored by PathGuard's Drop.
-        unsafe { std::env::set_var("PATH", &poisoned_path) };
-        let _path_guard = PathGuard(real_path);
+        // Thread-local PATH, not process PATH: a parallel
+        // `load_secret_by_ref(..., None)` spawn of `op` would otherwise
+        // execute this trojan and fail the assertion even when `load_secrets`
+        // itself sanitized correctly (Ubuntu CI flake).
+        let _path_override = override_broker_path(writable_dir.display().to_string());
 
         let mut mappings = HashMap::new();
         mappings.insert("op://vault/item/field".to_string(), "MY_VAR".to_string());
+
+        // Harness check: without outer_caps the trojan must run, otherwise
+        // the sanitizer assertion below would pass vacuously.
+        let _ = load_secrets(DEFAULT_SERVICE, &mappings, None);
+        assert!(
+            marker.exists(),
+            "harness: trojan op must be reachable when outer_caps is None"
+        );
+        std::fs::remove_file(&marker).expect("reset marker");
+
         // Real op:// resolution will fail (no real `op` on the test host, or
         // it exits non-zero) — we only care that the trojan never ran.
         let _ = load_secrets(DEFAULT_SERVICE, &mappings, Some(&caps));
